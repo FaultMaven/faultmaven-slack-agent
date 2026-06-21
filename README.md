@@ -6,6 +6,9 @@ contextual, AI-driven incident investigations.
 
 Built for the **Slack Agent Builder Challenge**.
 
+> Strategy, feature roadmap, and built-vs-planned status:
+> [docs/PRODUCT_BLUEPRINT.md](docs/PRODUCT_BLUEPRINT.md).
+
 ## Operating model
 
 - **Strict mention-only (Option B).** The bot is passive. It never reads
@@ -21,7 +24,7 @@ Built for the **Slack Agent Builder Challenge**.
 
 ## Layout
 
-```
+```text
 faultmaven-slack-agent/
 ├── config.py             # Settings + env validation (fail-fast)
 ├── main.py               # FastAPI app, routes, background workers
