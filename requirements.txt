@@ -1,0 +1,15 @@
+# FaultMaven Slack Agent — runtime dependencies
+
+# Web framework + ASGI server
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+
+# Settings / validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Slack Web API client (sync WebClient + signature verifier)
+slack-sdk==3.34.0
+
+# Async HTTP client for calling the FaultMaven core orchestration API
+httpx==0.28.1
