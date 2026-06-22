@@ -1,15 +1,14 @@
-# FaultMaven Slack Agent — runtime dependencies
+# FaultMaven Slack Agent — runtime dependencies (P0: Bolt + Assistant container)
 
-# Web framework + ASGI server
-fastapi==0.115.8
-uvicorn[standard]==0.34.0
+# Slack Bolt for Python — Assistant/AI-App container, event routing, signature
+# verification, retry de-dup. Socket Mode for dev; HTTP/OAuth lands in P5.
+slack-bolt==1.28.0
+slack-sdk==3.42.0
 
 # Settings / validation
 pydantic==2.10.6
 pydantic-settings==2.7.1
 
-# Slack Web API client (sync WebClient + signature verifier)
-slack-sdk==3.34.0
-
-# Async HTTP client for calling the FaultMaven core orchestration API
+# Sync HTTP client for the FaultMaven core API (kept sync to match Bolt's
+# synchronous listener model — no async/sync bridging in the hot path).
 httpx==0.28.1

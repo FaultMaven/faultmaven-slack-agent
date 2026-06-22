@@ -16,6 +16,9 @@ env/
 .env.*
 !.env.example
 
+# Local runtime state (thread→case SQLite store)
+data/
+
 # Tooling
 .mypy_cache/
 .pytest_cache/

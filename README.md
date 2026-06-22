@@ -1,74 +1,69 @@
 # FaultMaven Slack Agent
 
-A backend service that connects a Slack workspace to FaultMaven's core
-troubleshooting engine. It turns collaborative thread discussions into
-contextual, AI-driven incident investigations.
+Brings FaultMaven's AI troubleshooting engine into Slack — investigate incidents
+right in the thread (or the AI side panel), grounded in your runbooks, telemetry,
+and past fixes. Built on **Bolt for Python**'s Assistant container, backed by the
+FaultMaven core API.
 
 Built for the **Slack Agent Builder Challenge**.
 
-> Strategy, feature roadmap, and built-vs-planned status:
-> [docs/PRODUCT_BLUEPRINT.md](docs/PRODUCT_BLUEPRINT.md).
+> Full architecture, feature design, backend contract, and roadmap:
+> [docs/design.md](docs/design.md).
 
 ## Operating model
 
-- **Strict mention-only (Option B).** The bot is passive. It never reads
-  background channel traffic. It acts only when:
-  - explicitly mentioned (`@FaultMaven …`), or
-  - triggered via a message shortcut ("Investigate with FaultMaven").
-- **Threads are sessions.** The Slack `thread_ts` is used verbatim as the
-  investigation/session id. Every turn rebuilds context from the thread so the
-  engine sees the whole collaborative conversation.
-- **Async by design.** Slack requires an HTTP 200 within ~3 seconds. Each
-  webhook verifies the signature, acks immediately, and offloads the RAG/AI
-  work to FastAPI `BackgroundTasks`, replying in-thread when done.
+- **Assistant container** — a 1:1 AI side-panel session with suggested prompts
+  and live status, one FaultMaven case per assistant thread.
+- **Mention-driven in channels** — `@FaultMaven` in an incident thread runs an
+  investigation and replies in-thread, keeping the channel quiet. The bot never
+  reads background channel traffic; it acts only when summoned.
+- **Thread = case.** Each Slack thread maps to one FaultMaven case; the mapping
+  is tracked locally (we do *not* pass `thread_ts` to the backend as a session
+  id — it validates those server-side).
 
 ## Layout
 
 ```text
 faultmaven-slack-agent/
+├── app.py                # Bolt app entrypoint (Socket Mode)
 ├── config.py             # Settings + env validation (fail-fast)
-├── main.py               # FastAPI app, routes, background workers
-├── requirements.txt
-├── services/
-│   ├── slack_service.py  # Slack WebClient + Block Kit rendering + thread history
-│   └── faultmaven_api.py # Async client for the core engine (with mock mode)
-└── utils/
-    └── security.py       # Slack request signature verification + replay guard
+├── store.py              # thread→case map (SQLite)
+├── rendering.py          # TurnResult → Block Kit
+├── faultmaven/
+│   └── client.py         # FaultMaven API client (create case, multipart turns, 202-poll)
+├── listeners/
+│   ├── assistant.py      # Assistant container: thread_started + user_message
+│   ├── events.py         # app_mention (war-room)
+│   └── _turn.py          # shared find-or-create-case → submit-turn pipeline
+├── manifest.json         # Slack app manifest (scopes, events, assistant_view)
+└── docs/design.md        # authoritative design
 ```
 
 ## Run locally
 
+Requires a running FaultMaven backend (default `http://localhost:8090`).
+
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # fill in SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET
-python main.py              # serves on :3000
+cp .env.example .env     # fill in SLACK_BOT_TOKEN + SLACK_APP_TOKEN
+python app.py            # connects via Socket Mode — no public URL needed
 ```
 
-Leave `FAULTMAVEN_API_KEY` empty to run in **mock mode** — the agent returns a
-plausible stub investigation so you can demo the full Slack round-trip without
-a live backend. With a key set, it calls
-`POST {FAULTMAVEN_API_URL}/api/v1/investigations/turn` and gracefully falls
-back to mock output if the backend is unreachable.
+If `FAULTMAVEN_API_TOKEN` is empty, the agent bootstraps a token via
+`/auth/dev-login` (local `AUTH_MODE` only) using `FAULTMAVEN_DEV_LOGIN_USERNAME`.
 
-Expose the port (e.g. `ngrok http 3000`) and point your Slack app at:
+## Slack app setup
 
-| Slack feature        | Request URL                          |
-|----------------------|--------------------------------------|
-| Event Subscriptions  | `https://<host>/slack/events`        |
-| Interactivity        | `https://<host>/slack/interactions`  |
+Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *From
+a manifest*). It enables Socket Mode and requests least-privilege scopes
+(`assistant:write`, `chat:write`, `app_mentions:read`, plus `*:history` to replay
+a summoned thread). Then create an app-level token with `connections:write`
+(→ `SLACK_APP_TOKEN`) and install to your workspace.
 
-### Required Slack configuration
+## Status
 
-- **Bot token scopes:** `app_mentions:read`, `chat:write`,
-  `channels:history`, `groups:history` (for reading thread replies).
-- **Event subscriptions:** `app_mention` only (Option B — do **not** subscribe
-  to `message.channels`).
-- **Interactivity:** enable, and add a *message* shortcut whose callback id you
-  wire to the "Investigate with FaultMaven" action.
-
-## Security
-
-Every inbound request is authenticated against the app signing secret
-(HMAC-SHA256) with an explicit timestamp/replay window before any payload is
-parsed (`utils/security.py`). Unverified requests get `401`. Duplicate Slack
-re-deliveries are deduped on `event_id`.
+This is **P0** (foundational loop): Assistant container + `@mention`, the
+corrected case/turn backend contract, thread→case mapping, and Block Kit
+rendering. Streaming reasoning timeline, interactive action buttons, evidence
+upload, reports, App Home, and multi-workspace OAuth follow in P1–P6 — see the
+roadmap in [docs/design.md](docs/design.md) §14.
