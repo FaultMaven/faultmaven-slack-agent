@@ -121,6 +121,54 @@ def test_health_raises_on_error_status():
         client.health()
 
 
+def test_health_raises_on_non_json_body():
+    """A 200 from a proxy/login page (HTML) must degrade to a clear error, not
+    an unhandled JSONDecodeError escaping the httpx.HTTPError guard."""
+
+    client = make_client(
+        lambda req: httpx.Response(200, text="<html>login</html>")
+    )
+    with pytest.raises(FaultMavenError, match="non-JSON"):
+        client.health()
+
+
+def test_health_raises_on_non_dict_json():
+    client = make_client(lambda req: httpx.Response(200, json=["healthy"]))
+    with pytest.raises(FaultMavenError, match="not an object"):
+        client.health()
+
+
+# -- verify_auth --------------------------------------------------------------
+def test_verify_auth_passes_on_200():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"username": "admin"})
+
+    client = make_client(handler, token="tok")
+    client.verify_auth()  # must not raise
+    assert seen["path"] == "/api/v1/auth/me"
+    assert seen["auth"] == "Bearer tok"
+
+
+def test_verify_auth_flags_401_as_token_rejected():
+    """The false-green guard: a preset-but-invalid token must surface as a 401,
+    not pass silently (preflight keys on '401' in the message)."""
+
+    client = make_client(lambda req: httpx.Response(401, json={}), token="stale")
+    with pytest.raises(FaultMavenError, match="401"):
+        client.verify_auth()
+
+
+def test_verify_auth_inconclusive_on_other_status():
+    # e.g. /auth/me missing on an older backend → inconclusive, not "rejected".
+    client = make_client(lambda req: httpx.Response(404, json={}), token="tok")
+    with pytest.raises(FaultMavenError, match="inconclusive"):
+        client.verify_auth()
+
+
 # -- auth resilience ----------------------------------------------------------
 def test_401_triggers_single_reauth_and_retry():
     state = {"posts": 0}

@@ -133,6 +133,8 @@ advances (a new placeholder → updated reply appears in the thread).
 | Preflight: `auth.test rejected` | wrong/rotated bot token | re-copy `SLACK_BOT_TOKEN` (the `xoxb-…` one); reinstall if scopes changed |
 | Preflight: `apps.connections.open failed` | app token missing `connections:write` | regenerate the app-level token with that scope |
 | Preflight: `backend unreachable` | API down or wrong URL | start the backend / fix `FAULTMAVEN_API_URL` |
+| Preflight: `! status='degraded'` (yellow) | non-critical component down / `ALLOW_TOOLLESS_INVESTIGATION` | **not a failure** — the agent still works; check `GET /health` for which component |
+| Preflight: `token rejected (401)` | stale/wrong `FAULTMAVEN_API_TOKEN` | re-issue the token, or use a local-`AUTH_MODE` backend so dev-login works |
 | Preflight: `could not obtain a bearer token` | backend not in local auth mode | set `FAULTMAVEN_API_TOKEN` for this backend |
 | App starts, but nothing happens on events | bot not in the channel | `/invite @FaultMaven` |
 | Log: `Cannot post in channel … not_in_channel` | same | `/invite @FaultMaven` |

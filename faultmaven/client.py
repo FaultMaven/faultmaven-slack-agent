@@ -109,9 +109,44 @@ class FaultMavenClient:
         try:
             resp = self._http.get("/health")
             resp.raise_for_status()
+            body = resp.json()
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"health check failed: {exc}") from exc
-        return resp.json()
+        except ValueError as exc:  # non-JSON 200 (proxy / login page / wrong host)
+            raise FaultMavenError(
+                f"health endpoint returned non-JSON (is FAULTMAVEN_API_URL "
+                f"pointing at the API?): {exc}"
+            ) from exc
+        if not isinstance(body, dict):
+            raise FaultMavenError(
+                f"health endpoint returned {type(body).__name__}, not an object "
+                "(is FAULTMAVEN_API_URL pointing at the API?)"
+            )
+        return body
+
+    def verify_auth(self) -> None:
+        """Confirm the current bearer token is actually accepted by the backend.
+
+        ``_ensure_token`` only *obtains* a token (and short-circuits entirely
+        when one is preset), so it can't catch a stale or wrong
+        ``FAULTMAVEN_API_TOKEN`` — that surfaces as a 401 on the first real turn.
+        This makes one authenticated call (``GET /api/v1/auth/me``) so preflight
+        can fail fast instead. Raises :class:`FaultMavenError`; a message
+        containing ``401`` means the token was rejected, any other status means
+        the check was inconclusive (e.g. the endpoint isn't present).
+        """
+
+        self._ensure_token()
+        try:
+            resp = self._http.get("/api/v1/auth/me", headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise FaultMavenError(f"auth check request failed: {exc}") from exc
+        if resp.status_code == 401:
+            raise FaultMavenError("token rejected (401): the bearer token is invalid")
+        if resp.status_code != 200:
+            raise FaultMavenError(
+                f"auth check inconclusive (HTTP {resp.status_code} from /auth/me)"
+            )
 
     # -- auth ---------------------------------------------------------------
     def _ensure_token(self) -> None:

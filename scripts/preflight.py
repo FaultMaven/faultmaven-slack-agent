@@ -6,15 +6,15 @@ This script front-loads those failures into clear, actionable checks so you know
 the agent is ready before you click anything.
 
     python scripts/preflight.py          # read-only checks (safe to run anytime)
-    python scripts/preflight.py --full   # also create a throwaway case + 1 turn
+    python scripts/preflight.py --full   # also create a case + 1 turn (writes data)
 
 Checks, in order (each independent; we run them all and summarize at the end):
 
   1. Config loads          — env present + token formats valid (fail-fast rules)
   2. Slack bot token       — auth.test → workspace + bot identity
   3. Slack app token       — apps.connections.open → Socket Mode + connections:write
-  4. FaultMaven backend    — /cases/health reachable
-  5. FaultMaven auth       — a bearer token can be obtained (dev-login or preset)
+  4. FaultMaven backend    — /health reachable (degraded is a warning, not a fail)
+  5. FaultMaven auth        — a bearer token is obtained AND accepted (/auth/me)
   6. Turn contract (--full)— create a case, submit one turn, render the reply
 
 Exit code is non-zero if any check fails, so it doubles as a CI/start gate.
@@ -35,9 +35,9 @@ from slack_sdk import WebClient  # noqa: E402
 from slack_sdk.errors import SlackApiError  # noqa: E402
 
 # config/client pull no Slack handlers, so importing them here is cheap.
+from app import make_fault_client  # noqa: E402 — shared client factory
 from config import Settings, get_settings  # noqa: E402
 from faultmaven import FaultMavenClient, FaultMavenError  # noqa: E402
-from faultmaven import FaultMavenClient, FaultMavenError
 
 GREEN, RED, YELLOW, DIM, RESET = (
     "\033[32m",
@@ -58,13 +58,21 @@ def _fail(msg: str, fix: str) -> bool:
     return False
 
 
+def _warn(msg: str, detail: str = "") -> bool:
+    # A non-fatal caveat: the agent can still run, so this does NOT fail the gate.
+    print(f"  {YELLOW}!{RESET} {msg}" + (f"  {DIM}{detail}{RESET}" if detail else ""))
+    return True
+
+
 def check_config() -> tuple[bool, Settings | None]:
     print("\nConfig")
     try:
         settings = get_settings()
     except Exception as exc:  # noqa: BLE001 — surface the validation message
-        # pydantic-settings raises with all field errors at once.
-        first = str(exc).strip().splitlines()[0]
+        # pydantic-settings raises with all field errors at once. Guard against
+        # an empty message (splitlines() on "" is [], which would IndexError).
+        lines = str(exc).strip().splitlines()
+        first = lines[0] if lines else type(exc).__name__
         _fail(
             f"settings failed to load: {first}",
             "copy .env.example to .env and fill in the required values "
@@ -114,8 +122,16 @@ def check_slack_app(settings: Settings) -> bool:
         # valid and carries connections:write.
         WebClient().apps_connections_open(app_token=settings.slack_app_token)
     except SlackApiError as exc:
+        error = exc.response.get("error")
+        # apps.connections.open is Tier-1 rate-limited (~1/min); a rate-limit on
+        # a repeated run doesn't mean the token is bad, so don't fail the gate.
+        if error == "ratelimited":
+            return _warn(
+                "apps.connections.open was rate-limited — token not verified",
+                "rerun in ~1 min if you need to confirm it",
+            )
         return _fail(
-            f"apps.connections.open failed: {exc.response.get('error')}",
+            f"apps.connections.open failed: {error}",
             "regenerate the app-level token with the connections:write scope "
             "and confirm Socket Mode is enabled in the app manifest.",
         )
@@ -134,26 +150,47 @@ def check_backend(fm: FaultMavenClient) -> bool:
             "start the FaultMaven API (default :8090) or fix FAULTMAVEN_API_URL.",
         )
     status = health.get("status", "unknown")
-    if status != "healthy":
-        return _fail(
-            f"backend reports status={status!r}",
-            "check the API logs / GET /health; a component is degraded.",
+    if status == "healthy":
+        return _ok("/health is healthy")
+    if status == "degraded":
+        # The case/turn API still serves in 'degraded' (e.g. a non-critical
+        # component warming up, ALLOW_TOOLLESS_INVESTIGATION, RLS-owner-role).
+        # Warn so the operator notices, but don't block the live test.
+        return _warn(
+            "backend reports status='degraded'",
+            "serviceable, but check GET /health for which component is down",
         )
-    return _ok("/health is healthy")
+    # 'unhealthy' / 'unknown' (missing field) → treat as a real failure.
+    return _fail(
+        f"backend reports status={status!r}",
+        "the backend is not serviceable; check the API logs / GET /health.",
+    )
 
 
 def check_backend_auth(fm: FaultMavenClient, settings: Settings) -> bool:
     print("\nFaultMaven auth")
     try:
-        fm._ensure_token()  # noqa: SLF001 — preflight legitimately probes auth
+        # verify_auth() obtains a token (dev-login or preset) AND confirms the
+        # backend accepts it — so a stale/wrong preset token fails here rather
+        # than 401-ing on the first real Slack turn.
+        fm.verify_auth()
     except FaultMavenError as exc:
+        if "401" in str(exc):
+            return _fail(
+                f"token rejected: {exc}",
+                "the bearer token is invalid — re-issue FAULTMAVEN_API_TOKEN, "
+                "or use a local-AUTH_MODE backend so dev-login works.",
+            )
+        if "inconclusive" in str(exc):
+            # e.g. /auth/me absent on an older backend — token may still be fine.
+            return _warn(f"could not confirm the token: {exc}")
         return _fail(
             f"could not obtain a bearer token: {exc}",
             "set FAULTMAVEN_API_TOKEN for this backend, or run a backend in "
             "local AUTH_MODE so dev-login works.",
         )
     how = "preset token" if settings.faultmaven_api_token else "dev-login bootstrap"
-    return _ok("bearer token acquired", f"via {how}")
+    return _ok("bearer token accepted", f"via {how}")
 
 
 def check_turn_contract(fm: FaultMavenClient) -> bool:
@@ -168,10 +205,14 @@ def check_turn_contract(fm: FaultMavenClient) -> bool:
             "the API logs and the version of faultmaven/modules/case.",
         )
     snippet = (result.agent_response or "").strip().replace("\n", " ")[:60]
-    return _ok(
+    ok = _ok(
         f"created {case_id} + 1 turn",
         f"state={result.case_state} reply={snippet!r}…",
     )
+    # This case persists in the backend — there's no delete in the contract yet.
+    print(f"    {DIM}note: '{case_id}' is left in the backend (titled "
+          f"'preflight smoke test'){RESET}")
+    return ok
 
 
 def main() -> int:
@@ -195,12 +236,7 @@ def main() -> int:
     results.append(check_slack_bot(settings))
     results.append(check_slack_app(settings))
 
-    fm = FaultMavenClient(
-        settings.faultmaven_api_url,
-        token=settings.faultmaven_api_token,
-        dev_login_username=settings.faultmaven_dev_login_username,
-        timeout=settings.faultmaven_request_timeout,
-    )
+    fm = make_fault_client(settings)
     try:
         results.append(check_backend(fm))
         results.append(check_backend_auth(fm, settings))
