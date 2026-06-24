@@ -17,7 +17,15 @@
     "assistant_view": {
       "assistant_description": "Describe a symptom or paste an error and I'll help you investigate — grounded in your runbooks, telemetry, and past incidents.",
       "suggested_prompts": []
-    }
+    },
+    "shortcuts": [
+      {
+        "name": "Investigate with FaultMaven",
+        "type": "message",
+        "callback_id": "fm_investigate_message",
+        "description": "Open a FaultMaven investigation seeded with this message"
+      }
+    ]
   },
   "oauth_config": {
     "scopes": {
