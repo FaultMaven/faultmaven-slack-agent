@@ -15,10 +15,10 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient
-from rendering import build_turn_blocks, clean_mention
+from rendering import clean_mention
 from store import CaseStore
 
-from ._turn import Dedup, run_turn
+from ._turn import Dedup, run_turn_and_post
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -72,51 +72,20 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             "Please investigate this thread."
         )
 
-        # Guard the placeholder post: if the bot isn't in the channel we can't
-        # post at all — log actionable guidance rather than crashing silently.
-        try:
-            placeholder = client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=":mag: FaultMaven is investigating…",
+        # First summons into a thread → replay the prior discussion (catch-up).
+        prior_context = None
+        if store.get(team_id, channel, thread_ts) is None:
+            prior_context = _fetch_thread_context(
+                client, channel, thread_ts, exclude_ts=event.get("ts")
             )
-        except SlackApiError as exc:
-            logger.warning(
-                "Cannot post in channel %s (%s) — is FaultMaven invited? "
-                "Try /invite @FaultMaven",
-                channel,
-                exc.response.get("error"),
-            )
-            return
 
-        try:
-            # First summons into a thread → replay the prior discussion.
-            prior_context = None
-            if store.get(team_id, channel, thread_ts) is None:
-                prior_context = _fetch_thread_context(
-                    client, channel, thread_ts, exclude_ts=event.get("ts")
-                )
-
-            result = run_turn(
-                fm,
-                store,
-                team_id=team_id,
-                channel_id=channel,
-                thread_ts=thread_ts,
-                text=text,
-                prior_context=prior_context,
-            )
-            client.chat_update(
-                channel=channel,
-                ts=placeholder["ts"],
-                text=result.agent_response[:300],
-                blocks=build_turn_blocks(result),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("app_mention turn failed: %s", exc)
-            client.chat_update(
-                channel=channel,
-                ts=placeholder["ts"],
-                text=":warning: FaultMaven hit an error while investigating. "
-                "Please mention me again.",
-            )
+        run_turn_and_post(
+            client,
+            fm,
+            store,
+            channel=channel,
+            thread_ts=thread_ts,
+            team_id=team_id,
+            text=text,
+            prior_context=prior_context,
+        )

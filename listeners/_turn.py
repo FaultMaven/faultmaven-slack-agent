@@ -1,8 +1,11 @@
-"""Shared turn pipeline + de-duplication used by every entry point.
+"""Shared turn pipeline: find-or-create case, submit a turn, post to Slack.
 
-All Slack surfaces (assistant panel, mention, …) resolve to the same operation:
-find-or-create the case for this thread, submit one turn, return the rendered
-result. Keeping it here avoids drift between surfaces.
+Every channel surface (mention, message shortcut, …) resolves to the same
+operation, so it lives here once: ``run_turn`` advances the case, and
+``run_turn_and_post`` wraps it with the placeholder→update→error-recovery posting
+flow so the surfaces can't drift (they previously diverged on dedup, error
+strings, and provenance). De-duplication is per-surface (different identities)
+so it stays in each handler.
 """
 
 from __future__ import annotations
@@ -11,10 +14,20 @@ import logging
 import threading
 from collections import OrderedDict
 
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
 from faultmaven import FaultMavenClient, TurnResult
+from rendering import build_turn_blocks
 from store import CaseStore
 
 logger = logging.getLogger(__name__)
+
+INVESTIGATING_PLACEHOLDER = ":mag: FaultMaven is investigating…"
+TURN_ERROR_TEXT = (
+    ":warning: FaultMaven hit an error on that turn. Please try again or "
+    "@mention me."
+)
 
 
 class Dedup:
@@ -32,6 +45,8 @@ class Dedup:
 
     def is_duplicate(self, key: str) -> bool:
         with self._lock:
+            if not key:
+                return False
             if key in self._seen:
                 self._seen.move_to_end(key)
                 return True
@@ -49,15 +64,22 @@ def run_turn(
     channel_id: str,
     thread_ts: str,
     text: str,
+    pasted_content: str | None = None,
+    source_url: str | None = None,
     prior_context: str | None = None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
 
-    The user's text is always delivered via the turn's ``query`` (not seeded as
-    the case ``initial_message``), so it isn't recorded twice and isn't bound by
-    the backend's 4000-char initial-message limit. On the first turn of a thread
-    that already had discussion, ``prior_context`` carries that discussion so the
-    engine isn't blind to what preceded the summons.
+    - ``text`` is always the turn's ``query`` (never seeded as the case
+      ``initial_message``, so it isn't recorded twice or bound by the 4000-char
+      limit).
+    - ``pasted_content`` is *this turn's* evidence (e.g. a shortcut's selected
+      message) and is sent on **every** turn, new case or existing.
+    - ``prior_context`` is the one-time catch-up (the prior thread discussion on
+      an ``@mention``); it augments the evidence **only when the case is
+      created**, never on later turns.
+    - ``source_url`` (e.g. a permalink to the alert) is passed through for case
+      provenance.
     """
 
     case_id = store.get(team_id, channel_id, thread_ts)
@@ -66,11 +88,78 @@ def run_turn(
         store.put(team_id, channel_id, thread_ts, case_id)
         logger.info("Opened case %s for thread %s", case_id, thread_ts)
         if prior_context:
-            return fm.submit_turn(
-                case_id,
-                query=text,
-                pasted_content=prior_context,
-                input_type="paste",
+            pasted_content = (
+                f"{prior_context}\n\n{pasted_content}"
+                if pasted_content
+                else prior_context
             )
 
+    if pasted_content or source_url:
+        return fm.submit_turn(
+            case_id,
+            query=text,
+            pasted_content=pasted_content or None,
+            source_url=source_url,
+            input_type="paste" if pasted_content else None,
+        )
     return fm.submit_turn(case_id, query=text)
+
+
+def run_turn_and_post(
+    client: WebClient,
+    fm: FaultMavenClient,
+    store: CaseStore,
+    *,
+    channel: str,
+    thread_ts: str,
+    team_id: str,
+    text: str,
+    pasted_content: str | None = None,
+    source_url: str | None = None,
+    prior_context: str | None = None,
+) -> None:
+    """Post a placeholder, run one turn, and update it in place — shared by the
+    mention and shortcut surfaces so the post/error flow can't drift.
+
+    Guards the placeholder post: if the bot isn't in the channel we can't post at
+    all, so we log actionable guidance rather than crashing silently.
+    """
+
+    try:
+        placeholder = client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=INVESTIGATING_PLACEHOLDER,
+        )
+    except SlackApiError as exc:
+        logger.warning(
+            "Cannot post in channel %s (%s) — is FaultMaven invited? "
+            "Try /invite @FaultMaven",
+            channel,
+            exc.response.get("error"),
+        )
+        return
+
+    try:
+        result = run_turn(
+            fm,
+            store,
+            team_id=team_id,
+            channel_id=channel,
+            thread_ts=thread_ts,
+            text=text,
+            pasted_content=pasted_content,
+            source_url=source_url,
+            prior_context=prior_context,
+        )
+        client.chat_update(
+            channel=channel,
+            ts=placeholder["ts"],
+            text=result.agent_response[:300],
+            blocks=build_turn_blocks(result),
+        )
+    except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
+        logger.exception("turn failed in %s: %s", channel, exc)
+        client.chat_update(
+            channel=channel, ts=placeholder["ts"], text=TURN_ERROR_TEXT
+        )

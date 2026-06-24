@@ -89,6 +89,18 @@ def test_empty_message_is_empty_string():
     assert message_to_text({}) == ""
 
 
+# -- defensive: malformed payloads degrade, they don't crash -------------------
+def test_block_text_as_bare_string_does_not_crash():
+    # Some bot-relayed messages put a string where a {type,text} object is expected.
+    msg = {"blocks": [{"type": "section", "text": "plain string here"}]}
+    assert "plain string here" in message_to_text(msg)
+
+
+def test_malformed_blocks_degrade_to_plain_text():
+    msg = {"text": "fallback", "blocks": ["not a dict", {"type": "section"}, 42]}
+    assert message_to_text(msg) == "fallback"
+
+
 # -- shortcut opener reuses run_turn: seed = the message as pasted_content ------
 def test_shortcut_core_seeds_case_with_extracted_message():
     # Load _turn.py directly (its package __init__ pulls in slack_bolt).
@@ -121,9 +133,10 @@ def test_shortcut_core_seeds_case_with_extracted_message():
     alert = message_to_text(
         {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "disk 98%"}}]}
     )
+    # The shortcut sends the alert as pasted_content (this-turn evidence).
     _turn.run_turn(
         fm, store, team_id="T", channel_id="C", thread_ts="msg_ts",
-        text="Please investigate this.", prior_context=alert,
+        text="Please investigate this.", pasted_content=alert, source_url="https://slack/p1",
     )
     assert calls["create"] == (None, None)  # no initial_message seed
     case_id, kw = calls["turns"][0]
@@ -131,3 +144,44 @@ def test_shortcut_core_seeds_case_with_extracted_message():
     assert kw["query"] == "Please investigate this."
     assert kw["pasted_content"] == "disk 98%"  # the alert seeds as evidence
     assert kw["input_type"] == "paste"
+    assert kw["source_url"] == "https://slack/p1"  # provenance back to the alert
+
+
+def test_pasted_content_is_sent_on_an_existing_case_too():
+    # The #3 fix: re-investigating a message whose thread already has a case must
+    # still deliver the alert (run_turn used to drop it on existing cases).
+    spec = importlib.util.spec_from_file_location("_turn2", "listeners/_turn.py")
+    _turn = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_turn)
+
+    turns: list = []
+
+    class FakeFM:
+        def __init__(self):
+            self.creates = 0
+
+        def create_case(self, *, title=None, initial_message=None):
+            self.creates += 1
+            return "case_1"
+
+        def submit_turn(self, case_id, **kwargs):
+            turns.append(kwargs)
+            return TurnResult(agent_response="ok")
+
+    class FakeStore:
+        def __init__(self):
+            self.m = {}
+
+        def get(self, t, c, th):
+            return self.m.get((t, c, th))
+
+        def put(self, t, c, th, cid):
+            self.m[(t, c, th)] = cid
+
+    fm, store = FakeFM(), FakeStore()
+    kw = dict(team_id="T", channel_id="C", thread_ts="t1")
+    _turn.run_turn(fm, store, text="q1", pasted_content="alert A", **kw)  # creates
+    _turn.run_turn(fm, store, text="q2", pasted_content="alert B", **kw)  # existing
+    assert fm.creates == 1
+    assert turns[0]["pasted_content"] == "alert A"
+    assert turns[1]["pasted_content"] == "alert B"  # NOT dropped on existing case
