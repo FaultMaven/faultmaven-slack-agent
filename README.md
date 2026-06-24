@@ -62,8 +62,9 @@ a summoned thread). Then create an app-level token with `connections:write`
 
 ## Status
 
-This is **P0** (foundational loop): Assistant container + `@mention`, the
-corrected case/turn backend contract, thread→case mapping, and Block Kit
-rendering. Streaming reasoning timeline, interactive action buttons, evidence
-upload, reports, App Home, and multi-workspace OAuth follow in P1–P6 — see the
-roadmap in [docs/design.md](docs/design.md) §14.
+Working: Assistant container + `@mention`, the corrected case/turn backend
+contract, thread→case mapping, Block Kit rendering, and **interactive
+suggested-action buttons** (DECIDE/FREE_SPEECH clicks submit typed turns to
+advance the investigation). Token-streaming reasoning timeline, evidence upload,
+reports, App Home, and multi-workspace OAuth follow next — see the roadmap in
+[docs/design.md](docs/design.md) §14.
