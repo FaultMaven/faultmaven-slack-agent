@@ -97,6 +97,30 @@ def test_submit_turn_requires_at_least_one_input():
         client.submit_turn("c1")
 
 
+# -- health -------------------------------------------------------------------
+def test_health_hits_top_level_endpoint_without_auth():
+    """The preflight probe must use /health (the /cases/health route is shadowed
+    by /cases/{case_id}); it's public, so no token is required."""
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "healthy"})
+
+    client = make_client(handler)  # no token, no dev-login
+    assert client.health() == {"status": "healthy"}
+    assert seen["path"] == "/health"
+    assert seen["auth"] is None  # unauthenticated
+
+
+def test_health_raises_on_error_status():
+    client = make_client(lambda req: httpx.Response(503, json={}))
+    with pytest.raises(FaultMavenError, match="health check failed"):
+        client.health()
+
+
 # -- auth resilience ----------------------------------------------------------
 def test_401_triggers_single_reauth_and_retry():
     state = {"posts": 0}

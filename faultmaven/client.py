@@ -96,6 +96,23 @@ class FaultMavenClient:
     def close(self) -> None:
         self._http.close()
 
+    def health(self) -> dict[str, Any]:
+        """Probe the backend's top-level ``/health`` liveness endpoint.
+
+        Used by the preflight doctor to confirm the API is reachable *before*
+        the agent connects to Slack. It's public (no token) and side-effect free
+        (creates no case), so it's safe to call on every startup check. (Note:
+        ``/api/v1/cases/health`` is shadowed by the ``/cases/{case_id}`` route,
+        so the app-wide ``/health`` is the reliable probe.)
+        """
+
+        try:
+            resp = self._http.get("/health")
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise FaultMavenError(f"health check failed: {exc}") from exc
+        return resp.json()
+
     # -- auth ---------------------------------------------------------------
     def _ensure_token(self) -> None:
         if self._token:
