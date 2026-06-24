@@ -1,10 +1,9 @@
 """Application settings for the FaultMaven Slack Agent.
 
-All configuration is sourced from environment variables (or a local ``.env``
-file during development) and validated on startup. Importing this module is
-cheap; the singleton :data:`settings` is built lazily via
-:func:`get_settings` so tests can override the environment before the first
-access.
+Sourced from environment variables (or a local ``.env`` during development) and
+validated on startup, so a missing token fails fast rather than on the first
+inbound Slack event. The singleton is built lazily via :func:`get_settings` so
+tests can patch the environment before the first access.
 """
 
 from __future__ import annotations
@@ -16,12 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Validated runtime configuration.
-
-    Fails fast at import/startup time if a required secret is missing, which
-    is preferable to discovering a missing token on the first inbound Slack
-    event (when we only have ~3 seconds to respond).
-    """
+    """Validated runtime configuration."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -33,36 +27,38 @@ class Settings(BaseSettings):
     # --- Slack credentials -------------------------------------------------
     # Bot User OAuth token ("xoxb-..."): used to call the Slack Web API.
     slack_bot_token: str = Field(..., validation_alias="SLACK_BOT_TOKEN")
-    # Signing secret: used to verify the authenticity of inbound requests.
-    slack_signing_secret: str = Field(..., validation_alias="SLACK_SIGNING_SECRET")
+    # Signing secret: verifies inbound requests (used by Bolt in HTTP mode).
+    slack_signing_secret: str = Field(
+        default="", validation_alias="SLACK_SIGNING_SECRET"
+    )
+    # App-level token ("xapp-..."): required for Socket Mode (the P0 dev transport).
+    slack_app_token: str = Field(default="", validation_alias="SLACK_APP_TOKEN")
 
-    # --- FaultMaven core orchestration API ---------------------------------
+    # --- FaultMaven core API -----------------------------------------------
     faultmaven_api_url: str = Field(
-        default="http://localhost:8090",
-        validation_alias="FAULTMAVEN_API_URL",
+        default="http://localhost:8090", validation_alias="FAULTMAVEN_API_URL"
     )
-    faultmaven_api_key: str = Field(
-        default="",
-        validation_alias="FAULTMAVEN_API_KEY",
+    # Pre-obtained bearer token. If empty, the agent bootstraps one via
+    # /auth/dev-login using ``faultmaven_dev_login_username`` (local auth mode).
+    faultmaven_api_token: str = Field(
+        default="", validation_alias="FAULTMAVEN_API_TOKEN"
     )
-    # Upper bound for a single orchestration call. The Slack-facing webhook is
-    # already ACK'd by the time we call FaultMaven, so this can comfortably
-    # exceed Slack's 3s budget.
+    faultmaven_dev_login_username: str = Field(
+        default="admin", validation_alias="FAULTMAVEN_DEV_LOGIN_USERNAME"
+    )
+    # Upper bound for one turn (incl. 202+poll). Runs behind the Slack ack, so
+    # it can comfortably exceed Slack's 3s budget.
     faultmaven_request_timeout: float = Field(
-        default=60.0,
-        validation_alias="FAULTMAVEN_REQUEST_TIMEOUT",
+        default=120.0, validation_alias="FAULTMAVEN_REQUEST_TIMEOUT"
     )
 
-    # --- Replay protection -------------------------------------------------
-    # Reject signed requests whose timestamp is older than this (seconds).
-    slack_request_max_age: int = Field(
-        default=60 * 5,
-        validation_alias="SLACK_REQUEST_MAX_AGE",
+    # --- Local state -------------------------------------------------------
+    # SQLite file backing the thread→case map (the source of truth for "which
+    # FaultMaven case is this Slack thread").
+    case_store_path: str = Field(
+        default="data/cases.db", validation_alias="CASE_STORE_PATH"
     )
 
-    # --- Server ------------------------------------------------------------
-    host: str = Field(default="0.0.0.0", validation_alias="HOST")
-    port: int = Field(default=3000, validation_alias="PORT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     @field_validator("slack_bot_token")
@@ -70,8 +66,7 @@ class Settings(BaseSettings):
     def _validate_bot_token(cls, value: str) -> str:
         if not value.startswith(("xoxb-", "xoxp-")):
             raise ValueError(
-                "SLACK_BOT_TOKEN must be a Slack bot/user token "
-                "(starts with 'xoxb-' or 'xoxp-')"
+                "SLACK_BOT_TOKEN must start with 'xoxb-' or 'xoxp-'"
             )
         return value
 
@@ -83,10 +78,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return the process-wide settings singleton.
-
-    Cached so repeated imports don't re-parse the environment. Tests can call
-    ``get_settings.cache_clear()`` after patching ``os.environ``.
-    """
+    """Return the process-wide settings singleton."""
 
     return Settings()  # type: ignore[call-arg]
