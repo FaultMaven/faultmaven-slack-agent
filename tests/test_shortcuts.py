@@ -185,3 +185,39 @@ def test_pasted_content_is_sent_on_an_existing_case_too():
     assert fm.creates == 1
     assert turns[0]["pasted_content"] == "alert A"
     assert turns[1]["pasted_content"] == "alert B"  # NOT dropped on existing case
+
+
+def test_run_turn_forwards_files_even_without_text_evidence():
+    # A file-only message: no pasted_content, but the downloaded files must still
+    # reach submit_turn (the file-ingestion increment).
+    spec = importlib.util.spec_from_file_location("_turn3", "listeners/_turn.py")
+    _turn = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_turn)
+
+    turns: list = []
+
+    class FakeFM:
+        def create_case(self, *, title=None, initial_message=None):
+            return "case_1"
+
+        def submit_turn(self, case_id, **kwargs):
+            turns.append(kwargs)
+            return TurnResult(agent_response="ok")
+
+    class FakeStore:
+        def __init__(self):
+            self.m = {}
+
+        def get(self, t, c, th):
+            return self.m.get((t, c, th))
+
+        def put(self, t, c, th, cid):
+            self.m[(t, c, th)] = cid
+
+    files = [("app.log", b"boom", "text/plain")]
+    _turn.run_turn(
+        FakeFM(), FakeStore(), team_id="T", channel_id="C", thread_ts="t1",
+        text="Please investigate this.", pasted_content=None, files=files,
+    )
+    assert turns[0]["files"] == files
+    assert turns[0]["pasted_content"] is None  # no text, files carry the evidence

@@ -67,6 +67,7 @@ def run_turn(
     pasted_content: str | None = None,
     source_url: str | None = None,
     prior_context: str | None = None,
+    files: list[tuple[str, bytes, str]] | None = None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
 
@@ -75,6 +76,8 @@ def run_turn(
       limit).
     - ``pasted_content`` is *this turn's* evidence (e.g. a shortcut's selected
       message) and is sent on **every** turn, new case or existing.
+    - ``files`` are *this turn's* attachments (already-downloaded
+      ``(name, bytes, content_type)`` tuples), forwarded as multipart evidence.
     - ``prior_context`` is the one-time catch-up (the prior thread discussion on
       an ``@mention``); it augments the evidence **only when the case is
       created**, never on later turns.
@@ -94,12 +97,13 @@ def run_turn(
                 else prior_context
             )
 
-    if pasted_content or source_url:
+    if pasted_content or source_url or files:
         return fm.submit_turn(
             case_id,
             query=text,
             pasted_content=pasted_content or None,
             source_url=source_url,
+            files=files or None,
             input_type="paste" if pasted_content else None,
         )
     return fm.submit_turn(case_id, query=text)
@@ -117,6 +121,7 @@ def run_turn_and_post(
     pasted_content: str | None = None,
     source_url: str | None = None,
     prior_context: str | None = None,
+    files: list[tuple[str, bytes, str]] | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place — shared by the
     mention and shortcut surfaces so the post/error flow can't drift.
@@ -151,6 +156,7 @@ def run_turn_and_post(
             pasted_content=pasted_content,
             source_url=source_url,
             prior_context=prior_context,
+            files=files,
         )
         client.chat_update(
             channel=channel,

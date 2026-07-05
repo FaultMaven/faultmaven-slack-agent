@@ -15,6 +15,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient
+from slack_files import download_message_files
 from slack_text import message_to_text
 from store import CaseStore
 
@@ -57,21 +58,24 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
         thread_ts = message.get("thread_ts") or message_ts
         team_id = context.team_id or ""
         alert_text = message_to_text(message)[:_SEED_LIMIT]
+        # Download any attached files (logs, screenshots) to forward as evidence.
+        files = download_message_files(client.token, message)
 
-        # Nothing readable (file-only / image-only / unsupported blocks): don't
-        # open a blank case — tell the user how to hand us the evidence.
-        if not alert_text.strip():
-            self_help = (
-                " (I can't read attached files yet — paste the key error/log "
-                "text and @mention me)"
-                if message.get("files")
-                else " — describe the problem or @mention me"
-            )
+        # Nothing usable at all — no text AND no ingestible file: don't open a
+        # blank case; tell the user how to hand us the evidence.
+        if not alert_text.strip() and not files:
+            if message.get("files"):
+                note = (
+                    " — I couldn't read the attached file(s) (too large, or I "
+                    "lack access). Paste the key text and @mention me."
+                )
+            else:
+                note = " — describe the problem or @mention me."
             try:
                 client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
-                    text=f":information_source: I couldn't read that message{self_help}.",
+                    text=f":information_source: I couldn't read that message{note}",
                 )
             except SlackApiError:
                 pass
@@ -94,6 +98,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             thread_ts=thread_ts,
             team_id=team_id,
             text=_SEED_QUERY,
-            pasted_content=alert_text,
+            pasted_content=alert_text or None,
             source_url=source_url,
+            files=files or None,
         )
