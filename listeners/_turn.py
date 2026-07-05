@@ -56,6 +56,23 @@ class Dedup:
             return False
 
 
+def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
+    """The query for a turn, or ``None`` if there's nothing to investigate.
+
+    ``raw_text`` may be missing/``None`` (Slack sends ``text: null`` on some
+    file-share messages) or whitespace. Returns ``None`` only when there is no
+    text *and* no ingestible file, so a caller can decline (tell the user)
+    instead of opening a blank case with an empty query the backend rejects.
+    """
+
+    text = (raw_text or "").strip()
+    if text:
+        return text
+    if downloaded_files:
+        return "Please investigate the attached file(s)."
+    return None
+
+
 def run_turn(
     fm: FaultMavenClient,
     store: CaseStore,

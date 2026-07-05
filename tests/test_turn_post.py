@@ -101,3 +101,34 @@ def test_forwards_files_through_to_submit_turn():
     )
     _, kw = fm.turns[0]
     assert kw["files"] == files
+
+
+# -- resolve_query: the assistant's text/decline decision ----------------------
+def test_resolve_query_prefers_user_text():
+    _turn = _load_turn()
+    assert _turn.resolve_query("  disk full  ", downloaded_files=True) == "disk full"
+
+
+def test_resolve_query_defaults_when_file_only():
+    _turn = _load_turn()
+    assert (
+        _turn.resolve_query("", downloaded_files=True)
+        == "Please investigate the attached file(s)."
+    )
+
+
+def test_resolve_query_none_when_nothing_to_investigate():
+    _turn = _load_turn()
+    # No text and no ingestible file → decline (don't open a blank case).
+    assert _turn.resolve_query("", downloaded_files=False) is None
+    assert _turn.resolve_query("   ", downloaded_files=False) is None
+
+
+def test_resolve_query_handles_null_text():
+    # Slack sends text:null on some file-share messages — must not AttributeError.
+    _turn = _load_turn()
+    assert _turn.resolve_query(None, downloaded_files=False) is None
+    assert (
+        _turn.resolve_query(None, downloaded_files=True)
+        == "Please investigate the attached file(s)."
+    )
