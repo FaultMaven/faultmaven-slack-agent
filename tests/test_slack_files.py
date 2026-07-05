@@ -96,27 +96,80 @@ def test_skips_oversized_by_downloaded_length():
     assert out == []
 
 
-def test_skips_html_login_page_when_file_is_not_html():
-    # A token lacking files:read gets a 200 HTML login page, not the bytes.
+_LOGIN_PAGE = b"<!DOCTYPE html><html><head><title>Sign in | Slack</title></head><body>Sign in to Slack</body></html>"
+
+
+def test_skips_slack_login_page():
+    # A token lacking access gets a 200 sign-in page, not the bytes.
     out = download_message_files(
         "tok",
         {"files": [_file(mimetype="text/plain")]},
         http_client=_client(
-            lambda r: httpx.Response(200, content=b"<html>login</html>", headers={"content-type": "text/html"})
+            lambda r: httpx.Response(200, content=_LOGIN_PAGE, headers={"content-type": "text/html"})
         ),
     )
     assert out == []
 
 
+def test_skips_login_page_even_when_declared_html_or_odd_content_type():
+    # The old content-type-only guard let a login page through when the file was
+    # declared HTML, or when the login page came back as octet-stream. Body-sniff
+    # catches both.
+    for mimetype, ctype in [("text/html", "text/html"), ("text/plain", "application/octet-stream")]:
+        out = download_message_files(
+            "tok",
+            {"files": [_file(name="report.html", mimetype=mimetype)]},
+            http_client=_client(
+                lambda r: httpx.Response(200, content=_LOGIN_PAGE, headers={"content-type": ctype})
+            ),
+        )
+        assert out == [], f"{mimetype}/{ctype} login page leaked through"
+
+
 def test_keeps_genuine_html_file():
+    # A real .html attachment (no sign-in markers) is kept.
+    body = b"<html><body><h1>incident report</h1></body></html>"
     out = download_message_files(
         "tok",
         {"files": [_file(name="page.html", mimetype="text/html")]},
         http_client=_client(
-            lambda r: httpx.Response(200, content=b"<html>real</html>", headers={"content-type": "text/html"})
+            lambda r: httpx.Response(200, content=body, headers={"content-type": "text/html"})
         ),
     )
-    assert out == [("page.html", b"<html>real</html>", "text/html")]
+    assert out == [("page.html", body, "text/html")]
+
+
+def test_follows_redirect_to_cdn():
+    # Slack file URLs legitimately 3xx to a CDN host; we must follow, not drop.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "cdn" not in str(request.url):
+            return httpx.Response(302, headers={"location": "https://cdn.slack/app.log"})
+        return httpx.Response(200, content=b"boom", headers={"content-type": "text/plain"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    out = download_message_files("tok", {"files": [_file()]}, http_client=client)
+    assert out == [("app.log", b"boom", "text/plain")]
+
+
+def test_skips_empty_body():
+    out = download_message_files(
+        "tok",
+        {"files": [_file(size=0)]},
+        http_client=_client(lambda r: httpx.Response(200, content=b"", headers={"content-type": "text/plain"})),
+    )
+    assert out == []
+
+
+def test_sanitizes_filename_strips_path_components():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x", headers={"content-type": "text/plain"})
+
+    out = download_message_files(
+        "tok",
+        {"files": [_file(name="../../etc/passwd")]},
+        http_client=_client(handler),
+    )
+    assert out == [("passwd", b"x", "text/plain")]  # basename only
 
 
 def test_download_error_skips_that_file_but_keeps_others():

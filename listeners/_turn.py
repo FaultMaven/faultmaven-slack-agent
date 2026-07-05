@@ -109,6 +109,32 @@ def run_turn(
     return fm.submit_turn(case_id, query=text)
 
 
+def post_placeholder(
+    client: WebClient, channel: str, thread_ts: str
+) -> str | None:
+    """Post the "investigating…" placeholder and return its ``ts``.
+
+    Returns ``None`` (with actionable logging) if the bot can't post — e.g. it
+    isn't in the channel — so callers stop rather than crash. Posting this
+    *before* any slow pre-work (like downloading attachments) is what keeps the
+    feedback instant.
+    """
+
+    try:
+        resp = client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=INVESTIGATING_PLACEHOLDER
+        )
+    except SlackApiError as exc:
+        logger.warning(
+            "Cannot post in channel %s (%s) — is FaultMaven invited? "
+            "Try /invite @FaultMaven",
+            channel,
+            exc.response.get("error"),
+        )
+        return None
+    return resp["ts"]
+
+
 def run_turn_and_post(
     client: WebClient,
     fm: FaultMavenClient,
@@ -122,28 +148,20 @@ def run_turn_and_post(
     source_url: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
+    placeholder_ts: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place — shared by the
     mention and shortcut surfaces so the post/error flow can't drift.
 
-    Guards the placeholder post: if the bot isn't in the channel we can't post at
-    all, so we log actionable guidance rather than crashing silently.
+    ``placeholder_ts`` lets a caller that already posted the placeholder (e.g. to
+    show feedback before a slow file download) reuse it instead of posting a
+    second one.
     """
 
-    try:
-        placeholder = client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=INVESTIGATING_PLACEHOLDER,
-        )
-    except SlackApiError as exc:
-        logger.warning(
-            "Cannot post in channel %s (%s) — is FaultMaven invited? "
-            "Try /invite @FaultMaven",
-            channel,
-            exc.response.get("error"),
-        )
-        return
+    if placeholder_ts is None:
+        placeholder_ts = post_placeholder(client, channel, thread_ts)
+        if placeholder_ts is None:
+            return
 
     try:
         result = run_turn(
@@ -160,12 +178,12 @@ def run_turn_and_post(
         )
         client.chat_update(
             channel=channel,
-            ts=placeholder["ts"],
+            ts=placeholder_ts,
             text=result.agent_response[:300],
             blocks=build_turn_blocks(result),
         )
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
         logger.exception("turn failed in %s: %s", channel, exc)
         client.chat_update(
-            channel=channel, ts=placeholder["ts"], text=TURN_ERROR_TEXT
+            channel=channel, ts=placeholder_ts, text=TURN_ERROR_TEXT
         )
