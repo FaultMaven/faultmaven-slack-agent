@@ -9,9 +9,11 @@ from __future__ import annotations
 from logging import Logger
 
 from slack_bolt import Assistant, BoltContext, Say, SetStatus, SetSuggestedPrompts
+from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
 from rendering import build_turn_blocks
+from slack_files import download_message_files
 from store import CaseStore
 
 from ._turn import Dedup, run_turn
@@ -61,6 +63,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
     def user_message(
         payload: dict,
         context: BoltContext,
+        client: WebClient,
         set_status: SetStatus,
         say: Say,
         logger: Logger,
@@ -70,14 +73,25 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 f"{payload.get('channel')}:{payload.get('ts')}"
             ):
                 return
+            # set_status shows the native "investigating" indicator immediately,
+            # so the file download below still has visible feedback in front of it.
             set_status("is investigating…")
+            files = (
+                download_message_files(client.token, payload)
+                if payload.get("files")
+                else []
+            )
+            text = payload.get("text", "")
+            if not text.strip() and files:
+                text = "Please investigate the attached file(s)."
             result = run_turn(
                 fm,
                 store,
                 team_id=context.team_id or "",
                 channel_id=payload["channel"],
                 thread_ts=payload["thread_ts"],
-                text=payload.get("text", ""),
+                text=text,
+                files=files or None,
             )
             say(
                 text=result.agent_response[:300],

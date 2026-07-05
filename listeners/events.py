@@ -16,9 +16,10 @@ from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient
 from rendering import clean_mention
+from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, run_turn_and_post
+from ._turn import Dedup, post_placeholder, run_turn_and_post
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -72,12 +73,25 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             "Please investigate this thread."
         )
 
+        # Post the placeholder up front, before the (possibly slow) catch-up read
+        # and file download, so the summons is acknowledged immediately.
+        placeholder_ts = post_placeholder(client, channel, thread_ts)
+        if placeholder_ts is None:
+            return  # can't post here — /invite @FaultMaven
+
         # First summons into a thread → replay the prior discussion (catch-up).
         prior_context = None
         if store.get(team_id, channel, thread_ts) is None:
             prior_context = _fetch_thread_context(
                 client, channel, thread_ts, exclude_ts=event.get("ts")
             )
+
+        # Files attached to the mention itself are forwarded as evidence.
+        files = (
+            download_message_files(client.token, event)
+            if event.get("files")
+            else []
+        )
 
         run_turn_and_post(
             client,
@@ -88,4 +102,6 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             team_id=team_id,
             text=text,
             prior_context=prior_context,
+            files=files or None,
+            placeholder_ts=placeholder_ts,
         )
