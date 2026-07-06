@@ -31,7 +31,7 @@ The manifest pre-wires everything this agent uses:
 |---|---|
 | `assistant_view` + `assistant_thread_started`/`message.im` events | the **Assistant** side-panel surface |
 | `app_mention` event + `app_mentions:read` | the **@mention war-room** surface |
-| `shortcuts: [fm_investigate_message]` + `interactivity` | the **"Ask FaultMaven"** message shortcut |
+| `shortcuts: [fm_investigate_message]` + `interactivity` + `commands` | the **"Ask FaultMaven"** message shortcut (shortcuts need the `commands` scope) |
 | `chat:write` | posting replies + the investigating placeholder |
 | `files:read` | downloading attached logs/configs/screenshots as evidence |
 | `channels:history` / `groups:history` / `im:history` | replaying a thread on first summons (catch-up) |

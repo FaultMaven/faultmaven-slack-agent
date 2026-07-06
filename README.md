@@ -67,9 +67,9 @@ then smoke each surface (Assistant panel, @mention, message shortcut, buttons).
 
 Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *From
 a manifest*). It enables Socket Mode and requests least-privilege scopes
-(`assistant:write`, `chat:write`, `app_mentions:read`, `files:read` to download
-attached logs/screenshots, plus `*:history` to replay a summoned thread), and
-registers the **Ask FaultMaven** message shortcut. Then create an
+(`assistant:write`, `chat:write`, `commands` for the shortcut, `app_mentions:read`,
+`files:read` to download attached logs/screenshots, plus `*:history` to replay a
+summoned thread), and registers the **Ask FaultMaven** message shortcut. Then create an
 app-level token with `connections:write` (→ `SLACK_APP_TOKEN`) and install to
 your workspace. Full walkthrough: [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
 
