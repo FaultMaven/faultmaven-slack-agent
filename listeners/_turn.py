@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass, field
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -98,6 +99,103 @@ class _ThreadSerializer:
 # Serializes turns per Slack thread (see _ThreadSerializer). Threads are keyed by
 # team+channel+thread, so different threads still run concurrently.
 _serializer = _ThreadSerializer()
+
+FOLDED_NOTE = ":link: Folded into FaultMaven's reply above."
+
+
+@dataclass
+class _TurnRequest:
+    """One surface's request to advance a thread, plus how to reply to it.
+
+    Carries its own placeholder ``ts`` so that when several requests for the same
+    thread are coalesced into one turn, each still gets an answer: the batch's
+    result lands on the first request's placeholder, and the rest are marked
+    ``FOLDED_NOTE`` (their input was merged in, not dropped).
+    """
+
+    client: WebClient
+    channel: str
+    thread_ts: str
+    team_id: str
+    placeholder_ts: str
+    text: str
+    pasted_content: str | None = None
+    source_url: str | None = None
+    prior_context: str | None = None
+    files: list[tuple[str, bytes, str]] | None = field(default=None)
+
+
+def _merge_requests(reqs: list[_TurnRequest]) -> _TurnRequest:
+    """Combine coalesced requests into one turn — losing no text or files."""
+
+    base = reqs[0]
+    if len(reqs) == 1:
+        return base
+    texts = [r.text for r in reqs if r.text and r.text.strip()]
+    pasted = [r.pasted_content for r in reqs if r.pasted_content]
+    files: list[tuple[str, bytes, str]] = []
+    for r in reqs:
+        files.extend(r.files or [])
+    return _TurnRequest(
+        client=base.client,
+        channel=base.channel,
+        thread_ts=base.thread_ts,
+        team_id=base.team_id,
+        placeholder_ts=base.placeholder_ts,
+        text="\n\n".join(texts),
+        pasted_content="\n\n".join(pasted) or None,
+        # prior_context/source_url only matter on case creation (the first turn),
+        # so the first non-empty wins.
+        source_url=next((r.source_url for r in reqs if r.source_url), None),
+        prior_context=next((r.prior_context for r in reqs if r.prior_context), None),
+        files=files or None,
+    )
+
+
+class _CoalescingRunner:
+    """Per-thread single-flight executor that coalesces bursts into one turn.
+
+    The first request for an idle thread runs immediately (on a daemon worker, so
+    the Bolt listener thread returns at once). Requests that arrive while that
+    turn is in flight are *collected*; when it finishes they're merged into ONE
+    combined next turn — so a burst of N replies (several people answering the
+    same question at once) costs one extra turn, not N, and nobody's text or
+    files are dropped. Different threads drain on independent workers.
+    """
+
+    def __init__(self) -> None:
+        # key present ⇒ a worker is draining it; value = requests queued for the
+        # *next* turn on that thread.
+        self._pending: dict[str, list[_TurnRequest]] = {}
+        self._guard = threading.Lock()
+
+    def submit(self, key: str, req: _TurnRequest, run_batch) -> None:
+        with self._guard:
+            if key in self._pending:
+                self._pending[key].append(req)
+                return
+            self._pending[key] = []
+        threading.Thread(
+            target=self._drain, args=(key, [req], run_batch), daemon=True
+        ).start()
+
+    def _drain(self, key: str, batch: list[_TurnRequest], run_batch) -> None:
+        while batch:
+            try:
+                run_batch(batch)
+            except Exception as exc:  # noqa: BLE001 — a bad turn must not kill the loop
+                logger.exception("coalesced batch failed on %s: %s", key, exc)
+            with self._guard:
+                queued = self._pending.get(key)
+                if queued:
+                    self._pending[key] = []
+                    batch = queued
+                else:
+                    del self._pending[key]
+                    batch = None  # type: ignore[assignment]
+
+
+_runner = _CoalescingRunner()
 
 
 def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
@@ -201,6 +299,49 @@ def post_placeholder(
     return resp["ts"]
 
 
+def _process_channel_batch(
+    fm: FaultMavenClient, store: CaseStore, batch: list[_TurnRequest]
+) -> None:
+    """Run one (possibly coalesced) turn and post it — the runner's unit of work.
+
+    The batch's merged input becomes a single turn; its result lands on the first
+    request's placeholder and the rest are marked ``FOLDED_NOTE`` so every
+    replier gets closure. A failure marks them all with the error text.
+    """
+
+    req = _merge_requests(batch)
+    client = req.client
+    try:
+        result = run_turn(
+            fm,
+            store,
+            team_id=req.team_id,
+            channel_id=req.channel,
+            thread_ts=req.thread_ts,
+            text=req.text,
+            pasted_content=req.pasted_content,
+            source_url=req.source_url,
+            prior_context=req.prior_context,
+            files=req.files,
+        )
+        client.chat_update(
+            channel=req.channel,
+            ts=req.placeholder_ts,
+            text=result.agent_response[:300],
+            blocks=build_turn_blocks(result),
+        )
+        for extra in batch[1:]:
+            extra.client.chat_update(
+                channel=extra.channel, ts=extra.placeholder_ts, text=FOLDED_NOTE
+            )
+    except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
+        logger.exception("turn failed in %s: %s", req.channel, exc)
+        for r in batch:
+            r.client.chat_update(
+                channel=r.channel, ts=r.placeholder_ts, text=TURN_ERROR_TEXT
+            )
+
+
 def run_turn_and_post(
     client: WebClient,
     fm: FaultMavenClient,
@@ -216,12 +357,14 @@ def run_turn_and_post(
     files: list[tuple[str, bytes, str]] | None = None,
     placeholder_ts: str | None = None,
 ) -> None:
-    """Post a placeholder, run one turn, and update it in place — shared by the
-    mention and shortcut surfaces so the post/error flow can't drift.
+    """Acknowledge a reply and hand it to the per-thread coalescing runner.
 
-    ``placeholder_ts`` lets a caller that already posted the placeholder (e.g. to
-    show feedback before a slow file download) reuse it instead of posting a
-    second one.
+    Posts the "investigating…" placeholder now (instant feedback), then enqueues
+    the turn and returns — the runner drains it on a background worker, so the
+    Bolt listener thread is freed immediately. If a turn is already in flight for
+    this thread, this reply is *coalesced* into the next one (see
+    :class:`_CoalescingRunner`) rather than racing it. ``placeholder_ts`` reuses
+    a placeholder a caller already posted (e.g. before a slow file download).
     """
 
     if placeholder_ts is None:
@@ -229,27 +372,17 @@ def run_turn_and_post(
         if placeholder_ts is None:
             return
 
-    try:
-        result = run_turn(
-            fm,
-            store,
-            team_id=team_id,
-            channel_id=channel,
-            thread_ts=thread_ts,
-            text=text,
-            pasted_content=pasted_content,
-            source_url=source_url,
-            prior_context=prior_context,
-            files=files,
-        )
-        client.chat_update(
-            channel=channel,
-            ts=placeholder_ts,
-            text=result.agent_response[:300],
-            blocks=build_turn_blocks(result),
-        )
-    except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
-        logger.exception("turn failed in %s: %s", channel, exc)
-        client.chat_update(
-            channel=channel, ts=placeholder_ts, text=TURN_ERROR_TEXT
-        )
+    req = _TurnRequest(
+        client=client,
+        channel=channel,
+        thread_ts=thread_ts,
+        team_id=team_id,
+        placeholder_ts=placeholder_ts,
+        text=text,
+        pasted_content=pasted_content,
+        source_url=source_url,
+        prior_context=prior_context,
+        files=files,
+    )
+    key = "\x00".join((team_id, channel, thread_ts))
+    _runner.submit(key, req, lambda b: _process_channel_batch(fm, store, b))

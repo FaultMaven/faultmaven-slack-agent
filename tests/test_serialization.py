@@ -10,8 +10,11 @@ import time
 
 
 def _load_turn():
+    import sys
+
     spec = importlib.util.spec_from_file_location("_turn_s", "listeners/_turn.py")
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # let @dataclass resolve annotations
     spec.loader.exec_module(mod)
     return mod
 
