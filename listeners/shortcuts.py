@@ -19,13 +19,7 @@ from slack_files import download_message_files
 from slack_text import message_to_text
 from store import CaseStore
 
-from ._turn import (
-    Dedup,
-    end_turn,
-    post_placeholder,
-    run_turn_and_post,
-    try_begin_turn,
-)
+from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
 
 # The shortcut seeds the message as evidence (pasted_content); this is the query.
 _SEED_QUERY = "Please investigate this."
@@ -71,17 +65,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             _decline(client, channel, thread_ts, " — describe the problem or @mention me.")
             return
 
-        # Reserve the thread. If a turn is already running here, this deliberate
-        # action gets a note rather than a silent no-op.
-        if not try_begin_turn(
-            client, team_id=team_id, channel=channel, thread_ts=thread_ts
-        ):
-            _decline(
-                client, channel, thread_ts,
-                " — I'm still working on this thread; try again once I've replied.",
-            )
-            return
-        try:
+        def work() -> None:
             # Placeholder BEFORE the (potentially slow) file download for instant
             # feedback; reuse it for the reply.
             placeholder_ts = post_placeholder(client, channel, thread_ts)
@@ -128,8 +112,17 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 placeholder_ts=placeholder_ts,
                 mention_user=context.user_id,
             )
-        finally:
-            end_turn(team_id, channel, thread_ts)
+
+        # Reserve the thread and run in the background. If a turn is already
+        # running here, this deliberate action gets a note rather than a no-op.
+        if not run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=None, work=work,
+        ):
+            _decline(
+                client, channel, thread_ts,
+                " — I'm still working on this thread; try again once I've replied.",
+            )
 
 
 def _decline(client: WebClient, channel: str, thread_ts: str, note: str) -> None:

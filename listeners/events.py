@@ -24,13 +24,7 @@ from rendering import clean_mention
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import (
-    Dedup,
-    end_turn,
-    post_placeholder,
-    run_turn_and_post,
-    try_begin_turn,
-)
+from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -102,7 +96,9 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     followup_dedup = Dedup()
 
     @app.event("app_mention")
-    def on_app_mention(event: dict, client: WebClient, logger: Logger) -> None:
+    def on_app_mention(
+        event: dict, context: BoltContext, client: WebClient, logger: Logger
+    ) -> None:
         # Ignore the bot's own messages; de-dupe Slack retries.
         if event.get("bot_id"):
             return
@@ -110,17 +106,14 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             return
 
         channel = event["channel"]
-        team_id = event.get("team", "")
+        # context.team_id (the app's install team) keys the thread's case and gate
+        # uniformly across surfaces — event["team"] is the *sender's* team and can
+        # differ in Slack Connect, which would fork the case/gate.
+        team_id = context.team_id or ""
         # A mention may be top-level (use its ts) or already inside a thread.
         thread_ts = event.get("thread_ts") or event["ts"]
 
-        # Reserve the thread; if a turn is already running, skip this one (⏭️).
-        if not try_begin_turn(
-            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
-            skip_ts=event.get("ts"),
-        ):
-            return
-        try:
+        def work() -> None:
             text = clean_mention(event.get("text", "")) or (
                 "Please investigate this thread."
             )
@@ -137,10 +130,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client, channel, thread_ts, exclude_ts=event.get("ts")
                 )
 
-            # Files attached to the mention are forwarded as evidence (no-ops to
-            # [] when there are none).
             files = download_message_files(client.token, event)
-
             run_turn_and_post(
                 client,
                 fm,
@@ -154,8 +144,13 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 placeholder_ts=placeholder_ts,
                 mention_user=event.get("user"),
             )
-        finally:
-            end_turn(team_id, channel, thread_ts)
+
+        # Reserve the thread and run on a background worker; if a turn is already
+        # running, this one is skipped (⏭️).
+        run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"), work=work,
+        )
 
     @app.event("message")
     def on_thread_message(
@@ -170,26 +165,23 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
 
         channel = event["channel"]
         thread_ts = event["thread_ts"]
-        team_id = event.get("team", "")
+        team_id = context.team_id or ""  # install team — see on_app_mention
         # Only act on threads that are already an investigation.
         if store.get(team_id, channel, thread_ts) is None:
             return
         if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
             return
 
-        # Reserve the thread; if a turn is already running, skip this reply (⏭️)
-        # — the sender should wait for FaultMaven's reply, then resend.
-        if not try_begin_turn(
-            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
-            skip_ts=event.get("ts"),
-        ):
+        # Decide there's something to investigate BEFORE reserving the thread, so
+        # a content-free reply (whitespace, or only another user's mention) can't
+        # hold the gate and cause a concurrent real reply to be skipped.
+        text = clean_mention(event.get("text") or "").strip()
+        has_files = bool(event.get("files"))
+        if not text and not has_files:
             return
-        try:
-            text = clean_mention(event.get("text") or "").strip()
-            files = download_message_files(client.token, event)
-            if not text and not files:
-                return  # nothing new to add (e.g. an emoji-only reply)
 
+        def work() -> None:
+            files = download_message_files(client.token, event) if has_files else []
             run_turn_and_post(
                 client,
                 fm,
@@ -201,5 +193,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 files=files or None,
                 mention_user=event.get("user"),
             )
-        finally:
-            end_turn(team_id, channel, thread_ts)
+
+        # Reserve the thread and run in the background; if a turn is already
+        # running, skip this reply (⏭️) — the sender waits, then resends.
+        run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"), work=work,
+        )

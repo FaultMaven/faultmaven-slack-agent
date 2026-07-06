@@ -124,8 +124,15 @@ def try_begin_turn(
             client.reactions_add(
                 channel=channel, timestamp=skip_ts, name=SKIPPED_REACTION
             )
-        except SlackApiError:
-            pass  # missing scope / already reacted — the drop still stands
+        except Exception as exc:  # noqa: BLE001 — reacting must never raise on the drop path
+            # e.g. reactions:write not (re)consented → the skip has no visible
+            # signal; log it loudly so the missing scope is diagnosable.
+            logger.warning(
+                "Could not mark a skipped message in %s (%s) — is reactions:write "
+                "granted? The message was dropped with no ⏭️.",
+                channel,
+                exc,
+            )
     return False
 
 
@@ -133,6 +140,42 @@ def end_turn(team_id: str, channel: str, thread_ts: str) -> None:
     """Release a thread reserved by :func:`try_begin_turn` (call in ``finally``)."""
 
     _gate.release(_thread_key(team_id, channel, thread_ts))
+
+
+def run_gated(
+    client: WebClient,
+    *,
+    team_id: str,
+    channel: str,
+    thread_ts: str,
+    skip_ts: str | None,
+    work,
+) -> bool:
+    """Reserve the thread and run ``work()`` on a background daemon.
+
+    Returns True and offloads ``work`` (releasing the thread when it finishes) if
+    the thread was idle; the Bolt listener thread returns immediately, so a long
+    turn never pins a Socket Mode worker or delays the envelope ack. Returns False
+    if a turn is already running — the caller decides how to signal that; when
+    ``skip_ts`` is given the busy message is marked ⏭️ automatically.
+    """
+
+    if not try_begin_turn(
+        client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+        skip_ts=skip_ts,
+    ):
+        return False
+
+    def runner() -> None:
+        try:
+            work()
+        except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
+            logger.exception("gated turn failed in %s: %s", channel, exc)
+        finally:
+            end_turn(team_id, channel, thread_ts)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True
 
 
 def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:

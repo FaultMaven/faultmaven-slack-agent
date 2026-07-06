@@ -18,7 +18,7 @@ from faultmaven import FaultMavenClient, TurnResult
 from rendering import SUGGESTED_ACTION_PATTERN, build_turn_blocks
 from store import CaseStore
 
-from ._turn import end_turn, try_begin_turn
+from ._turn import run_gated
 
 
 def apply_action(
@@ -71,10 +71,45 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = message.get("thread_ts") or message["ts"]
         team_id = context.team_id or ""
 
-        # A click advances the case, so it's a turn — reserve the thread. If one
-        # is already running, tell the clicker to retry once it's replied.
-        if not try_begin_turn(
-            client, team_id=team_id, channel=channel, thread_ts=thread_ts
+        def work() -> None:
+            try:
+                action = body["actions"][0]
+                label = action.get("text", {}).get("text", "")
+                case_id = store.get(team_id, channel, thread_ts)
+                if not case_id:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=":warning: I lost track of this investigation's case. "
+                        "Please @mention me to continue.",
+                    )
+                    return
+
+                result = apply_action(fm, case_id, action["value"])
+                _disable_actions(client, body, label)
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=result.agent_response[:300],
+                    blocks=build_turn_blocks(result),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("suggested-action failed: %s", exc)
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=":warning: That action hit an error. "
+                        "Please try again or @mention me.",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # A click advances the case, so it's a turn — reserve the thread and run
+        # in the background. If one is already running, tell the clicker to retry.
+        if not run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=None, work=work,
         ):
             client.chat_postMessage(
                 channel=channel,
@@ -82,38 +117,3 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 text=":hourglass_flowing_sand: Still working on the previous turn "
                 "— click that again once I've replied.",
             )
-            return
-        try:
-            action = body["actions"][0]
-            label = action.get("text", {}).get("text", "")
-            case_id = store.get(team_id, channel, thread_ts)
-            if not case_id:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=":warning: I lost track of this investigation's case. "
-                    "Please @mention me to continue.",
-                )
-                return
-
-            result = apply_action(fm, case_id, action["value"])
-            _disable_actions(client, body, label)
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=result.agent_response[:300],
-                blocks=build_turn_blocks(result),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("suggested-action failed: %s", exc)
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=":warning: That action hit an error. "
-                    "Please try again or @mention me.",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            end_turn(team_id, channel, thread_ts)
