@@ -33,6 +33,7 @@
         "assistant:write",
         "chat:write",
         "app_mentions:read",
+        "files:read",
         "im:history",
         "channels:history",
         "groups:history"

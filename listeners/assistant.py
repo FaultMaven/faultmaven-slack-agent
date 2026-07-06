@@ -9,12 +9,14 @@ from __future__ import annotations
 from logging import Logger
 
 from slack_bolt import Assistant, BoltContext, Say, SetStatus, SetSuggestedPrompts
+from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
 from rendering import build_turn_blocks
+from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, run_turn
+from ._turn import Dedup, resolve_query, run_turn
 
 _SUGGESTED_PROMPTS = [
     {
@@ -61,6 +63,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
     def user_message(
         payload: dict,
         context: BoltContext,
+        client: WebClient,
         set_status: SetStatus,
         say: Say,
         logger: Logger,
@@ -70,14 +73,34 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 f"{payload.get('channel')}:{payload.get('ts')}"
             ):
                 return
+            # set_status shows the native "investigating" indicator immediately,
+            # so the file download below still has visible feedback in front of it.
             set_status("is investigating…")
+            # download_message_files no-ops (returns []) when there are no files.
+            files = download_message_files(client.token, payload)
+
+            query = resolve_query(payload.get("text"), downloaded_files=bool(files))
+            if query is None:
+                # No text and nothing ingestible — don't open a blank case; say
+                # why (mirrors the shortcut's decline instead of a generic error).
+                say(
+                    ":information_source: I couldn't read the attached file(s) "
+                    "(too large, or I lack access). Paste the key text and I'll "
+                    "take it from there."
+                    if payload.get("files")
+                    else "Tell me what's going on — describe a symptom, paste an "
+                    "error, or attach a log."
+                )
+                return
+
             result = run_turn(
                 fm,
                 store,
                 team_id=context.team_id or "",
                 channel_id=payload["channel"],
                 thread_ts=payload["thread_ts"],
-                text=payload.get("text", ""),
+                text=query,
+                files=files or None,
             )
             say(
                 text=result.agent_response[:300],

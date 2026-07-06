@@ -15,10 +15,11 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient
+from slack_files import download_message_files
 from slack_text import message_to_text
 from store import CaseStore
 
-from ._turn import Dedup, run_turn_and_post
+from ._turn import Dedup, post_placeholder, run_turn_and_post
 
 # The shortcut seeds the message as evidence (pasted_content); this is the query.
 _SEED_QUERY = "Please investigate this."
@@ -57,24 +58,34 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
         thread_ts = message.get("thread_ts") or message_ts
         team_id = context.team_id or ""
         alert_text = message_to_text(message)[:_SEED_LIMIT]
+        has_files = bool(message.get("files"))
 
-        # Nothing readable (file-only / image-only / unsupported blocks): don't
-        # open a blank case — tell the user how to hand us the evidence.
-        if not alert_text.strip():
-            self_help = (
-                " (I can't read attached files yet — paste the key error/log "
-                "text and @mention me)"
-                if message.get("files")
-                else " — describe the problem or @mention me"
+        # Cheap decline before any work: nothing to read and nothing attached.
+        if not alert_text.strip() and not has_files:
+            _decline(client, channel, thread_ts, " — describe the problem or @mention me.")
+            return
+
+        # Post the placeholder BEFORE the (potentially slow) file download so the
+        # user gets instant feedback; reuse it for the reply.
+        placeholder_ts = post_placeholder(client, channel, thread_ts)
+        if placeholder_ts is None:
+            return  # can't post in this channel — /invite @FaultMaven
+
+        # Download any attached files (logs, screenshots) to forward as evidence.
+        files = download_message_files(client.token, message) if has_files else []
+
+        # Files were attached but none were ingestible, and there's no text: don't
+        # open a blank case — turn the placeholder into a how-to instead.
+        if not alert_text.strip() and not files:
+            client.chat_update(
+                channel=channel,
+                ts=placeholder_ts,
+                text=(
+                    ":information_source: I couldn't read the attached file(s) "
+                    "(too large, or I lack access). Paste the key text and "
+                    "@mention me."
+                ),
             )
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f":information_source: I couldn't read that message{self_help}.",
-                )
-            except SlackApiError:
-                pass
             return
 
         # Best-effort permalink back to the alert, for case provenance.
@@ -94,6 +105,21 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             thread_ts=thread_ts,
             team_id=team_id,
             text=_SEED_QUERY,
-            pasted_content=alert_text,
+            pasted_content=alert_text or None,
             source_url=source_url,
+            files=files or None,
+            placeholder_ts=placeholder_ts,
         )
+
+
+def _decline(client: WebClient, channel: str, thread_ts: str, note: str) -> None:
+    """Post a short 'couldn't read that' note without opening a case."""
+
+    try:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f":information_source: I couldn't read that message{note}",
+        )
+    except SlackApiError:
+        pass

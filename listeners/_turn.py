@@ -56,6 +56,23 @@ class Dedup:
             return False
 
 
+def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
+    """The query for a turn, or ``None`` if there's nothing to investigate.
+
+    ``raw_text`` may be missing/``None`` (Slack sends ``text: null`` on some
+    file-share messages) or whitespace. Returns ``None`` only when there is no
+    text *and* no ingestible file, so a caller can decline (tell the user)
+    instead of opening a blank case with an empty query the backend rejects.
+    """
+
+    text = (raw_text or "").strip()
+    if text:
+        return text
+    if downloaded_files:
+        return "Please investigate the attached file(s)."
+    return None
+
+
 def run_turn(
     fm: FaultMavenClient,
     store: CaseStore,
@@ -67,6 +84,7 @@ def run_turn(
     pasted_content: str | None = None,
     source_url: str | None = None,
     prior_context: str | None = None,
+    files: list[tuple[str, bytes, str]] | None = None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
 
@@ -75,6 +93,8 @@ def run_turn(
       limit).
     - ``pasted_content`` is *this turn's* evidence (e.g. a shortcut's selected
       message) and is sent on **every** turn, new case or existing.
+    - ``files`` are *this turn's* attachments (already-downloaded
+      ``(name, bytes, content_type)`` tuples), forwarded as multipart evidence.
     - ``prior_context`` is the one-time catch-up (the prior thread discussion on
       an ``@mention``); it augments the evidence **only when the case is
       created**, never on later turns.
@@ -94,15 +114,42 @@ def run_turn(
                 else prior_context
             )
 
-    if pasted_content or source_url:
+    if pasted_content or source_url or files:
         return fm.submit_turn(
             case_id,
             query=text,
             pasted_content=pasted_content or None,
             source_url=source_url,
+            files=files or None,
             input_type="paste" if pasted_content else None,
         )
     return fm.submit_turn(case_id, query=text)
+
+
+def post_placeholder(
+    client: WebClient, channel: str, thread_ts: str
+) -> str | None:
+    """Post the "investigating…" placeholder and return its ``ts``.
+
+    Returns ``None`` (with actionable logging) if the bot can't post — e.g. it
+    isn't in the channel — so callers stop rather than crash. Posting this
+    *before* any slow pre-work (like downloading attachments) is what keeps the
+    feedback instant.
+    """
+
+    try:
+        resp = client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=INVESTIGATING_PLACEHOLDER
+        )
+    except SlackApiError as exc:
+        logger.warning(
+            "Cannot post in channel %s (%s) — is FaultMaven invited? "
+            "Try /invite @FaultMaven",
+            channel,
+            exc.response.get("error"),
+        )
+        return None
+    return resp["ts"]
 
 
 def run_turn_and_post(
@@ -117,28 +164,21 @@ def run_turn_and_post(
     pasted_content: str | None = None,
     source_url: str | None = None,
     prior_context: str | None = None,
+    files: list[tuple[str, bytes, str]] | None = None,
+    placeholder_ts: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place — shared by the
     mention and shortcut surfaces so the post/error flow can't drift.
 
-    Guards the placeholder post: if the bot isn't in the channel we can't post at
-    all, so we log actionable guidance rather than crashing silently.
+    ``placeholder_ts`` lets a caller that already posted the placeholder (e.g. to
+    show feedback before a slow file download) reuse it instead of posting a
+    second one.
     """
 
-    try:
-        placeholder = client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=INVESTIGATING_PLACEHOLDER,
-        )
-    except SlackApiError as exc:
-        logger.warning(
-            "Cannot post in channel %s (%s) — is FaultMaven invited? "
-            "Try /invite @FaultMaven",
-            channel,
-            exc.response.get("error"),
-        )
-        return
+    if placeholder_ts is None:
+        placeholder_ts = post_placeholder(client, channel, thread_ts)
+        if placeholder_ts is None:
+            return
 
     try:
         result = run_turn(
@@ -151,15 +191,16 @@ def run_turn_and_post(
             pasted_content=pasted_content,
             source_url=source_url,
             prior_context=prior_context,
+            files=files,
         )
         client.chat_update(
             channel=channel,
-            ts=placeholder["ts"],
+            ts=placeholder_ts,
             text=result.agent_response[:300],
             blocks=build_turn_blocks(result),
         )
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
         logger.exception("turn failed in %s: %s", channel, exc)
         client.chat_update(
-            channel=channel, ts=placeholder["ts"], text=TURN_ERROR_TEXT
+            channel=channel, ts=placeholder_ts, text=TURN_ERROR_TEXT
         )
