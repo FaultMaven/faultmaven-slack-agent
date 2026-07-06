@@ -56,6 +56,50 @@ class Dedup:
             return False
 
 
+class _ThreadSerializer:
+    """One lock per Slack thread, so turns on the same thread run one at a time.
+
+    A turn is stateful — it advances the case version — and the backend guards
+    that with optimistic concurrency: two turns for the same case that overlap
+    race, and the loser is rejected with a 409 (``expected vN, db vN+…``). Turns
+    can take 20s+, so a second @mention (or an impatient re-mention) while the
+    first is still running is easy to trigger. Serializing per thread makes the
+    second turn *wait* for the first instead of colliding, and also closes the
+    first-message race where two concurrent messages would each open a case for
+    the same thread.
+
+    Locks are created on demand and evicted LRU once idle (never while held), so
+    the registry stays bounded over a long-running process.
+    """
+
+    def __init__(self, maxsize: int = 4096) -> None:
+        self._locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
+        self._guard = threading.Lock()
+        self._max = maxsize
+
+    def lock_for(self, key: str) -> threading.Lock:
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+            self._locks.move_to_end(key)
+            # Evict the coldest locks, but only ones nobody holds — removing a
+            # held lock would let a new acquirer make a *second* lock for the
+            # same key and defeat the serialization.
+            while len(self._locks) > self._max:
+                old_key, old_lock = next(iter(self._locks.items()))
+                if old_lock.locked():
+                    break
+                self._locks.popitem(last=False)
+            return lock
+
+
+# Serializes turns per Slack thread (see _ThreadSerializer). Threads are keyed by
+# team+channel+thread, so different threads still run concurrently.
+_serializer = _ThreadSerializer()
+
+
 def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
     """The query for a turn, or ``None`` if there's nothing to investigate.
 
@@ -102,28 +146,33 @@ def run_turn(
       provenance.
     """
 
-    case_id = store.get(team_id, channel_id, thread_ts)
-    if case_id is None:
-        case_id = fm.create_case(title=None)
-        store.put(team_id, channel_id, thread_ts, case_id)
-        logger.info("Opened case %s for thread %s", case_id, thread_ts)
-        if prior_context:
-            pasted_content = (
-                f"{prior_context}\n\n{pasted_content}"
-                if pasted_content
-                else prior_context
-            )
+    # Serialize the whole find-or-create + submit for this thread: two turns on
+    # the same thread must not overlap (backend OCC 409), and two first-messages
+    # must not both open a case. Different threads keep running concurrently.
+    key = "\x00".join((team_id, channel_id, thread_ts))
+    with _serializer.lock_for(key):
+        case_id = store.get(team_id, channel_id, thread_ts)
+        if case_id is None:
+            case_id = fm.create_case(title=None)
+            store.put(team_id, channel_id, thread_ts, case_id)
+            logger.info("Opened case %s for thread %s", case_id, thread_ts)
+            if prior_context:
+                pasted_content = (
+                    f"{prior_context}\n\n{pasted_content}"
+                    if pasted_content
+                    else prior_context
+                )
 
-    if pasted_content or source_url or files:
-        return fm.submit_turn(
-            case_id,
-            query=text,
-            pasted_content=pasted_content or None,
-            source_url=source_url,
-            files=files or None,
-            input_type="paste" if pasted_content else None,
-        )
-    return fm.submit_turn(case_id, query=text)
+        if pasted_content or source_url or files:
+            return fm.submit_turn(
+                case_id,
+                query=text,
+                pasted_content=pasted_content or None,
+                source_url=source_url,
+                files=files or None,
+                input_type="paste" if pasted_content else None,
+            )
+        return fm.submit_turn(case_id, query=text)
 
 
 def post_placeholder(
