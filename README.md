@@ -29,14 +29,19 @@ faultmaven-slack-agent/
 ├── config.py             # Settings + env validation (fail-fast)
 ├── store.py              # thread→case map (SQLite)
 ├── rendering.py          # TurnResult → Block Kit
+├── slack_text.py         # Slack message (blocks/attachments) → readable text
 ├── faultmaven/
-│   └── client.py         # FaultMaven API client (create case, multipart turns, 202-poll)
+│   └── client.py         # FaultMaven API client (create case, multipart turns, health)
 ├── listeners/
 │   ├── assistant.py      # Assistant container: thread_started + user_message
 │   ├── events.py         # app_mention (war-room)
+│   ├── shortcuts.py      # "Investigate with FaultMaven" message-shortcut opener
+│   ├── actions.py        # suggested-action button clicks
 │   └── _turn.py          # shared find-or-create-case → submit-turn pipeline
-├── manifest.json         # Slack app manifest (scopes, events, assistant_view)
-└── docs/design.md        # authoritative design
+├── scripts/preflight.py  # preflight doctor (env + Slack + backend checks)
+├── manifest.json         # Slack app manifest (scopes, events, assistant_view, shortcut)
+├── docs/design.md        # authoritative design
+└── docs/LIVE_TEST.md     # install + smoke runbook (real workspace)
 ```
 
 ## Run locally
@@ -45,26 +50,35 @@ Requires a running FaultMaven backend (default `http://localhost:8090`).
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env     # fill in SLACK_BOT_TOKEN + SLACK_APP_TOKEN
-python app.py            # connects via Socket Mode — no public URL needed
+cp .env.example .env            # fill in SLACK_BOT_TOKEN + SLACK_APP_TOKEN
+python scripts/preflight.py     # verify env + Slack tokens + backend before connecting
+python app.py                   # connects via Socket Mode — no public URL needed
 ```
 
 If `FAULTMAVEN_API_TOKEN` is empty, the agent bootstraps a token via
 `/auth/dev-login` (local `AUTH_MODE` only) using `FAULTMAVEN_DEV_LOGIN_USERNAME`.
+
+**Testing in a real workspace?** Follow the step-by-step runbook in
+[docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,
+then smoke each surface (Assistant panel, @mention, message shortcut, buttons).
 
 ## Slack app setup
 
 Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *From
 a manifest*). It enables Socket Mode and requests least-privilege scopes
 (`assistant:write`, `chat:write`, `app_mentions:read`, plus `*:history` to replay
-a summoned thread). Then create an app-level token with `connections:write`
-(→ `SLACK_APP_TOKEN`) and install to your workspace.
+a summoned thread), and registers the **Investigate with FaultMaven** message
+shortcut. Then create an app-level token with `connections:write`
+(→ `SLACK_APP_TOKEN`) and install to your workspace. Full walkthrough:
+[docs/LIVE_TEST.md](docs/LIVE_TEST.md).
 
 ## Status
 
-Working: Assistant container + `@mention`, the corrected case/turn backend
-contract, thread→case mapping, Block Kit rendering, and **interactive
+Working: Assistant container + `@mention`, the **"Investigate with FaultMaven"
+message shortcut** (open a case seeded from any message), the corrected case/turn
+backend contract, thread→case mapping, Block Kit rendering, and **interactive
 suggested-action buttons** (DECIDE/FREE_SPEECH clicks submit typed turns to
-advance the investigation). Token-streaming reasoning timeline, evidence upload,
-reports, App Home, and multi-workspace OAuth follow next — see the roadmap in
-[docs/design.md](docs/design.md) §14.
+advance the investigation). A **preflight doctor** (`scripts/preflight.py`)
+verifies the wiring before a live test. Token-streaming reasoning timeline,
+evidence/file upload, reports, App Home, and multi-workspace OAuth follow next —
+see the roadmap in [docs/design.md](docs/design.md) §14.

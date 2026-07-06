@@ -13,22 +13,32 @@ import logging
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from config import get_settings
+from config import Settings, get_settings
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from store import CaseStore
+
+
+def make_fault_client(settings: Settings) -> FaultMavenClient:
+    """Build the FaultMaven API client from settings.
+
+    Shared by the runtime (:func:`build_app`) and the preflight doctor so the
+    client wiring has one definition and can't drift between them.
+    """
+
+    return FaultMavenClient(
+        settings.faultmaven_api_url,
+        token=settings.faultmaven_api_token,
+        dev_login_username=settings.faultmaven_dev_login_username,
+        timeout=settings.faultmaven_request_timeout,
+    )
 
 
 def build_app() -> tuple[App, CaseStore, FaultMavenClient, str]:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
-    fm = FaultMavenClient(
-        settings.faultmaven_api_url,
-        token=settings.faultmaven_api_token,
-        dev_login_username=settings.faultmaven_dev_login_username,
-        timeout=settings.faultmaven_request_timeout,
-    )
+    fm = make_fault_client(settings)
     fm.startup()
 
     store = CaseStore(settings.case_store_path)
