@@ -55,7 +55,7 @@ One capability done excellently beats three done ordinarily. The flagship is the
 universal **"investigate this"** flow:
 
 1. From **any** message — an alert, a pasted error/log, a problem description — a
-   user fires the **"FaultMaven: Investigate" message shortcut** (§4.3): a
+   user fires the **"Ask FaultMaven" message shortcut** (§4.3): a
    case opens, seeded with that message (+ optional context/file via the modal).
 2. FaultMaven drives a **structured investigation** in the thread — triage →
    hypotheses → *specific* evidence requests → root cause → verified fix —
@@ -199,7 +199,7 @@ subscribe to `app_mention` only, never `message.channels`.
 
 ### 4.3 Message shortcut — the universal case-opener
 
-"FaultMaven: Investigate" is a registered **message shortcut** (in the ⋮
+"Ask FaultMaven" is a registered **message shortcut** (in the ⋮
 *More actions* menu of any message — *not* a slash command). It is the
 **universal entry**: it works on *any* message (an alert's Block Kit payload, a
 pasted stack trace, a teammate's description), and Slack hands our agent the
@@ -659,7 +659,7 @@ faultmaven-slack-agent/
 ├── listeners/
 │   ├── assistant/              # thread_started (suggested prompts) · user_message (turn)
 │   ├── events/                 # app_mention
-│   ├── shortcuts/              # "FaultMaven: Investigate" message shortcut
+│   ├── shortcuts/              # "Ask FaultMaven" message shortcut
 │   ├── commands/               # one /faultmaven command; handler parses the text arg
 │   ├── actions/                # suggested-action buttons (incl. close) · feedback
 │   └── views/                  # App Home (per-channel case list) · modals
@@ -759,7 +759,7 @@ requirement.
 3. **P2 — Reasoning timeline + actions.** `chat_stream` task/plan rendering from
    milestones/hypotheses; suggested-action buttons → typed intents; EVIDENCE/RUN
    flows. *Exit: signature UX demoable.*
-4. **P3 — Flagship entry + evidence.** The **"FaultMaven: Investigate"
+4. **P3 — Flagship entry + evidence.** The **"Ask FaultMaven"
    message shortcut** as the universal case-opener (+ context/`file_input`
    modal); seed-by-summon + ping-scoped turns; **per-thread serialization**
    (§5.3); evidence consumption — files (`url_private`), paste, screenshots

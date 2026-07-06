@@ -1,4 +1,4 @@
-"""Message shortcut — the universal "FaultMaven: Investigate" case-opener.
+"""Message shortcut — the universal "Ask FaultMaven" case-opener.
 
 The flagship entry (design §4.3): from *any* message, Slack hands us the full
 selected message in the payload. We extract its text (blocks included), open a

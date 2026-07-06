@@ -36,7 +36,7 @@ faultmaven-slack-agent/
 ├── listeners/
 │   ├── assistant.py      # Assistant container: thread_started + user_message
 │   ├── events.py         # app_mention (war-room)
-│   ├── shortcuts.py      # "FaultMaven: Investigate" message-shortcut opener
+│   ├── shortcuts.py      # "Ask FaultMaven" message-shortcut opener
 │   ├── actions.py        # suggested-action button clicks
 │   └── _turn.py          # shared find-or-create-case → submit-turn pipeline
 ├── scripts/preflight.py  # preflight doctor (env + Slack + backend checks)
@@ -69,13 +69,13 @@ Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *Fr
 a manifest*). It enables Socket Mode and requests least-privilege scopes
 (`assistant:write`, `chat:write`, `app_mentions:read`, `files:read` to download
 attached logs/screenshots, plus `*:history` to replay a summoned thread), and
-registers the **FaultMaven: Investigate** message shortcut. Then create an
+registers the **Ask FaultMaven** message shortcut. Then create an
 app-level token with `connections:write` (→ `SLACK_APP_TOKEN`) and install to
 your workspace. Full walkthrough: [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
 
 ## Status
 
-Working: Assistant container + `@mention`, the **"FaultMaven: Investigate"
+Working: Assistant container + `@mention`, the **"Ask FaultMaven"
 message shortcut** (open a case seeded from any message), **file ingestion** on
 all three surfaces (attached logs/configs/screenshots downloaded via `url_private`
 and forwarded as multipart evidence — streamed with an 8 MiB cap, redirect-aware,

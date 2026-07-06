@@ -31,7 +31,7 @@ The manifest pre-wires everything this agent uses:
 |---|---|
 | `assistant_view` + `assistant_thread_started`/`message.im` events | the **Assistant** side-panel surface |
 | `app_mention` event + `app_mentions:read` | the **@mention war-room** surface |
-| `shortcuts: [fm_investigate_message]` + `interactivity` | the **"FaultMaven: Investigate"** message shortcut |
+| `shortcuts: [fm_investigate_message]` + `interactivity` | the **"Ask FaultMaven"** message shortcut |
 | `chat:write` | posting replies + the investigating placeholder |
 | `files:read` | downloading attached logs/configs/screenshots as evidence |
 | `channels:history` / `groups:history` / `im:history` | replaying a thread on first summons (catch-up) |
@@ -109,10 +109,10 @@ question or names what it needs). A new case is created for this assistant threa
 catch-up context, so its reply should reflect what was already discussed. A file
 attached to the mention itself is ingested as evidence.
 
-### C. "FaultMaven: Investigate" message shortcut (the flagship)
+### C. "Ask FaultMaven" message shortcut (the flagship)
 
 1. Find any message — ideally a monitoring alert (Datadog/PagerDuty/Grafana
-   Block Kit). Hover → **⋮ More actions** → **FaultMaven: Investigate**.
+   Block Kit). Hover → **⋮ More actions** → **Ask FaultMaven**.
 
 **Expect:** a case opens **seeded with that message's content as evidence**, and
 the first reply threads under the selected message. Rich alerts (blocks, fields,
