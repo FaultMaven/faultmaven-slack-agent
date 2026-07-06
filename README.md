@@ -30,6 +30,7 @@ faultmaven-slack-agent/
 ├── store.py              # thread→case map (SQLite)
 ├── rendering.py          # TurnResult → Block Kit
 ├── slack_text.py         # Slack message (blocks/attachments) → readable text
+├── slack_files.py        # download a message's attached files → evidence bytes
 ├── faultmaven/
 │   └── client.py         # FaultMaven API client (create case, multipart turns, health)
 ├── listeners/
@@ -66,19 +67,22 @@ then smoke each surface (Assistant panel, @mention, message shortcut, buttons).
 
 Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *From
 a manifest*). It enables Socket Mode and requests least-privilege scopes
-(`assistant:write`, `chat:write`, `app_mentions:read`, plus `*:history` to replay
-a summoned thread), and registers the **Investigate with FaultMaven** message
-shortcut. Then create an app-level token with `connections:write`
-(→ `SLACK_APP_TOKEN`) and install to your workspace. Full walkthrough:
-[docs/LIVE_TEST.md](docs/LIVE_TEST.md).
+(`assistant:write`, `chat:write`, `app_mentions:read`, `files:read` to download
+attached logs/screenshots, plus `*:history` to replay a summoned thread), and
+registers the **Investigate with FaultMaven** message shortcut. Then create an
+app-level token with `connections:write` (→ `SLACK_APP_TOKEN`) and install to
+your workspace. Full walkthrough: [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
 
 ## Status
 
 Working: Assistant container + `@mention`, the **"Investigate with FaultMaven"
-message shortcut** (open a case seeded from any message), the corrected case/turn
-backend contract, thread→case mapping, Block Kit rendering, and **interactive
-suggested-action buttons** (DECIDE/FREE_SPEECH clicks submit typed turns to
-advance the investigation). A **preflight doctor** (`scripts/preflight.py`)
-verifies the wiring before a live test. Token-streaming reasoning timeline,
-evidence/file upload, reports, App Home, and multi-workspace OAuth follow next —
-see the roadmap in [docs/design.md](docs/design.md) §14.
+message shortcut** (open a case seeded from any message), **file ingestion** on
+all three surfaces (attached logs/configs/screenshots downloaded via `url_private`
+and forwarded as multipart evidence — streamed with an 8 MiB cap, redirect-aware,
+sign-in-page-safe), the corrected case/turn backend contract, thread→case
+mapping, Block Kit rendering, and **interactive suggested-action buttons**
+(DECIDE/FREE_SPEECH clicks submit typed turns to advance the investigation). A
+**preflight doctor** (`scripts/preflight.py`) verifies the wiring before a live
+test. Token-streaming reasoning timeline, terminal-state reports, App Home, and
+multi-workspace OAuth follow next — see the roadmap in
+[docs/design.md](docs/design.md) §16.

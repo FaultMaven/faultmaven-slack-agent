@@ -3,8 +3,8 @@
 This is the operator runbook for taking the agent from merged code to a working
 loop in a real Slack workspace, then confirming each surface end to end. It uses
 **Socket Mode**, so no public URL or OAuth round-trip is required — the fastest
-path to a genuine test. (Multi-workspace HTTP/OAuth is a later deployment step;
-see [design.md](design.md) §14.)
+path to a genuine test. (Multi-workspace HTTP/OAuth is a later roadmap phase;
+see [design.md](design.md) §16, P5–P6.)
 
 Budget ~15 minutes the first time.
 
@@ -33,6 +33,7 @@ The manifest pre-wires everything this agent uses:
 | `app_mention` event + `app_mentions:read` | the **@mention war-room** surface |
 | `shortcuts: [fm_investigate_message]` + `interactivity` | the **"Investigate with FaultMaven"** message shortcut |
 | `chat:write` | posting replies + the investigating placeholder |
+| `files:read` | downloading attached logs/configs/screenshots as evidence |
 | `channels:history` / `groups:history` / `im:history` | replaying a thread on first summons (catch-up) |
 | `socket_mode_enabled: true` | the dev transport (no public URL) |
 
@@ -78,11 +79,12 @@ Leave it running. Then invite the bot to a test channel: `/invite @FaultMaven`
 
 ---
 
-## 6. Smoke the four surfaces
+## 6. Smoke the surfaces
 
 Run each and check the **Expect** line. The agent posts a
 `:mag: FaultMaven is investigating…` placeholder, then edits it in place with the
-result — so a flash-then-update is the healthy signal.
+result — so a flash-then-update is the healthy signal. (The assistant panel shows
+Slack's native "is investigating…" status instead of a placeholder.)
 
 ### A. Assistant side panel (1:1)
 
@@ -92,6 +94,11 @@ result — so a flash-then-update is the healthy signal.
 **Expect:** a threaded reply that engages with the symptom (asks a clarifying
 question or names what it needs). A new case is created for this assistant thread.
 
+- **With a file:** attach a `.log`/`.txt` (optionally with no caption) and send.
+  **Expect:** the reply reflects the file's *contents*. A caption-less file gets a
+  default "investigate the attached file(s)" query; a file it can't read (too
+  large / no access) yields a short "couldn't read that file" note, not an error.
+
 ### B. @mention war-room (channels)
 
 1. In a channel thread (or a fresh message), post an incident note, then:
@@ -99,7 +106,8 @@ question or names what it needs). A new case is created for this assistant threa
 
 **Expect:** the bot replies **in that thread** (channel stays quiet). On the
 *first* mention in an existing thread, it replays the prior thread messages as
-catch-up context, so its reply should reflect what was already discussed.
+catch-up context, so its reply should reflect what was already discussed. A file
+attached to the mention itself is ingested as evidence.
 
 ### C. "Investigate with FaultMaven" message shortcut (the flagship)
 
@@ -111,10 +119,13 @@ the first reply threads under the selected message. Rich alerts (blocks, fields,
 legacy attachments) are extracted to text — the seed is the alert's substance,
 not a bare "Alert triggered" stub.
 
-- **Edge — empty/file-only message:** the shortcut on a message with no readable
-  text (e.g. only a file) should *not* open a blank case; it posts a short note
-  telling you to paste the key error text and `@mention` it. (File ingestion is
-  the next increment.)
+- **File-carrying message (the headline path):** run the shortcut on a message
+  that has a log/config/screenshot attached. **Expect:** the file is downloaded
+  and forwarded, so the reply reasons over the file's contents — not just the
+  surrounding text. Multiple files (up to 5, ≤8 MiB each) are all sent.
+- **Edge — unreadable file-only message:** a file-only message the bot can't read
+  (too large, or no `files:read` access) does *not* open a blank case; it posts a
+  short note telling you to paste the key text and `@mention` it.
 
 ### D. Interactive action buttons
 
@@ -140,6 +151,7 @@ advances (a new placeholder → updated reply appears in the thread).
 | Log: `Cannot post in channel … not_in_channel` | same | `/invite @FaultMaven` |
 | Shortcut missing from ⋮ menu | manifest not applied / app not reinstalled | recreate from manifest or reinstall |
 | Mention catch-up empty | missing history scope | confirm `channels:history`/`groups:history` are granted; reinstall |
+| Attached file ignored / "couldn't read that file" | missing `files:read`, file >8 MiB, or bot lacks access to that file's channel | grant `files:read` and reinstall; keep files ≤8 MiB; log line `came back as the sign-in page` confirms an access/scope gap |
 
 ---
 
@@ -150,6 +162,9 @@ advances (a new placeholder → updated reply appears in the thread).
 - **One case per thread.** Re-mentioning or re-running the shortcut in a thread
   that already has a case continues that case — it does not open a second one.
 - **Backend stays Slack-agnostic.** The agent is the only bridge: it reads Slack
-  and posts to Slack; the FaultMaven API never sees Slack tokens or payloads.
+  (including downloading attached files) and posts to Slack; the FaultMaven API
+  never sees Slack tokens or payloads — it receives a normal multipart turn.
+- **File limits:** up to 5 files per turn, ≤8 MiB each (streamed with a hard cap);
+  oversized/unreadable files are skipped, never fatal to the turn.
 - This run does **not** exercise multi-workspace OAuth or the HTTP transport —
-  those are the next deployment increment ([design.md](design.md) §14).
+  those are later roadmap phases ([design.md](design.md) §16, P5–P6).
