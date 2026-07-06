@@ -1,16 +1,22 @@
-"""Channel ``app_mention`` — the collaborative war-room surface.
+"""Channel surfaces — the collaborative war-room.
 
-Strictly mention-driven (no ``message.channels`` subscription). Replies land in
-the summoned thread so the parent channel stays quiet. On the first summons into
-a thread, the prior thread discussion is replayed to the engine so it isn't
-blind to what preceded the mention.
+Two entry points, both landing replies in the summoned thread so the parent
+channel stays quiet:
+
+- ``app_mention`` — the **summon**: ``@FaultMaven`` starts (or re-engages) an
+  investigation in a thread. On the first summons the prior thread discussion is
+  replayed as catch-up so the engine isn't blind to what preceded the mention.
+- ``message`` — **active-thread continuity**: once a thread is an investigation,
+  plain replies in *that* thread continue it without re-@mentioning. Every other
+  channel message is ignored (the bot only acts on threads it already owns), so
+  there's no ambient/firehose behavior.
 """
 
 from __future__ import annotations
 
 from logging import Logger
 
-from slack_bolt import App
+from slack_bolt import App, BoltContext
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
@@ -55,8 +61,39 @@ def _fetch_thread_context(
     return "\n".join(lines)[:_THREAD_CONTEXT_LIMIT]
 
 
+def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> bool:
+    """Cheap gate: is this a plain human reply *inside a thread* worth checking?
+
+    Filters out everything that must NOT auto-continue an investigation, before
+    the (slightly less cheap) store lookup the caller then does:
+
+    - the bot's own posts (``bot_id``),
+    - non-message subtypes (edits, deletes, joins…) — only a normal message or a
+      ``file_share`` carries new user input,
+    - DMs (``channel_type == "im"``) — the Assistant surface owns those,
+    - top-level channel messages (no ``thread_ts``) — we never start an
+      investigation from ambient channel chatter, only continue one in a thread,
+    - messages that mention the bot — ``app_mention`` owns those (and does the
+      first-summons catch-up read), so we don't double-process.
+    """
+
+    if event.get("bot_id"):
+        return False
+    if event.get("subtype") not in (None, "file_share"):
+        return False
+    if event.get("channel_type") == "im":
+        return False
+    if not event.get("thread_ts"):
+        return False
+    text = event.get("text") or ""
+    if bot_user_id and f"<@{bot_user_id}>" in text:
+        return False
+    return True
+
+
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
+    followup_dedup = Dedup()
 
     @app.event("app_mention")
     def on_app_mention(event: dict, client: WebClient, logger: Logger) -> None:
@@ -102,4 +139,40 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             prior_context=prior_context,
             files=files or None,
             placeholder_ts=placeholder_ts,
+        )
+
+    @app.event("message")
+    def on_thread_message(
+        event: dict, context: BoltContext, client: WebClient, logger: Logger
+    ) -> None:
+        # Continue an *existing* investigation from a plain thread reply — no
+        # re-@mention needed. Everything else is ignored (no firehose).
+        if not is_thread_followup_candidate(
+            event, bot_user_id=context.bot_user_id
+        ):
+            return
+
+        channel = event["channel"]
+        thread_ts = event["thread_ts"]
+        team_id = event.get("team", "")
+        # The gate: only act on threads that are already an investigation.
+        if store.get(team_id, channel, thread_ts) is None:
+            return
+        if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+            return
+
+        text = clean_mention(event.get("text") or "").strip()
+        files = download_message_files(client.token, event)
+        if not text and not files:
+            return  # nothing new to add (e.g. an emoji-only reply)
+
+        run_turn_and_post(
+            client,
+            fm,
+            store,
+            channel=channel,
+            thread_ts=thread_ts,
+            team_id=team_id,
+            text=text or "Please continue the investigation with this evidence.",
+            files=files or None,
         )
