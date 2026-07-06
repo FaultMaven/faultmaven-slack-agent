@@ -19,7 +19,13 @@ from slack_files import download_message_files
 from slack_text import message_to_text
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_turn_and_post
+from ._turn import (
+    Dedup,
+    end_turn,
+    post_placeholder,
+    run_turn_and_post,
+    try_begin_turn,
+)
 
 # The shortcut seeds the message as evidence (pasted_content); this is the query.
 _SEED_QUERY = "Please investigate this."
@@ -65,51 +71,65 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             _decline(client, channel, thread_ts, " — describe the problem or @mention me.")
             return
 
-        # Post the placeholder BEFORE the (potentially slow) file download so the
-        # user gets instant feedback; reuse it for the reply.
-        placeholder_ts = post_placeholder(client, channel, thread_ts)
-        if placeholder_ts is None:
-            return  # can't post in this channel — /invite @FaultMaven
-
-        # Download any attached files (logs, screenshots) to forward as evidence.
-        files = download_message_files(client.token, message) if has_files else []
-
-        # Files were attached but none were ingestible, and there's no text: don't
-        # open a blank case — turn the placeholder into a how-to instead.
-        if not alert_text.strip() and not files:
-            client.chat_update(
-                channel=channel,
-                ts=placeholder_ts,
-                text=(
-                    ":information_source: I couldn't read the attached file(s) "
-                    "(too large, or I lack access). Paste the key text and "
-                    "@mention me."
-                ),
+        # Reserve the thread. If a turn is already running here, this deliberate
+        # action gets a note rather than a silent no-op.
+        if not try_begin_turn(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts
+        ):
+            _decline(
+                client, channel, thread_ts,
+                " — I'm still working on this thread; try again once I've replied.",
             )
             return
-
-        # Best-effort permalink back to the alert, for case provenance.
-        source_url = None
         try:
-            source_url = client.chat_getPermalink(
-                channel=channel, message_ts=message_ts
-            ).get("permalink")
-        except SlackApiError:
-            pass
+            # Placeholder BEFORE the (potentially slow) file download for instant
+            # feedback; reuse it for the reply.
+            placeholder_ts = post_placeholder(client, channel, thread_ts)
+            if placeholder_ts is None:
+                return  # can't post in this channel — /invite @FaultMaven
 
-        run_turn_and_post(
-            client,
-            fm,
-            store,
-            channel=channel,
-            thread_ts=thread_ts,
-            team_id=team_id,
-            text=_SEED_QUERY,
-            pasted_content=alert_text or None,
-            source_url=source_url,
-            files=files or None,
-            placeholder_ts=placeholder_ts,
-        )
+            # Download attached files (logs, screenshots) to forward as evidence.
+            files = download_message_files(client.token, message) if has_files else []
+
+            # Files attached but none ingestible, and no text: don't open a blank
+            # case — turn the placeholder into a how-to instead.
+            if not alert_text.strip() and not files:
+                client.chat_update(
+                    channel=channel,
+                    ts=placeholder_ts,
+                    text=(
+                        ":information_source: I couldn't read the attached file(s) "
+                        "(too large, or I lack access). Paste the key text and "
+                        "@mention me."
+                    ),
+                )
+                return
+
+            # Best-effort permalink back to the alert, for case provenance.
+            source_url = None
+            try:
+                source_url = client.chat_getPermalink(
+                    channel=channel, message_ts=message_ts
+                ).get("permalink")
+            except SlackApiError:
+                pass
+
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text=_SEED_QUERY,
+                pasted_content=alert_text or None,
+                source_url=source_url,
+                files=files or None,
+                placeholder_ts=placeholder_ts,
+                mention_user=context.user_id,
+            )
+        finally:
+            end_turn(team_id, channel, thread_ts)
 
 
 def _decline(client: WebClient, channel: str, thread_ts: str, note: str) -> None:

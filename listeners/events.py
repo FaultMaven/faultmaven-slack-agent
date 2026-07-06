@@ -24,7 +24,13 @@ from rendering import clean_mention
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_turn_and_post
+from ._turn import (
+    Dedup,
+    end_turn,
+    post_placeholder,
+    run_turn_and_post,
+    try_begin_turn,
+)
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -107,39 +113,49 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         team_id = event.get("team", "")
         # A mention may be top-level (use its ts) or already inside a thread.
         thread_ts = event.get("thread_ts") or event["ts"]
-        text = clean_mention(event.get("text", "")) or (
-            "Please investigate this thread."
-        )
 
-        # Post the placeholder up front, before the (possibly slow) catch-up read
-        # and file download, so the summons is acknowledged immediately.
-        placeholder_ts = post_placeholder(client, channel, thread_ts)
-        if placeholder_ts is None:
-            return  # can't post here — /invite @FaultMaven
-
-        # First summons into a thread → replay the prior discussion (catch-up).
-        prior_context = None
-        if store.get(team_id, channel, thread_ts) is None:
-            prior_context = _fetch_thread_context(
-                client, channel, thread_ts, exclude_ts=event.get("ts")
+        # Reserve the thread; if a turn is already running, skip this one (⏭️).
+        if not try_begin_turn(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"),
+        ):
+            return
+        try:
+            text = clean_mention(event.get("text", "")) or (
+                "Please investigate this thread."
             )
+            # Placeholder up front, before the (possibly slow) catch-up read and
+            # file download, so the summons is acknowledged immediately.
+            placeholder_ts = post_placeholder(client, channel, thread_ts)
+            if placeholder_ts is None:
+                return  # can't post here — /invite @FaultMaven
 
-        # Files attached to the mention itself are forwarded as evidence
-        # (download_message_files no-ops to [] when there are none).
-        files = download_message_files(client.token, event)
+            # First summons into a thread → replay the prior discussion.
+            prior_context = None
+            if store.get(team_id, channel, thread_ts) is None:
+                prior_context = _fetch_thread_context(
+                    client, channel, thread_ts, exclude_ts=event.get("ts")
+                )
 
-        run_turn_and_post(
-            client,
-            fm,
-            store,
-            channel=channel,
-            thread_ts=thread_ts,
-            team_id=team_id,
-            text=text,
-            prior_context=prior_context,
-            files=files or None,
-            placeholder_ts=placeholder_ts,
-        )
+            # Files attached to the mention are forwarded as evidence (no-ops to
+            # [] when there are none).
+            files = download_message_files(client.token, event)
+
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text=text,
+                prior_context=prior_context,
+                files=files or None,
+                placeholder_ts=placeholder_ts,
+                mention_user=event.get("user"),
+            )
+        finally:
+            end_turn(team_id, channel, thread_ts)
 
     @app.event("message")
     def on_thread_message(
@@ -155,24 +171,35 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         channel = event["channel"]
         thread_ts = event["thread_ts"]
         team_id = event.get("team", "")
-        # The gate: only act on threads that are already an investigation.
+        # Only act on threads that are already an investigation.
         if store.get(team_id, channel, thread_ts) is None:
             return
         if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
             return
 
-        text = clean_mention(event.get("text") or "").strip()
-        files = download_message_files(client.token, event)
-        if not text and not files:
-            return  # nothing new to add (e.g. an emoji-only reply)
+        # Reserve the thread; if a turn is already running, skip this reply (⏭️)
+        # — the sender should wait for FaultMaven's reply, then resend.
+        if not try_begin_turn(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"),
+        ):
+            return
+        try:
+            text = clean_mention(event.get("text") or "").strip()
+            files = download_message_files(client.token, event)
+            if not text and not files:
+                return  # nothing new to add (e.g. an emoji-only reply)
 
-        run_turn_and_post(
-            client,
-            fm,
-            store,
-            channel=channel,
-            thread_ts=thread_ts,
-            team_id=team_id,
-            text=text or "Please continue the investigation with this evidence.",
-            files=files or None,
-        )
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text=text or "Please continue the investigation with this evidence.",
+                files=files or None,
+                mention_user=event.get("user"),
+            )
+        finally:
+            end_turn(team_id, channel, thread_ts)

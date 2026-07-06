@@ -18,6 +18,8 @@ from faultmaven import FaultMavenClient, TurnResult
 from rendering import SUGGESTED_ACTION_PATTERN, build_turn_blocks
 from store import CaseStore
 
+from ._turn import end_turn, try_begin_turn
+
 
 def apply_action(
     fm: FaultMavenClient, case_id: str, value_json: str
@@ -67,11 +69,24 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         channel = body["channel"]["id"]
         message = body["message"]
         thread_ts = message.get("thread_ts") or message["ts"]
+        team_id = context.team_id or ""
 
+        # A click advances the case, so it's a turn — reserve the thread. If one
+        # is already running, tell the clicker to retry once it's replied.
+        if not try_begin_turn(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts
+        ):
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=":hourglass_flowing_sand: Still working on the previous turn "
+                "— click that again once I've replied.",
+            )
+            return
         try:
             action = body["actions"][0]
             label = action.get("text", {}).get("text", "")
-            case_id = store.get(context.team_id or "", channel, thread_ts)
+            case_id = store.get(team_id, channel, thread_ts)
             if not case_id:
                 client.chat_postMessage(
                     channel=channel,
@@ -100,3 +115,5 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            end_turn(team_id, channel, thread_ts)
