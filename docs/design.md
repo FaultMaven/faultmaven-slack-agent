@@ -199,7 +199,9 @@ subscribe to `app_mention` only, never `message.channels`.
 
 ### 4.3 Message shortcut — the universal case-opener
 
-"Ask FaultMaven" is a registered **message shortcut** (in the ⋮
+"Ask FaultMaven" is a registered **message shortcut** (named just `Ask` in the
+manifest — Slack appends the app name in the menu, so it reads *Ask FaultMaven*;
+in the ⋮
 *More actions* menu of any message — *not* a slash command). It is the
 **universal entry**: it works on *any* message (an alert's Block Kit payload, a
 pasted stack trace, a teammate's description), and Slack hands our agent the
