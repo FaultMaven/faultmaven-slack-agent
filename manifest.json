@@ -20,7 +20,7 @@
     },
     "shortcuts": [
       {
-        "name": "Investigate with FaultMaven",
+        "name": "FaultMaven: Investigate",
         "type": "message",
         "callback_id": "fm_investigate_message",
         "description": "Open a FaultMaven investigation seeded with this message"
