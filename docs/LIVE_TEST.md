@@ -24,6 +24,10 @@ Budget ~15 minutes the first time.
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From a manifest**.
 2. Pick the workspace, paste [`manifest.json`](../manifest.json), create.
+3. **Set the app icon** (the manifest can't carry it): *Basic Information* →
+   *Display Information* → **App icon** → upload
+   [`assets/slack-app-icon.png`](../assets/slack-app-icon.png) — the FaultMaven
+   "FM" mark. Otherwise the bot shows a generic avatar.
 
 The manifest pre-wires everything this agent uses:
 

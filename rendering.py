@@ -172,10 +172,12 @@ def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
 
     blocks: list[dict[str, Any]] = []
 
+    # No ":robot_face: *FaultMaven*" header — Slack already shows the app's name
+    # and icon above every message, so it's redundant. The reply is just the
+    # response text (the drop-if-busy path prepends an @mention of the replier).
     parts = _chunk(result.agent_response)
-    blocks.append(_section(f":robot_face: *FaultMaven*\n{parts[0]}"))
-    for extra in parts[1:]:
-        blocks.append(_section(extra))
+    for part in parts:
+        blocks.append(_section(part))
 
     evidence: list[dict[str, Any]] = []
     buttons: list[dict[str, Any]] = []
