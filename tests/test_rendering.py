@@ -36,6 +36,14 @@ def test_short_response_is_single_section():
     assert len(_sections(build_turn_blocks(result))) == 1
 
 
+def test_reply_has_no_redundant_faultmaven_header():
+    # Slack already shows the app name + icon above every message, so the reply
+    # is the response text itself — no ":robot_face: *FaultMaven*" prefix.
+    sections = _sections(build_turn_blocks(TurnResult(agent_response="root cause found")))
+    assert sections[0] == "root cause found"
+    assert ":robot_face:" not in sections[0] and "*FaultMaven*" not in sections[0]
+
+
 # -- §7.3 soundness behavior --------------------------------------------------
 def test_evidence_ask_gets_its_own_prominent_section():
     result = TurnResult(
