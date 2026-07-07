@@ -30,7 +30,7 @@ tension**:
 | Decision | Choice | Rationale |
 |---|---|---|
 | Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives the challenge rewards; the skeleton uses none of them. |
-| Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` + message shortcuts + slash commands | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
+| Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` (+ auto-continue) + the **Ask** message shortcut | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
 | Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
 | Case scoping & lifecycle | **Thread-scoped collaborative cases under the org**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
@@ -44,6 +44,14 @@ The original skeleton posts to **`POST /api/v1/investigations/turn`, which does
 not exist.** The real contract is: **create a case**
 (`POST /api/v1/cases`) → **submit turns**
 (`POST /api/v1/cases/{case_id}/turns`, *multipart form-data*). See §8.
+
+### Implementation status (this doc is design intent, not all shipped)
+
+| State | Surfaces / features |
+|---|---|
+| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · preflight doctor — on **Socket Mode**. |
+| **Designed, not yet built** | multi-workspace OAuth / per-user account linking (§10; today Socket Mode, single install) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
+| **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
 ---
 
@@ -108,7 +116,7 @@ moved past:
 | Posts plain Block Kit messages | **Assistant container**: suggested prompts, `set_status`, `chat_stream` reasoning timeline, feedback buttons |
 | Calls non-existent `/investigations/turn` | Correct **case → turns** lifecycle (§8) |
 | Single bot token, no install flow | **Multi-workspace OAuth** install store + per-user account linking (§10) |
-| Mention + shortcut only | Mention + shortcut + **Assistant panel** + **slash commands** + **App Home** |
+| Mention + shortcut only | Mention (+ auto-continue) + shortcut + **Assistant panel** + interactive buttons |
 
 What we **keep** from the skeleton: the privacy posture (mention-only, no
 firehose), the "thread = session" insight, `event_id` de-duplication, the
@@ -126,18 +134,18 @@ doesn't already cover them.
 ```text
                          Slack Workspace (per-tenant install)
    ┌──────────────────────────────────────────────────────────────────────┐
-   │  Assistant side panel │ Channel threads │ Message shortcuts │ /faultmaven │
-   └───────────────┬──────────────┬───────────────┬─────────────────┬───────┘
-                   │ events / interactivity / commands (HTTPS, signed)
+   │  Assistant side panel │ Channel threads (mention + auto-continue) │ Ask shortcut │
+   └───────────────┬────────────────────────┬────────────────────────────┬───┘
+                   │ events / interactivity (Socket Mode today; HTTPS+OAuth is the target)
                    ▼
    ┌────────────────────────────────────────────────────────────────────────┐
    │                 FaultMaven Slack Agent  (Bolt for Python)                │
    │                                                                          │
-   │  listeners/      assistant · events · shortcuts · commands · actions     │
+   │  listeners/      assistant · events (mention + auto-continue) · shortcuts · actions │
    │  rendering/      TurnResponse → Block Kit + chat_stream (task/plan)       │
    │  faultmaven/     REST client · account-linking OAuth · token refresh      │
    │  store/          InstallationStore · OAuthStateStore · thread→case map     │
-   │                  · per-thread turn lock · user→FaultMaven-token  (Postgres)│
+   │                  · per-thread drop-if-busy gate · user→FM-token  (Postgres)│
    │  lifecycle/      offer-to-close · auto-close-on-inactivity (background)    │
    └───────────────┬───────────────────────────────────────┬──────────────────┘
                    │ Slack Web API (chat.*, assistant.*,     │ HTTPS + Bearer (per-user
@@ -164,11 +172,14 @@ events — not hand-rolled Starlette background tasks.
 
 ---
 
-## 4. Slack surface design — four entry points, one engine
+## 4. Slack surface design — three entry points, one engine
 
-All four funnel into the same `run_turn(case, input)` core. They differ only in
-how the user **pings** the agent and where replies land. *How* a turn is scoped,
-triggered, and serialized is the **interaction model** (§5).
+Three ways to *summon* FaultMaven — the **Assistant panel**, an `@mention`, and
+the **Ask** shortcut — all funnel into the same `run_turn(case, input)` core;
+they differ only in how the user summons it and where replies land. (Once a
+thread is owned, plain replies auto-continue it, and result **buttons** advance
+it — but those act on an existing case, they don't open one.) *How* a turn is
+scoped, triggered, and serialized is the **interaction model** (§5).
 
 ### 4.1 Assistant container (the AI side panel) — primary 1:1 surface
 
@@ -222,28 +233,25 @@ the thread.)
 > extract readable text from `message.blocks`/`attachments`, **not** just
 > `message.text` (usually a stub). See §5.4.
 >
-> The shortcut is the precise *opener* but is buried in the ⋮ menu; `@mention` /
-> `/faultmaven` / the side panel and onboarding carry *discoverability* (§5.2).
+> The shortcut is the precise *opener* but is buried in the ⋮ menu; `@mention`,
+> the side panel, and onboarding carry *discoverability* (§5.2).
 
-### 4.4 Slash command — one registered command
+### 4.4 Slash command — cut
 
-We register **one** slash command, `/faultmaven` (one command string, one request
-URL). Slack delivers everything after it as a **single `text` argument** — there
-are **no sub-commands**; our handler parses the text. It is discoverable via the
-`/`-autocomplete (its **usage hint** is the surface) once registered:
+> **Rejected.** A `/faultmaven` command was designed and dropped. A free-text
+> `/faultmaven <problem>` only duplicates the `@mention`, which already opens an
+> investigation (with or without a problem statement) and reads better; and the
+> management flavors (`cases`, `status`) are dashboard-duplicative — case
+> browsing belongs on the **Dashboard**, deep-linked, not rebuilt in Slack (§1).
+> Account-linking is a button, not a command (§10.2).
 
-- `/faultmaven <describe the problem>` → start/continue an investigation
-- `/faultmaven status` → the current investigation board
-- `/faultmaven cases` → cases in this channel
-- `/faultmaven connect` / `help` → utility (account-linking §10.2, help)
+### 4.5 App Home — a landing card, not a case list
 
-### 4.5 App Home — the "case list" equivalent
-
-The Home tab renders cases scoped to the **channels the user is in** (and, for
-admins, the whole workspace) — title, status pill, last activity, turn count,
-deep links. Because Slack cases are *collaborative team artifacts*, not an
-individual's private cases (§6.1), the view is **per-channel / per-workspace**,
-not a global "my cases" pile.
+If we ship an App Home at all, it is a **lightweight landing/help card** —
+what FaultMaven does, how to summon it, and a **deep link to the Dashboard** for
+the case portfolio, KB, and full reports. We deliberately do **not** reimplement
+the Dashboard's case list in Slack (§1 non-goals): Slack owns the *in-flow*
+investigation; browsing and managing cases is better online. *(Not yet built.)*
 
 ---
 
@@ -254,12 +262,14 @@ This section defines *when* FaultMaven responds, *what* it treats as a turn, and
 backend's world (a serialized, single-author 1:1 conversation) to Slack's
 (an asynchronous, multi-author, unlocked message stream).
 
-### 5.1 Stance: respond to a ping, never ambient
+### 5.1 Stance: explicitly summoned, then owned-thread only — never ambient
 
 FaultMaven is a **tool you invoke**, not a participant that decides when to speak.
-A response is triggered only by an explicit **ping**: an `@mention`, a message
-shortcut, a slash command, or a message in the Assistant side panel. Between
-pings it is silent.
+It only ever engages after an explicit summon — an `@mention`, the **Ask**
+shortcut, or a message in the Assistant side panel. Once summoned into a thread,
+it **auto-continues** that thread's investigation (plain replies, no re-summon,
+§5.2) — but it acts *only* on threads it already owns, and is silent everywhere
+else. It never joins arbitrary channel chatter.
 
 This is not a compromise — it is the convergent design of the whole ecosystem:
 
@@ -278,7 +288,7 @@ in a multi-party chat) is high and the payoff low: humans tolerate imperfect
 turn-taking, so a deliberately-invoked agent that's occasionally out of order is
 *fine*, while feeding the agent the raw cross-talk would actively harm it (§5.2).
 
-### 5.2 Entry & context — seeded by the summon, then ping-scoped
+### 5.2 Entry & context — seeded by the summon, then auto-continue
 
 FaultMaven gets its context from **how it was summoned** — not by reading the
 channel. The opening turn is seeded by the entry gesture:
@@ -286,8 +296,8 @@ channel. The opening turn is seeded by the entry gesture:
 | Entry | Seed (the opening turn) | Discoverability |
 |---|---|---|
 | **Message shortcut** (§4.3) — the universal opener | *that specific message* (Slack delivers it) + optional modal context/file | buried in ⋮; the precise *opener* |
-| **`@mention` into a thread with prior discussion** | a **one-time catch-up read** of the thread → FaultMaven synthesizes *"here's what I understand … correct?"* then leads (the lone use of `conversations.replies`; the invite authorizes it) | natural (`@`) |
-| **`@mention`/message in a fresh thread or side panel; `/faultmaven`** | the mention/command text | natural |
+| **`@mention` mid-thread** (a thread that already has replies) | the case is created *here*, but the opening turn is seeded by a **one-time catch-up read** of the earlier thread messages (up to ~50, via `conversations.replies`) → FaultMaven synthesizes *"here's what I understand … correct?"* then leads. It is **not blind to what preceded the summons.** | natural (`@`) |
+| **`@mention`/message in a fresh thread or the side panel** | the mention text (or nothing — a bare `@FaultMaven` still opens the case) | natural |
 
 After the opening, the thread becomes an **owned investigation**, and FaultMaven
 **auto-continues** it: plain replies in *that thread* advance the case with no
@@ -315,9 +325,9 @@ Why the catch-up read is the *only* full thread read:
   the "no incorrect conclusion" guarantee. The catch-up read is bounded and
   *synthesizes + confirms* rather than ingesting as truth, which is itself the
   soundness behavior.
-- **Privacy.** The shortcut/slash flavors read nothing beyond what they're handed
-  (no history scope); only the `@mention`-into-a-thread flavor reads that one
-  thread, on explicit invitation.
+- **Privacy.** The shortcut reads nothing beyond the message it was fired on;
+  only the mid-thread `@mention` reads that one thread's prior messages, on
+  explicit invitation, for the one-time catch-up.
 - **Simplicity & concurrency.** Smaller blast radius, each turn self-contained.
 
 > Curation is the trade-off — and a feature: point at a message (shortcut), or
@@ -401,8 +411,9 @@ a **team artifact**:
   model, §10). That is the real tenancy line.
 - A case is **scoped to its thread/channel**, attributed to its participants
   (initiator + pingers) via metadata / account-linking — not owned by one person.
-- App Home views are **per-channel / per-workspace** (§4.5), not a meaningless
-  global "my cases."
+- Case *browsing* is the Dashboard's job (deep-linked from Slack), scoped
+  per-channel/workspace there — not a global "my cases" pile reimplemented in
+  Slack (§4.5).
 
 So "all Slack users collapse to one user" stops being a bug once the meaningful
 owner is the *team/channel under the org*; per-user identity is attribution
@@ -453,10 +464,10 @@ and bounded storage/cost.
 | Suggested actions (DECIDE/RUN/EVIDENCE/FREE_SPEECH) | Interactive Block Kit buttons / prompt chips (§9.2) | `suggested_actions[]` |
 | Knowledge/runbook lookup | Rendered inline with source links; deep-link to Dashboard KB | `/knowledge/...`, returned in turns |
 | Evidence requests ("paste logs from X") | Prominent **EVIDENCE** call-to-action block | `suggested_actions[type=EVIDENCE]` |
-| Case status lifecycle | Status pill in thread + App Home; offer-to-close / auto-close (§6.2) | `case_state`, `closure_reason` |
+| Case status lifecycle | Status pill in the thread reply; offer-to-close / auto-close (§6.2) | `case_state`, `closure_reason` |
 | Reports (resolution/closure/runbook) | On terminal state: summary + "Generate runbook" / "Download" buttons; markdown posted or uploaded as a snippet | `/cases/{id}/report-recommendations`, `/cases/{id}/reports` |
 | Post-closure Q&A | Re-pinging a closed thread starts a fresh case (§6.2); the old case stays archived | `/cases/{id}/turns` |
-| Case list sidebar | **App Home** (per-channel/workspace) + `/faultmaven cases` | `GET /cases` |
+| Case list sidebar | **Deep-link to the Dashboard** (Slack doesn't reimplement the list, §4.5) | Dashboard |
 | Auth / login | OAuth account-linking (§10) | `/auth/...` |
 
 ---
@@ -623,8 +634,7 @@ Reuses the Copilot's proven PKCE flow (`client_id=faultmaven-copilot`, scopes
 `openid profile email cases:read cases:write knowledge:read evidence:read`):
 
 1. First time a Slack user invokes the agent without a linked token, the agent
-   posts an **ephemeral "Connect your FaultMaven account"** button
-   (also `/faultmaven connect`).
+   posts an **ephemeral "Connect your FaultMaven account"** button.
 2. Button opens the FaultMaven authorize URL → user logs in/consents →
    redirect to our public callback → exchange `code + code_verifier` for
    access/refresh tokens.
@@ -685,16 +695,16 @@ identity** (the team→org binding), attributed to the Slack user in metadata. T
 
 ```text
 faultmaven-slack-agent/
-├── app.py                      # Bolt App + FastAPI adapter; OAuthSettings; register listeners
-├── manifest.json               # scopes, events, assistant_view, slash commands, shortcuts
+├── app.py                      # Bolt App (Socket Mode today; FastAPI+OAuth is the target); register listeners
+├── manifest.json               # scopes, events, assistant_view, shortcut
 ├── config.py                   # settings (kept, extended): lifecycle windows, etc.
 ├── listeners/
-│   ├── assistant/              # thread_started (suggested prompts) · user_message (turn)
-│   ├── events/                 # app_mention
-│   ├── shortcuts/              # "Ask FaultMaven" message shortcut
-│   ├── commands/               # one /faultmaven command; handler parses the text arg
-│   ├── actions/                # suggested-action buttons (incl. close) · feedback
-│   └── views/                  # App Home (per-channel case list) · modals
+│   ├── assistant.py            # thread_started (suggested prompts) · user_message (turn)
+│   ├── events.py               # app_mention + thread-reply auto-continue
+│   ├── shortcuts.py            # "Ask FaultMaven" message shortcut
+│   ├── actions.py              # suggested-action buttons (incl. close) · feedback
+│   ├── _turn.py                # shared pipeline: drop-if-busy gate → turn → post (§5.3)
+│   └── views/                  # (future) modals; App Home landing card (§4.5)
 ├── rendering/
 │   ├── timeline.py             # TurnResponse → chat_stream task/plan chunks
 │   └── blocks.py               # hypotheses, suggested actions, status, reports → Block Kit
@@ -705,8 +715,8 @@ faultmaven-slack-agent/
 ├── store/
 │   ├── installations.py        # Postgres InstallationStore + OAuthStateStore
 │   ├── tokens.py               # per-(team,user) FaultMaven token store
-│   ├── cases.py                # (team,channel,thread_ts) → case_id + last_activity
-│   └── locks.py                # per-thread turn serialization (§5.3)
+│   └── cases.py                # (team,channel,thread_ts) → case_id + last_activity
+│                               # (the drop-if-busy gate is in-process, in listeners/_turn.py, §5.3)
 ├── lifecycle/
 │   └── reaper.py               # background auto-close-on-inactivity job (§6.2)
 ├── requirements.txt            # slack-bolt, slack-sdk, fastapi, httpx, sqlalchemy, redis
@@ -723,7 +733,7 @@ only any replay/observability extras Bolt doesn't already give us.
 | Judging criterion | How we score |
 |---|---|
 | **Technological Implementation** | Full Slack AI-App stack (Assistant container, streaming `chat_stream` task/plan timeline, `set_status`, feedback) over a real multi-provider RAG investigation engine; multi-workspace OAuth with clean tenant isolation; (optional) live SSE tool-use streaming. |
-| **Design / UX** | The reasoning timeline turns opaque AI into a watchable diagnosis; suggested-action buttons make next steps one click; per-channel App Home; in-thread hygiene + ping-scoped focus keep channels quiet and answers on-point. |
+| **Design / UX** | The reasoning timeline turns opaque AI into a watchable diagnosis; suggested-action buttons make next steps one click; summon-then-auto-continue keeps channels quiet while a thread reads as an ordered Q&A (drop-if-busy + replier `@mention`). |
 | **Potential Impact** | Faster MTTR where incidents already live; the knowledge flywheel — every resolved case becomes a reusable runbook (the lifecycle drivers in §6.2 are what make it actually turn); honest "name the missing data" behavior builds trust. |
 | **Quality of Idea** | A human-in-the-loop, deliberately-invoked copilot (not an autopilot, not an ambient chatbot) with explicit soundness guarantees and a privacy-first posture — differentiated from alerting bots. |
 
@@ -736,7 +746,8 @@ a developer **sandbox URL granting `slackhack@salesforce.com` and
 stack trace → watch the reasoning timeline form hypotheses and request a log;
 (2) drag in a log file → hypothesis validates, root cause identified;
 (3) click **Generate runbook** → resolution summary + reusable runbook posted;
-(4) open the Assistant side panel and `/faultmaven cases` to show the portfolio.
+(4) open the Assistant side panel for the same flow 1:1, and deep-link to the
+Dashboard for the case portfolio.
 
 ---
 
@@ -791,14 +802,14 @@ requirement.
 3. **P2 — Reasoning timeline + actions.** `chat_stream` task/plan rendering from
    milestones/hypotheses; suggested-action buttons → typed intents; EVIDENCE/RUN
    flows. *Exit: signature UX demoable.*
-4. **P3 — Flagship entry + evidence.** The **"Ask FaultMaven"
-   message shortcut** as the universal case-opener (+ context/`file_input`
-   modal); seed-by-summon + ping-scoped turns; **per-thread serialization**
+4. **P3 — Flagship entry + evidence + concurrency.** The **"Ask FaultMaven"
+   message shortcut** as the universal case-opener; **auto-continue** in owned
+   threads; **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention`
    (§5.3); evidence consumption — files (`url_private`), paste, screenshots
-   (multimodal), shortcut-existing-content (§5.4).
-5. **P4 — Case lifecycle + reports + App Home.** Offer-to-close / auto-close-on-
-   inactivity / fresh-on-revival (§6.2); terminal-state report generation;
-   per-channel App Home; `/faultmaven cases`.
+   (multimodal), shortcut-existing-content (§5.4). *(Built.)*
+5. **P4 — Case lifecycle + reports.** Offer-to-close / auto-close-on-inactivity /
+   fresh-on-revival (§6.2); terminal-state report generation; deep-link to the
+   Dashboard for the case portfolio (no in-Slack case list, §4.5).
 6. **P5 — Multi-tenant OAuth hardening + war-room entry.** Per-user account
    linking + refresh; workspace→org binding; war-room fallback; `not_in_channel`;
    the `@mention` catch-up read (the one history-scope feature, §5.2).
