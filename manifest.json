@@ -20,7 +20,7 @@
     },
     "shortcuts": [
       {
-        "name": "Investigate with FaultMaven",
+        "name": "Ask",
         "type": "message",
         "callback_id": "fm_investigate_message",
         "description": "Open a FaultMaven investigation seeded with this message"
@@ -32,6 +32,8 @@
       "bot": [
         "assistant:write",
         "chat:write",
+        "commands",
+        "reactions:write",
         "app_mentions:read",
         "files:read",
         "im:history",
@@ -45,6 +47,8 @@
       "bot_events": [
         "assistant_thread_started",
         "message.im",
+        "message.channels",
+        "message.groups",
         "app_mention"
       ]
     },

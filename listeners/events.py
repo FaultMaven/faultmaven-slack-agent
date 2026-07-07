@@ -1,16 +1,22 @@
-"""Channel ``app_mention`` — the collaborative war-room surface.
+"""Channel surfaces — the collaborative war-room.
 
-Strictly mention-driven (no ``message.channels`` subscription). Replies land in
-the summoned thread so the parent channel stays quiet. On the first summons into
-a thread, the prior thread discussion is replayed to the engine so it isn't
-blind to what preceded the mention.
+Two entry points, both landing replies in the summoned thread so the parent
+channel stays quiet:
+
+- ``app_mention`` — the **summon**: ``@FaultMaven`` starts (or re-engages) an
+  investigation in a thread. On the first summons the prior thread discussion is
+  replayed as catch-up so the engine isn't blind to what preceded the mention.
+- ``message`` — **active-thread continuity**: once a thread is an investigation,
+  plain replies in *that* thread continue it without re-@mentioning. Every other
+  channel message is ignored (the bot only acts on threads it already owns), so
+  there's no ambient/firehose behavior.
 """
 
 from __future__ import annotations
 
 from logging import Logger
 
-from slack_bolt import App
+from slack_bolt import App, BoltContext
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
@@ -18,7 +24,7 @@ from rendering import clean_mention
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_turn_and_post
+from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -55,11 +61,44 @@ def _fetch_thread_context(
     return "\n".join(lines)[:_THREAD_CONTEXT_LIMIT]
 
 
+def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> bool:
+    """Cheap gate: is this a plain human reply *inside a thread* worth checking?
+
+    Filters out everything that must NOT auto-continue an investigation, before
+    the (slightly less cheap) store lookup the caller then does:
+
+    - the bot's own posts (``bot_id``),
+    - non-message subtypes (edits, deletes, joins…) — only a normal message or a
+      ``file_share`` carries new user input,
+    - DMs (``channel_type == "im"``) — the Assistant surface owns those,
+    - top-level channel messages (no ``thread_ts``) — we never start an
+      investigation from ambient channel chatter, only continue one in a thread,
+    - messages that mention the bot — ``app_mention`` owns those (and does the
+      first-summons catch-up read), so we don't double-process.
+    """
+
+    if event.get("bot_id"):
+        return False
+    if event.get("subtype") not in (None, "file_share"):
+        return False
+    if event.get("channel_type") == "im":
+        return False
+    if not event.get("thread_ts"):
+        return False
+    text = event.get("text") or ""
+    if bot_user_id and f"<@{bot_user_id}>" in text:
+        return False
+    return True
+
+
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
+    followup_dedup = Dedup()
 
     @app.event("app_mention")
-    def on_app_mention(event: dict, client: WebClient, logger: Logger) -> None:
+    def on_app_mention(
+        event: dict, context: BoltContext, client: WebClient, logger: Logger
+    ) -> None:
         # Ignore the bot's own messages; de-dupe Slack retries.
         if event.get("bot_id"):
             return
@@ -67,39 +106,97 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             return
 
         channel = event["channel"]
-        team_id = event.get("team", "")
+        # context.team_id (the app's install team) keys the thread's case and gate
+        # uniformly across surfaces — event["team"] is the *sender's* team and can
+        # differ in Slack Connect, which would fork the case/gate.
+        team_id = context.team_id or ""
         # A mention may be top-level (use its ts) or already inside a thread.
         thread_ts = event.get("thread_ts") or event["ts"]
-        text = clean_mention(event.get("text", "")) or (
-            "Please investigate this thread."
-        )
 
-        # Post the placeholder up front, before the (possibly slow) catch-up read
-        # and file download, so the summons is acknowledged immediately.
-        placeholder_ts = post_placeholder(client, channel, thread_ts)
-        if placeholder_ts is None:
-            return  # can't post here — /invite @FaultMaven
+        def work() -> None:
+            text = clean_mention(event.get("text", "")) or (
+                "Please investigate this thread."
+            )
+            # Placeholder up front, before the (possibly slow) catch-up read and
+            # file download, so the summons is acknowledged immediately.
+            placeholder_ts = post_placeholder(client, channel, thread_ts)
+            if placeholder_ts is None:
+                return  # can't post here — /invite @FaultMaven
 
-        # First summons into a thread → replay the prior discussion (catch-up).
-        prior_context = None
-        if store.get(team_id, channel, thread_ts) is None:
-            prior_context = _fetch_thread_context(
-                client, channel, thread_ts, exclude_ts=event.get("ts")
+            # First summons into a thread → replay the prior discussion.
+            prior_context = None
+            if store.get(team_id, channel, thread_ts) is None:
+                prior_context = _fetch_thread_context(
+                    client, channel, thread_ts, exclude_ts=event.get("ts")
+                )
+
+            files = download_message_files(client.token, event)
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text=text,
+                prior_context=prior_context,
+                files=files or None,
+                placeholder_ts=placeholder_ts,
+                mention_user=event.get("user"),
             )
 
-        # Files attached to the mention itself are forwarded as evidence
-        # (download_message_files no-ops to [] when there are none).
-        files = download_message_files(client.token, event)
+        # Reserve the thread and run on a background worker; if a turn is already
+        # running, this one is skipped (⏭️).
+        run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"), work=work,
+        )
 
-        run_turn_and_post(
-            client,
-            fm,
-            store,
-            channel=channel,
-            thread_ts=thread_ts,
-            team_id=team_id,
-            text=text,
-            prior_context=prior_context,
-            files=files or None,
-            placeholder_ts=placeholder_ts,
+    @app.event("message")
+    def on_thread_message(
+        event: dict, context: BoltContext, client: WebClient, logger: Logger
+    ) -> None:
+        # Continue an *existing* investigation from a plain thread reply — no
+        # re-@mention needed. Everything else is ignored (no firehose).
+        if not is_thread_followup_candidate(
+            event, bot_user_id=context.bot_user_id
+        ):
+            return
+
+        channel = event["channel"]
+        thread_ts = event["thread_ts"]
+        team_id = context.team_id or ""  # install team — see on_app_mention
+        # Only act on threads that are already an investigation.
+        if store.get(team_id, channel, thread_ts) is None:
+            return
+        if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+            return
+
+        # Decide there's something to investigate BEFORE reserving the thread, so
+        # a content-free reply (whitespace, or only another user's mention) can't
+        # hold the gate and cause a concurrent real reply to be skipped.
+        text = clean_mention(event.get("text") or "").strip()
+        has_files = bool(event.get("files"))
+        if not text and not has_files:
+            return
+
+        def work() -> None:
+            files = download_message_files(client.token, event) if has_files else []
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text=text or "Please continue the investigation with this evidence.",
+                files=files or None,
+                mention_user=event.get("user"),
+            )
+
+        # Reserve the thread and run in the background; if a turn is already
+        # running, skip this reply (⏭️) — the sender waits, then resends.
+        run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=event.get("ts"), work=work,
         )

@@ -99,8 +99,8 @@ def test_submit_turn_requires_at_least_one_input():
 
 # -- health -------------------------------------------------------------------
 def test_health_hits_top_level_endpoint_without_auth():
-    """The preflight probe must use /health (the /cases/health route is shadowed
-    by /cases/{case_id}); it's public, so no token is required."""
+    """The preflight probe must use the app-wide /health (broad liveness), not
+    the narrower /cases/health; it's public, so no token is required."""
 
     seen: dict = {}
 

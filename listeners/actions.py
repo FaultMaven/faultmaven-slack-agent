@@ -18,6 +18,8 @@ from faultmaven import FaultMavenClient, TurnResult
 from rendering import SUGGESTED_ACTION_PATTERN, build_turn_blocks
 from store import CaseStore
 
+from ._turn import run_gated
+
 
 def apply_action(
     fm: FaultMavenClient, case_id: str, value_json: str
@@ -67,36 +69,51 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         channel = body["channel"]["id"]
         message = body["message"]
         thread_ts = message.get("thread_ts") or message["ts"]
+        team_id = context.team_id or ""
 
-        try:
-            action = body["actions"][0]
-            label = action.get("text", {}).get("text", "")
-            case_id = store.get(context.team_id or "", channel, thread_ts)
-            if not case_id:
+        def work() -> None:
+            try:
+                action = body["actions"][0]
+                label = action.get("text", {}).get("text", "")
+                case_id = store.get(team_id, channel, thread_ts)
+                if not case_id:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=":warning: I lost track of this investigation's case. "
+                        "Please @mention me to continue.",
+                    )
+                    return
+
+                result = apply_action(fm, case_id, action["value"])
+                _disable_actions(client, body, label)
                 client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
-                    text=":warning: I lost track of this investigation's case. "
-                    "Please @mention me to continue.",
+                    text=result.agent_response[:300],
+                    blocks=build_turn_blocks(result),
                 )
-                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("suggested-action failed: %s", exc)
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=":warning: That action hit an error. "
+                        "Please try again or @mention me.",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
-            result = apply_action(fm, case_id, action["value"])
-            _disable_actions(client, body, label)
+        # A click advances the case, so it's a turn — reserve the thread and run
+        # in the background. If one is already running, tell the clicker to retry.
+        if not run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=None, work=work,
+        ):
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=result.agent_response[:300],
-                blocks=build_turn_blocks(result),
+                text=":hourglass_flowing_sand: Still working on the previous turn "
+                "— click that again once I've replied.",
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("suggested-action failed: %s", exc)
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=":warning: That action hit an error. "
-                    "Please try again or @mention me.",
-                )
-            except Exception:  # noqa: BLE001
-                pass

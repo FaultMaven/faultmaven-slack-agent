@@ -1,18 +1,25 @@
-"""run_turn_and_post + post_placeholder — the shared post/update flow that the
-mention and shortcut surfaces rely on (incl. the placeholder_ts reuse that keeps
-feedback instant before a slow file download)."""
+"""run_turn_and_post: post placeholder → run one turn → update it, addressing the
+replier (@mention) and carrying a one-time etiquette note on a thread's first
+reply. Runs synchronously (the caller holds the drop-if-busy gate)."""
 
 from __future__ import annotations
 
 import importlib.util
+import sys
 
 from faultmaven.client import TurnResult
 from slack_sdk.errors import SlackApiError
 
+_seq = 0
+
 
 def _load_turn():
-    spec = importlib.util.spec_from_file_location("_turn_p", "listeners/_turn.py")
+    global _seq
+    _seq += 1
+    name = f"_turn_rp{_seq}"
+    spec = importlib.util.spec_from_file_location(name, "listeners/_turn.py")
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -22,13 +29,12 @@ class FakeClient:
         self.fail_post = fail_post
         self.posts: list = []
         self.updates: list = []
-        self.token = "xoxb-test"
 
     def chat_postMessage(self, **kw):
         if self.fail_post:
             raise SlackApiError("cannot_post", {"error": "not_in_channel"})
         self.posts.append(kw)
-        return {"ts": "PH_NEW"}
+        return {"ts": "PH1"}
 
     def chat_update(self, **kw):
         self.updates.append(kw)
@@ -58,77 +64,79 @@ class FakeStore:
         self.m[(t, c, th)] = cid
 
 
-_COMMON = dict(channel="C", thread_ts="TS", team_id="T", text="hi")
+_COMMON = dict(channel="C", thread_ts="TS", team_id="T")
 
 
-def test_posts_a_placeholder_then_updates_it_when_none_given():
+def _first_section_text(update) -> str:
+    for b in update["blocks"]:
+        if b.get("type") == "section":
+            return b["text"]["text"]
+    return ""
+
+
+def _context_texts(update) -> list[str]:
+    return [
+        e.get("text", "")
+        for b in update["blocks"]
+        if b.get("type") == "context"
+        for e in b.get("elements", [])
+    ]
+
+
+def test_posts_a_placeholder_then_updates_it():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
-    _turn.run_turn_and_post(client, fm, FakeStore(), **_COMMON)
-    assert len(client.posts) == 1  # posted its own placeholder
-    assert client.updates[0]["ts"] == "PH_NEW"  # updated that same message
+    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON)
+    assert len(client.posts) == 1
+    assert client.updates[0]["ts"] == "PH1"
 
 
-def test_reuses_an_existing_placeholder_and_posts_no_second_one():
+def test_reuses_an_existing_placeholder():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
     _turn.run_turn_and_post(
-        client, fm, FakeStore(), placeholder_ts="PH_PRE", **_COMMON
+        client, fm, FakeStore(), text="hi", placeholder_ts="PH_PRE", **_COMMON
     )
-    assert client.posts == []  # did NOT post a second placeholder
-    assert client.updates[0]["ts"] == "PH_PRE"  # updated the caller's placeholder
+    assert client.posts == []
+    assert client.updates[0]["ts"] == "PH_PRE"
 
 
-def test_bails_without_running_the_turn_when_it_cannot_post():
+def test_bails_without_running_when_it_cannot_post():
     _turn = _load_turn()
     client, fm = FakeClient(fail_post=True), FakeFM()
-    _turn.run_turn_and_post(client, fm, FakeStore(), **_COMMON)
-    assert fm.turns == []  # never reached submit_turn
+    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON)
+    assert fm.turns == []
     assert client.updates == []
 
 
-def test_post_placeholder_returns_none_on_slack_error():
+def test_addresses_the_replier_and_warns_on_first_turn():
     _turn = _load_turn()
-    assert _turn.post_placeholder(FakeClient(fail_post=True), "C", "TS") is None
+    client, fm = FakeClient(), FakeFM()
+    _turn.run_turn_and_post(
+        client, fm, FakeStore(), text="hi", mention_user="U42", **_COMMON
+    )
+    update = client.updates[0]
+    assert _first_section_text(update).startswith("<@U42> ")  # addressed
+    # First reply carries the one-time "one at a time" etiquette note.
+    assert _turn._INTRO_WARNING in _context_texts(update)
 
 
-def test_forwards_files_through_to_submit_turn():
+def test_no_warning_on_later_turns():
+    _turn = _load_turn()
+    client, fm, store = FakeClient(), FakeFM(), FakeStore()
+    store.put("T", "C", "TS", "case_1")  # case already exists → not the first turn
+    _turn.run_turn_and_post(
+        client, fm, store, text="again", mention_user="U42", **_COMMON
+    )
+    assert _turn._INTRO_WARNING not in _context_texts(client.updates[0])
+
+
+def test_forwards_files_to_submit_turn():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
     files = [("app.log", b"boom", "text/plain")]
     _turn.run_turn_and_post(
-        client, fm, FakeStore(), placeholder_ts="PH", files=files, **_COMMON
+        client, fm, FakeStore(), text="hi", files=files, **_COMMON
     )
     _, kw = fm.turns[0]
     assert kw["files"] == files
-
-
-# -- resolve_query: the assistant's text/decline decision ----------------------
-def test_resolve_query_prefers_user_text():
-    _turn = _load_turn()
-    assert _turn.resolve_query("  disk full  ", downloaded_files=True) == "disk full"
-
-
-def test_resolve_query_defaults_when_file_only():
-    _turn = _load_turn()
-    assert (
-        _turn.resolve_query("", downloaded_files=True)
-        == "Please investigate the attached file(s)."
-    )
-
-
-def test_resolve_query_none_when_nothing_to_investigate():
-    _turn = _load_turn()
-    # No text and no ingestible file → decline (don't open a blank case).
-    assert _turn.resolve_query("", downloaded_files=False) is None
-    assert _turn.resolve_query("   ", downloaded_files=False) is None
-
-
-def test_resolve_query_handles_null_text():
-    # Slack sends text:null on some file-share messages — must not AttributeError.
-    _turn = _load_turn()
-    assert _turn.resolve_query(None, downloaded_files=False) is None
-    assert (
-        _turn.resolve_query(None, downloaded_files=True)
-        == "Please investigate the attached file(s)."
-    )

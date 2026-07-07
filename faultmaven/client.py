@@ -101,9 +101,9 @@ class FaultMavenClient:
 
         Used by the preflight doctor to confirm the API is reachable *before*
         the agent connects to Slack. It's public (no token) and side-effect free
-        (creates no case), so it's safe to call on every startup check. (Note:
-        ``/api/v1/cases/health`` is shadowed by the ``/cases/{case_id}`` route,
-        so the app-wide ``/health`` is the reliable probe.)
+        (creates no case), so it's safe to call on every startup check. We probe
+        the app-wide ``/health`` (broad liveness — DB/LLM components) rather than
+        the narrower case-service ``/api/v1/cases/health``.
         """
 
         try:
