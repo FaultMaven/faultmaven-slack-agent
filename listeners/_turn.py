@@ -29,7 +29,7 @@ from store import CaseStore
 
 logger = logging.getLogger(__name__)
 
-INVESTIGATING_PLACEHOLDER = ":mag: FaultMaven is investigating…"
+INVESTIGATING_PLACEHOLDER = ":mag: Investigating…"
 TURN_ERROR_TEXT = (
     ":warning: FaultMaven hit an error on that turn. Please try again or "
     "@mention me."
