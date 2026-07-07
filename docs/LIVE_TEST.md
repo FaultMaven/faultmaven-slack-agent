@@ -4,7 +4,7 @@ This is the operator runbook for taking the agent from merged code to a working
 loop in a real Slack workspace, then confirming each surface end to end. It uses
 **Socket Mode**, so no public URL or OAuth round-trip is required — the fastest
 path to a genuine test. (Multi-workspace HTTP/OAuth is a later deployment step;
-see [design.md](design.md) §14.)
+see [design.md](design.md) §16, P5–P6.)
 
 Budget ~15 minutes the first time.
 
@@ -30,10 +30,13 @@ The manifest pre-wires everything this agent uses:
 | Manifest section | Enables |
 |---|---|
 | `assistant_view` + `assistant_thread_started`/`message.im` events | the **Assistant** side-panel surface |
-| `app_mention` event + `app_mentions:read` | the **@mention war-room** surface |
-| `shortcuts: [fm_investigate_message]` + `interactivity` | the **"Investigate with FaultMaven"** message shortcut |
+| `app_mention` event + `app_mentions:read` | the **@mention** summon |
+| `message.channels` / `message.groups` events | **thread-reply auto-continue** (gated to owned threads) |
+| `shortcuts: [fm_investigate_message]` + `interactivity` + `commands` | the **Ask** message shortcut (shown as *Ask FaultMaven*; shortcuts need `commands`) |
 | `chat:write` | posting replies + the investigating placeholder |
-| `channels:history` / `groups:history` / `im:history` | replaying a thread on first summons (catch-up) |
+| `reactions:write` | marking a skipped message ⏭️ (drop-if-busy) |
+| `files:read` | downloading attached logs/screenshots as evidence |
+| `channels:history` / `groups:history` / `im:history` | thread catch-up on first summons + receiving reply events |
 | `socket_mode_enabled: true` | the dev transport (no public URL) |
 
 ## 2. Get the two tokens
@@ -92,29 +95,36 @@ result — so a flash-then-update is the healthy signal.
 **Expect:** a threaded reply that engages with the symptom (asks a clarifying
 question or names what it needs). A new case is created for this assistant thread.
 
-### B. @mention war-room (channels)
+### B. @mention war-room + auto-continue (channels)
 
 1. In a channel thread (or a fresh message), post an incident note, then:
    `@FaultMaven can you investigate this?`
+2. When it replies, **reply again in that thread — no @mention** — and attach a
+   log if you have one.
 
-**Expect:** the bot replies **in that thread** (channel stays quiet). On the
-*first* mention in an existing thread, it replays the prior thread messages as
-catch-up context, so its reply should reflect what was already discussed.
+**Expect:** the bot replies **in that thread** (channel stays quiet); on the
+*first* mention it replays the prior thread as catch-up. The follow-up reply
+**continues the investigation without a re-mention** (auto-continue), ingesting
+the attached file. A reply in a thread it was *not* summoned into is ignored.
 
-### C. "Investigate with FaultMaven" message shortcut (the flagship)
+- **Drop-if-busy:** have two people reply at once (or fire a second reply before
+  it answers). **Expect:** FaultMaven answers the first (`@mention`ing that
+  person) and marks the others ⏭️ — resend after it replies.
 
-1. Find any message — ideally a monitoring alert (Datadog/PagerDuty/Grafana
-   Block Kit). Hover → **⋮ More actions** → **Investigate with FaultMaven**.
+### C. "Ask FaultMaven" message shortcut (the flagship)
 
-**Expect:** a case opens **seeded with that message's content as evidence**, and
-the first reply threads under the selected message. Rich alerts (blocks, fields,
-legacy attachments) are extracted to text — the seed is the alert's substance,
-not a bare "Alert triggered" stub.
+1. Find any message — ideally a monitoring alert (Datadog/PagerDuty/Grafana Block
+   Kit), better yet with a **log file attached**. Hover → **⋮ More actions** →
+   **Ask FaultMaven**.
 
-- **Edge — empty/file-only message:** the shortcut on a message with no readable
-  text (e.g. only a file) should *not* open a blank case; it posts a short note
-  telling you to paste the key error text and `@mention` it. (File ingestion is
-  the next increment.)
+**Expect:** a case opens **seeded with that message as evidence** (rich alerts
+are extracted from blocks/attachments, not a bare "Alert triggered" stub), the
+attached file is **downloaded and forwarded**, and the first reply threads under
+the selected message.
+
+- **Edge — unreadable file-only message:** a message with no readable text and a
+  file the bot can't read (too large / no access) does *not* open a blank case;
+  it posts a short note telling you to paste the key text and `@mention` it.
 
 ### D. Interactive action buttons
 
@@ -138,8 +148,11 @@ advances (a new placeholder → updated reply appears in the thread).
 | Preflight: `could not obtain a bearer token` | backend not in local auth mode | set `FAULTMAVEN_API_TOKEN` for this backend |
 | App starts, but nothing happens on events | bot not in the channel | `/invite @FaultMaven` |
 | Log: `Cannot post in channel … not_in_channel` | same | `/invite @FaultMaven` |
-| Shortcut missing from ⋮ menu | manifest not applied / app not reinstalled | recreate from manifest or reinstall |
+| Shortcut missing from ⋮ menu | manifest not applied / app not reinstalled, or `commands` scope missing | recreate from manifest (needs `commands`) or reinstall |
 | Mention catch-up empty | missing history scope | confirm `channels:history`/`groups:history` are granted; reinstall |
+| Thread replies ignored (no auto-continue) | `message.channels`/`message.groups` not subscribed, or the thread isn't one FaultMaven owns | reinstall with those events; remember only summoned threads continue |
+| Skipped messages get no ⏭️ mark | `reactions:write` not granted (re-consent needed after adding it) | grant `reactions:write` and reinstall; the log warns `Could not mark a skipped message` |
+| Attached file ignored / "couldn't read that file" | missing `files:read`, file >8 MiB, or no access to that file's channel | grant `files:read` + reinstall; keep files ≤8 MiB |
 
 ---
 
@@ -152,4 +165,4 @@ advances (a new placeholder → updated reply appears in the thread).
 - **Backend stays Slack-agnostic.** The agent is the only bridge: it reads Slack
   and posts to Slack; the FaultMaven API never sees Slack tokens or payloads.
 - This run does **not** exercise multi-workspace OAuth or the HTTP transport —
-  those are the next deployment increment ([design.md](design.md) §14).
+  those are later roadmap phases ([design.md](design.md) §16, P5–P6).

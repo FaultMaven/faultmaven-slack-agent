@@ -10,7 +10,53 @@ from __future__ import annotations
 import httpx
 from slack_sdk.errors import SlackApiError
 
-from listeners.events import _fetch_thread_context
+from listeners.events import _fetch_thread_context, is_thread_followup_candidate
+
+_BOT = "UBOT"
+
+
+def _reply(**over) -> dict:
+    """A plain human reply inside a channel thread (the True case)."""
+    e = {"channel_type": "channel", "thread_ts": "t1", "text": "here's the log", "ts": "9"}
+    e.update(over)
+    return e
+
+
+# -- is_thread_followup_candidate (auto-continue gate) ------------------------
+def test_plain_thread_reply_is_a_candidate():
+    assert is_thread_followup_candidate(_reply(), bot_user_id=_BOT) is True
+
+
+def test_file_share_reply_is_a_candidate():
+    assert is_thread_followup_candidate(
+        _reply(subtype="file_share", text=""), bot_user_id=_BOT
+    ) is True
+
+
+def test_bot_own_message_is_not_a_candidate():
+    assert is_thread_followup_candidate(_reply(bot_id="B1"), bot_user_id=_BOT) is False
+
+
+def test_edit_delete_subtypes_are_not_candidates():
+    assert is_thread_followup_candidate(_reply(subtype="message_changed"), bot_user_id=_BOT) is False
+
+
+def test_dm_is_not_a_candidate():
+    # The Assistant surface owns DMs.
+    assert is_thread_followup_candidate(_reply(channel_type="im"), bot_user_id=_BOT) is False
+
+
+def test_top_level_channel_message_is_not_a_candidate():
+    # No thread_ts → ambient chatter, never starts an investigation.
+    e = _reply()
+    e.pop("thread_ts")
+    assert is_thread_followup_candidate(e, bot_user_id=_BOT) is False
+
+
+def test_mention_is_not_a_candidate_app_mention_owns_it():
+    assert is_thread_followup_candidate(
+        _reply(text=f"<@{_BOT}> take another look"), bot_user_id=_BOT
+    ) is False
 
 
 class _Client:

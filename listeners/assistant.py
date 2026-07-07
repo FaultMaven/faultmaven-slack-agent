@@ -16,7 +16,7 @@ from rendering import build_turn_blocks
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, resolve_query, run_turn
+from ._turn import Dedup, end_turn, resolve_query, run_turn, try_begin_turn
 
 _SUGGESTED_PROMPTS = [
     {
@@ -68,11 +68,19 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         say: Say,
         logger: Logger,
     ) -> None:
+        if dedup.is_duplicate(f"{payload.get('channel')}:{payload.get('ts')}"):
+            return
+        team_id = context.team_id or ""
+        channel = payload["channel"]
+        thread_ts = payload["thread_ts"]
+        # One turn at a time per thread: a second message sent before the reply is
+        # skipped (⏭️) rather than racing it (same rule as the channel surfaces).
+        if not try_begin_turn(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=payload.get("ts"),
+        ):
+            return
         try:
-            if dedup.is_duplicate(
-                f"{payload.get('channel')}:{payload.get('ts')}"
-            ):
-                return
             # set_status shows the native "investigating" indicator immediately,
             # so the file download below still has visible feedback in front of it.
             set_status("is investigating…")
@@ -96,9 +104,9 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
             result = run_turn(
                 fm,
                 store,
-                team_id=context.team_id or "",
-                channel_id=payload["channel"],
-                thread_ts=payload["thread_ts"],
+                team_id=team_id,
+                channel_id=channel,
+                thread_ts=thread_ts,
                 text=query,
                 files=files or None,
             )
@@ -112,5 +120,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 ":warning: FaultMaven hit an error on that turn. "
                 "Please try again."
             )
+        finally:
+            end_turn(team_id, channel, thread_ts)
 
     return assistant

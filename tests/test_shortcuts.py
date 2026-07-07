@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 
 from faultmaven.client import TurnResult
 from slack_text import message_to_text
@@ -106,6 +107,7 @@ def test_shortcut_core_seeds_case_with_extracted_message():
     # Load _turn.py directly (its package __init__ pulls in slack_bolt).
     spec = importlib.util.spec_from_file_location("_turn", "listeners/_turn.py")
     _turn = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = _turn  # let @dataclass resolve annotations
     spec.loader.exec_module(_turn)
 
     calls: dict = {}
@@ -152,6 +154,7 @@ def test_pasted_content_is_sent_on_an_existing_case_too():
     # still deliver the alert (run_turn used to drop it on existing cases).
     spec = importlib.util.spec_from_file_location("_turn2", "listeners/_turn.py")
     _turn = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = _turn  # let @dataclass resolve annotations
     spec.loader.exec_module(_turn)
 
     turns: list = []
@@ -192,6 +195,7 @@ def test_run_turn_forwards_files_even_without_text_evidence():
     # reach submit_turn (the file-ingestion increment).
     spec = importlib.util.spec_from_file_location("_turn3", "listeners/_turn.py")
     _turn = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = _turn  # let @dataclass resolve annotations
     spec.loader.exec_module(_turn)
 
     turns: list = []

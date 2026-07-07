@@ -31,11 +31,11 @@ tension**:
 |---|---|---|
 | Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives the challenge rewards; the skeleton uses none of them. |
 | Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` + message shortcuts + slash commands | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
-| Interaction model | **Deliberately-invoked tool, not an ambient participant** — respond only to a *ping* (mention / shortcut / slash / panel); a turn's context is the **pinged message only**, not the surrounding thread (§5) | Matches the backend's serialized, single-author model *and* Slack's own AI-apps guidance *and* every incident bot in the market; curated input protects the soundness guarantee. |
+| Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
 | Case scoping & lifecycle | **Thread-scoped collaborative cases under the org**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
 | Deploy / auth | **Cloud OAuth, multi-workspace** → "Agent for Organizations" track | Slack workspace ↔ FaultMaven organization; per-user FaultMaven account linking. |
-| Privacy posture | **Keep strict mention-only** — no `message.channels` firehose | An enterprise-trust strength that is fully compatible with the AI-App UX. |
+| Privacy posture | **Subscribe-and-gate** — `message.channels`/`message.groups` for in-thread continuity, but act only on already-owned threads (never ambient) | Same enterprise-trust "no firehose" guarantee as strict mention-only, with the in-thread UX; ownership gate does the filtering. |
 | Backend integration | **FaultMaven REST** (`/cases`, `/cases/{id}/turns`, `/reports`, `/knowledge`) | Carries the case state machine, evidence pipeline, and milestones. |
 
 ### The one bug to fix no matter what
@@ -55,7 +55,7 @@ One capability done excellently beats three done ordinarily. The flagship is the
 universal **"investigate this"** flow:
 
 1. From **any** message — an alert, a pasted error/log, a problem description — a
-   user fires the **"Investigate with FaultMaven" message shortcut** (§4.3): a
+   user fires the **"Ask FaultMaven" message shortcut** (§4.3): a
    case opens, seeded with that message (+ optional context/file via the modal).
 2. FaultMaven drives a **structured investigation** in the thread — triage →
    hypotheses → *specific* evidence requests → root cause → verified fix —
@@ -192,14 +192,17 @@ conversation.
 ### 4.2 Channel `@FaultMaven` mention — the war-room surface
 
 For collaborative incident channels. Same engine, replies land **in-thread** so
-the parent channel stays quiet. **A mention is a ping: the turn's input is the
-mention message only** — FaultMaven does *not* replay the surrounding thread (see
-§5.2 for why, and the one explicit exception). Strictly gesture-driven — we
-subscribe to `app_mention` only, never `message.channels`.
+the parent channel stays quiet. A mention **creates** the investigation and does
+*not* replay the surrounding thread (see §5.2 for why, and the one explicit
+exception); after that, plain replies **auto-continue** it (§5.2). We subscribe
+to `app_mention` plus `message.channels`/`message.groups`, but act only on
+threads the agent already owns — never ambient chatter.
 
 ### 4.3 Message shortcut — the universal case-opener
 
-"Investigate with FaultMaven" is a registered **message shortcut** (in the ⋮
+"Ask FaultMaven" is a registered **message shortcut** (named just `Ask` in the
+manifest — Slack appends the app name in the menu, so it reads *Ask FaultMaven*;
+in the ⋮
 *More actions* menu of any message — *not* a slash command). It is the
 **universal entry**: it works on *any* message (an alert's Block Kit payload, a
 pasted stack trace, a teammate's description), and Slack hands our agent the
@@ -286,12 +289,26 @@ channel. The opening turn is seeded by the entry gesture:
 | **`@mention` into a thread with prior discussion** | a **one-time catch-up read** of the thread → FaultMaven synthesizes *"here's what I understand … correct?"* then leads (the lone use of `conversations.replies`; the invite authorizes it) | natural (`@`) |
 | **`@mention`/message in a fresh thread or side panel; `/faultmaven`** | the mention/command text | natural |
 
-After the opening, **every subsequent turn is ping-scoped**: the input is the
-pinged message only, and FaultMaven's memory of the conversation is its **own
-case history** (held server-side), not the raw thread. It never reads un-pinged
-messages — no `message.channels` subscription.
+After the opening, the thread becomes an **owned investigation**, and FaultMaven
+**auto-continues** it: plain replies in *that thread* advance the case with no
+re-`@mention` needed (users flagged re-pinging every turn as friction). Each
+turn's input is still just the message that triggered it; FaultMaven's memory of
+the conversation is its **own case history** (held server-side), not a re-read of
+the thread.
 
-Why ping-scoped (and why the catch-up read is the *only* thread read):
+This subscribes to `message.channels`/`message.groups`, but it is **not
+ambient**: the agent acts *only* on threads it already owns (a `store` lookup
+gates every message), so it never responds to channel chatter, top-level
+messages, or threads it wasn't summoned into. Creation still requires an explicit
+mention or the shortcut — a bare reply-in-thread does nothing. So the "no
+firehose" posture is preserved; the mechanism (subscribe-and-gate) changed, not
+the behaviour.
+
+> **Rejected alternative.** *Strict mention-only, re-ping every turn* (v1, no
+> `message.channels`): correct on privacy but poor UX in an active thread — the
+> subscribe-and-gate model gives the same privacy with in-thread continuity.
+
+Why the catch-up read is the *only* full thread read:
 
 - **Soundness.** Feeding raw multi-party cross-talk — contradictions, tangents,
   half-formed guesses — into a *stateful* investigation pollutes it and threatens
@@ -307,26 +324,40 @@ Why ping-scoped (and why the catch-up read is the *only* thread read):
 > include the context in the ping; the human controls what FaultMaven sees.
 > Copy-paste works everywhere but is manual — a fallback, not a designed path.
 
-### 5.3 Concurrency — serialize turns per case
+### 5.3 Concurrency — one turn per thread, drop-if-busy
 
-The backend processes turns **serialized and single-author** (Copilot's locked
-1:1 UI guarantees this). A Slack thread is **concurrent and multi-author** — two
-people can ping the same thread at once. So the agent **serializes turns per
-case**: a per-`(team, channel, thread_ts)` lock ensures at most one turn is in
-flight per case; concurrent pings queue and run in order.
+The backend is **linear and client-agnostic**: a turn advances the case by one,
+its next context includes the latest reply, and it cannot tell a Slack N:1
+war-room from the Copilot's 1:1 chat (and must not try — accommodating hundreds
+of concurrent repliers server-side is unbounded complexity). A Slack thread,
+however, is **concurrent and multi-author**. The agent bridges the two by
+enforcing strict turn-taking, entirely agent-side:
 
-This is justified specifically by **statefulness**. The stateless reference
-Slackbots skip serialization (each response is independent), but FaultMaven
-*mutates a persistent case* (turn_history, hypotheses, current_turn), so
-concurrent turns would corrupt shared state. Serialization presents the backend
-the one-at-a-time stream it is designed for. (The backend's turn-sequence
-resilience fix makes any slip non-catastrophic; serialization keeps slips from
-happening.)
+- **One turn per thread at a time.** A per-`(team, channel, thread_ts)` gate
+  admits the first message and runs it on a background worker (so the Bolt
+  listener returns immediately and the Socket Mode worker pool isn't pinned by a
+  20 s+ turn).
+- **Drop-if-busy, not queue.** Any message that arrives *before* FaultMaven's
+  reply is posted is **skipped**, marked ⏭️ (`reactions:write`) so its sender
+  knows to resend after the reply. We deliberately do **not** queue or merge
+  those messages: queuing would answer a message its sender wrote against a state
+  that has since moved on, and merging blends different people's (possibly
+  contradictory) input into one turn the linear backend would mis-read.
+- **Address the replier.** FaultMaven `@mention`s the user whose message it
+  answered, so a multi-person thread reads "→ @alice … → @bob …" instead of a
+  confusing run — and a one-time note on the first reply sets the etiquette
+  ("I take these one at a time — wait for my reply before sending the next").
+
+> **Rejected alternatives.** *Serialize-and-queue* (v1) and *coalesce the burst
+> into one turn* (v2) were both built and discarded: the accepted residual — that
+> a reply written while FaultMaven is *composing* is judged against the newer
+> state — is inherent to a linear backend and no amount of queuing/merging or
+> debouncing removes it, so the simplest honest rule (answer the first, skip the
+> rest with a visible ⏭️, keep the backend linear) won.
 
 **Multi-author** is handled as metadata, not a turn-model change: a turn is
-attributed to the pinging Slack user; the *case* is a team artifact under the org
-(§6.1). Content drives the diagnosis, not authorship, so flattening "who said it"
-does not corrupt the reasoning — only the audit trail, which the metadata keeps.
+attributed to the pinging Slack user (used for the `@mention`); the *case* is a
+team artifact under the org (§6.1). Content drives the diagnosis, not authorship.
 
 ### 5.4 Evidence input — consume Slack's native inputs, don't build an uploader
 
@@ -626,16 +657,17 @@ identity** (the team→org binding), attributed to the Slack user in metadata. T
 
 ## 11. Privacy & security posture
 
-- **Strict mention/ping-only.** Subscribe to `app_mention`, `assistant_thread_*`,
-  `message.im` (the 1:1 assistant DM), shortcuts, and commands — **never**
-  `message.channels`. No background ingestion; every read is a direct response
-  to an explicit ping, scoped to the pinged message (§5.2).
+- **Summon-to-create, then owned-thread only — never ambient.** We subscribe to
+  `app_mention`, `assistant_thread_*`, `message.im` (the 1:1 assistant DM),
+  `message.channels`/`message.groups`, shortcuts, and commands. The channel
+  message events power **in-thread continuity**, but every one is gated by a
+  `store` ownership lookup: the agent acts only on threads it was explicitly
+  summoned into (§5.2). No background ingestion of channel chatter.
 - **Least-privilege scopes (core):** `app_mentions:read`, `assistant:write`,
-  `chat:write`, `im:history`, `commands`, `files:read` (download attached
-  evidence). The shortcut/slash flavors need **no** thread-read; the
-  `@mention`-into-a-thread **catch-up read** (§5.2) is the only path that reads a
-  thread, and the *only* reason we request `channels:history`/`groups:history` —
-  used solely on that explicit invitation.
+  `chat:write`, `commands`, `reactions:write` (mark a skipped message ⏭️, §5.3),
+  `files:read` (download attached evidence), and `channels:history`/`groups:history`/
+  `im:history` (read a thread for the one-time catch-up on first summons, §5.2,
+  and receive the thread-reply events that drive continuity).
 - **Request authenticity** handled by Bolt (signing secret + timestamp/replay).
 - **Secrets** via env/secret store; never logged. Evidence is forwarded to
   FaultMaven (which already runs Presidio PII redaction + the preprocessing
@@ -659,7 +691,7 @@ faultmaven-slack-agent/
 ├── listeners/
 │   ├── assistant/              # thread_started (suggested prompts) · user_message (turn)
 │   ├── events/                 # app_mention
-│   ├── shortcuts/              # "Investigate with FaultMaven" message shortcut
+│   ├── shortcuts/              # "Ask FaultMaven" message shortcut
 │   ├── commands/               # one /faultmaven command; handler parses the text arg
 │   ├── actions/                # suggested-action buttons (incl. close) · feedback
 │   └── views/                  # App Home (per-channel case list) · modals
@@ -759,7 +791,7 @@ requirement.
 3. **P2 — Reasoning timeline + actions.** `chat_stream` task/plan rendering from
    milestones/hypotheses; suggested-action buttons → typed intents; EVIDENCE/RUN
    flows. *Exit: signature UX demoable.*
-4. **P3 — Flagship entry + evidence.** The **"Investigate with FaultMaven"
+4. **P3 — Flagship entry + evidence.** The **"Ask FaultMaven"
    message shortcut** as the universal case-opener (+ context/`file_input`
    modal); seed-by-summon + ping-scoped turns; **per-thread serialization**
    (§5.3); evidence consumption — files (`url_private`), paste, screenshots
