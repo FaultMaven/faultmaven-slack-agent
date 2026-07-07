@@ -92,6 +92,6 @@ replier `@mention`s, the corrected case/turn backend contract, thread→case
 mapping, Block Kit rendering, and **interactive suggested-action buttons**
 (DECIDE/FREE_SPEECH clicks submit typed turns). A **preflight doctor**
 (`scripts/preflight.py`) verifies the wiring before a live test. Token-streaming
-reasoning timeline, terminal-state reports, App Home, and multi-workspace OAuth
-(currently Socket Mode) follow next — see the roadmap in
+reasoning timeline, terminal-state reports, and multi-workspace OAuth (currently
+Socket Mode) follow next — see the roadmap in
 [docs/design.md](docs/design.md) §16.
