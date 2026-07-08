@@ -330,7 +330,9 @@ def run_turn_and_post(
             prior_context=prior_context,
             files=files,
         )
-        blocks = build_turn_blocks(result)
+        # Stamp the case pointer only on the opening reply (thread = case).
+        opening_case_id = store.get(team_id, channel, thread_ts) if first_turn else None
+        blocks = build_turn_blocks(result, case_id=opening_case_id)
         if mention_user:
             _address(blocks, mention_user)
             if first_turn:

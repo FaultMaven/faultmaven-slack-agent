@@ -101,6 +101,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 )
                 return
 
+            first_turn = store.get(team_id, channel, thread_ts) is None
             result = run_turn(
                 fm,
                 store,
@@ -110,9 +111,13 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 text=query,
                 files=files or None,
             )
+            # Stamp the case pointer only on the opening reply (thread = case).
+            opening_case_id = (
+                store.get(team_id, channel, thread_ts) if first_turn else None
+            )
             say(
                 text=result.agent_response[:300],
-                blocks=build_turn_blocks(result),
+                blocks=build_turn_blocks(result, case_id=opening_case_id),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("assistant user_message failed: %s", exc)
