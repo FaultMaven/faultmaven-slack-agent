@@ -14,6 +14,7 @@ import re
 from typing import Any, Pattern
 
 from faultmaven.client import TurnResult
+from slack_mrkdwn import to_mrkdwn
 
 # Slack section ``mrkdwn`` text tops out at 3000 chars; stay safely under.
 _SECTION_LIMIT = 2900
@@ -82,7 +83,7 @@ def _action_label(action: dict[str, Any]) -> str:
 def _format_evidence(action: dict[str, Any]) -> str:
     """Render an evidence ask, appending acquisition hints when present."""
 
-    label = _action_label(action)
+    label = to_mrkdwn(_action_label(action))
     hints = action.get("hints")
     if isinstance(hints, list) and hints:
         return f"• {label} — _{', '.join(str(h) for h in hints)}_"
@@ -92,45 +93,48 @@ def _format_evidence(action: dict[str, Any]) -> str:
 
 
 def _format_action(action: dict[str, Any]) -> str:
-    """Render a non-clickable suggested action as an mrkdwn bullet, by type."""
+    """Render a non-clickable suggested action as an mrkdwn bullet, by type.
 
-    a_type = (action.get("type") or action.get("action_type") or "").upper()
-    label = _action_label(action)
-    if a_type == "RUN":
-        command = action.get("payload") or action.get("body") or label
-        return f"• *Run:* `{command}`"
-    if a_type == "DECIDE":
-        return f"• :white_check_mark: *Decision:* {label}"
-    return f"• {label}"
-
-
-def _action_value(action: dict[str, Any]) -> str | None:
-    """Encode a submittable button value, or None if the action isn't one.
-
-    DECIDE carries a backend ``intent`` (QueryIntent dict) we replay verbatim,
-    flagged ``user_confirmed`` since the click is an explicit confirmation.
-    FREE_SPEECH submits the suggested text as a plain conversation turn.
-    ``evidence_need`` is never submittable (NOT_IMPLEMENTED server-side, design
-    §6.3), and oversized values fall back to text rather than truncate.
+    RUN → a copy-run command in a code span (never rewritten as mrkdwn).
+    FREE_SPEECH → a prompt to answer in your own words (a hint, not a command).
+    DECIDE here is the fallback for a DECIDE the button path couldn't encode.
     """
 
     a_type = (action.get("type") or action.get("action_type") or "").upper()
-    payload = action.get("payload") or _action_label(action)
+    if a_type == "RUN":
+        command = action.get("payload") or action.get("body") or _action_label(action)
+        return f"• *Run:* `{command}`"  # command stays literal in the code span
+    label = to_mrkdwn(_action_label(action))
     if a_type == "DECIDE":
-        intent = action.get("intent") or {}
-        intent_type = intent.get("type")
-        if not intent_type or intent_type == "evidence_need":
-            return None
-        value = {
-            "q": payload,
-            "it": intent_type,
-            "id": {**intent, "user_confirmed": True},
-        }
-    elif a_type == "FREE_SPEECH":
-        value = {"q": payload, "it": "conversation"}
-    else:
-        return None
+        return f"• :white_check_mark: *Decision:* {label}"
+    # FREE_SPEECH (or any other non-clickable) — a "tell me in your own words" prompt.
+    return f"• :speech_balloon: {label}"
 
+
+def _action_value(action: dict[str, Any]) -> str | None:
+    """Encode a submittable button value, or None if the action isn't clickable.
+
+    **Only DECIDE is a button.** Clicking it sends the pre-composed decision to
+    the backend verbatim (its ``intent`` replayed, flagged ``user_confirmed``).
+    RUN (a command to copy-run locally), FREE_SPEECH (a prompt to answer in your
+    own words), and EVIDENCE are **not** submittable — making them clickable
+    would send fixed text the engine can't act on. ``evidence_need`` intents are
+    also non-submittable (NOT_IMPLEMENTED server-side); oversized values fall
+    back to text rather than truncate.
+    """
+
+    a_type = (action.get("type") or action.get("action_type") or "").upper()
+    if a_type != "DECIDE":
+        return None
+    intent = action.get("intent") or {}
+    intent_type = intent.get("type")
+    if not intent_type or intent_type == "evidence_need":
+        return None
+    value = {
+        "q": action.get("payload") or _action_label(action),
+        "it": intent_type,
+        "id": {**intent, "user_confirmed": True},
+    }
     encoded = json.dumps(value)
     return encoded if len(encoded) <= _BUTTON_VALUE_LIMIT else None
 
@@ -173,9 +177,10 @@ def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
 
     # No ":robot_face: *FaultMaven*" header — Slack already shows the app's name
-    # and icon above every message, so it's redundant. The reply is just the
-    # response text (the drop-if-busy path prepends an @mention of the replier).
-    parts = _chunk(result.agent_response)
+    # and icon above every message, so it's redundant. The reply is the response
+    # text, converted from the engine's standard Markdown to Slack mrkdwn (the
+    # drop-if-busy path prepends an @mention of the replier).
+    parts = _chunk(to_mrkdwn(result.agent_response))
     for part in parts:
         blocks.append(_section(part))
 

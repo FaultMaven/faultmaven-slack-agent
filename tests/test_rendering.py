@@ -44,6 +44,14 @@ def test_reply_has_no_redundant_faultmaven_header():
     assert ":robot_face:" not in sections[0] and "*FaultMaven*" not in sections[0]
 
 
+def test_response_markdown_is_converted_to_slack_mrkdwn():
+    # The engine emits standard Markdown; the reply must be Slack mrkdwn.
+    result = TurnResult(agent_response="The **root cause** is a\n- bad deploy")
+    body = _sections(build_turn_blocks(result))[0]
+    assert "*root cause*" in body and "**" not in body
+    assert "• bad deploy" in body
+
+
 # -- §7.3 soundness behavior --------------------------------------------------
 def test_evidence_ask_gets_its_own_prominent_section():
     result = TurnResult(
