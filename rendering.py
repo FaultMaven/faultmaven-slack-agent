@@ -160,7 +160,9 @@ def _make_button(action: dict[str, Any]) -> dict[str, Any] | None:
     return button
 
 
-def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
+def build_turn_blocks(
+    result: TurnResult, *, case_id: str | None = None
+) -> list[dict[str, Any]]:
     """Render a turn result as Block Kit blocks.
 
     Honors FaultMaven's soundness posture (design §7.3): while the case is still
@@ -172,6 +174,11 @@ def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
     DECIDE actions become interactive buttons (handled by
     listeners/actions.py); RUN renders as a copyable code block; EVIDENCE asks
     render as the prominent text section above.
+
+    ``case_id`` is passed **only on the case-opening reply** (thread = case, so
+    once is enough). It renders as a quiet, selectable line in the context row
+    so the case record can be located in the backend/dashboard; later turns omit
+    it to keep the thread clean.
     """
 
     blocks: list[dict[str, Any]] = []
@@ -219,6 +226,9 @@ def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
         blocks.append({"type": "actions", "elements": buttons[i : i + 5]})
 
     context: list[dict[str, Any]] = []
+    if case_id:
+        # Quiet, selectable case pointer — root-only (see docstring).
+        context.append({"type": "mrkdwn", "text": f":card_index_dividers: `{case_id}`"})
     if result.case_state:
         context.append(
             {"type": "mrkdwn", "text": f"State: `{result.case_state}`"}

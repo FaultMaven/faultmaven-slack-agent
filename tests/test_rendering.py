@@ -52,6 +52,23 @@ def test_response_markdown_is_converted_to_slack_mrkdwn():
     assert "• bad deploy" in body
 
 
+def test_case_id_shown_quietly_on_opening_reply():
+    # thread = case: the case pointer rides once in the quiet context row so the
+    # record is locatable in the backend/dashboard.
+    result = TurnResult(agent_response="opened", case_state="inquiry", turn_number=1)
+    ctx = _context_texts(build_turn_blocks(result, case_id="case_abc123"))
+    assert any("case_abc123" in t for t in ctx)
+    # It's a context (gray) element, never a prominent section.
+    assert all("case_abc123" not in s for s in _sections(build_turn_blocks(result, case_id="case_abc123")))
+
+
+def test_case_id_omitted_on_later_turns():
+    # Root-only: without case_id (every non-opening turn), nothing is stamped.
+    result = TurnResult(agent_response="next", case_state="investigating", turn_number=4)
+    ctx = _context_texts(build_turn_blocks(result))
+    assert all("case_" not in t for t in ctx)
+
+
 # -- §7.3 soundness behavior --------------------------------------------------
 def test_evidence_ask_gets_its_own_prominent_section():
     result = TurnResult(
