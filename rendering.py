@@ -169,7 +169,7 @@ def build_turn_blocks(result: TurnResult) -> list[dict[str, Any]]:
     context line states the investigation is ongoing so an in-progress turn is
     not mistaken for a verdict.
 
-    DECIDE / FREE_SPEECH actions become interactive buttons (handled by
+    DECIDE actions become interactive buttons (handled by
     listeners/actions.py); RUN renders as a copyable code block; EVIDENCE asks
     render as the prominent text section above.
     """

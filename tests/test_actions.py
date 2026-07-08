@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from listeners.actions import apply_action
+from listeners.actions import _plain, apply_action
 from rendering import build_turn_blocks
+
+
+def test_plain_neutralizes_mrkdwn_in_echoed_label():
+    # The choice echo wraps the label in *...*; an active char must not break it.
+    assert _plain("Yes, let's investigate") == "Yes, let's investigate"
+    assert _plain("run *now* & <cmd>") == "run now &amp; &lt;cmd&gt;"
+    assert "*" not in _plain("a*b_c~d`e") and "_" not in _plain("a*b_c~d`e")
 
 
 class FakeFM:

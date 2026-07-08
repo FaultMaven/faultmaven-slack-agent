@@ -1,9 +1,11 @@
 """Interactive suggested-action buttons (P2).
 
-When a user clicks a DECIDE / FREE_SPEECH button rendered on a turn result, Slack
-delivers a ``block_actions`` payload (over Socket Mode). We recover the case for
-that thread, submit the encoded turn, post the next result in-thread, and disable
-the clicked buttons so the same action can't be double-submitted.
+When a user clicks a DECIDE button rendered on a turn result (the only clickable
+suggestion type — RUN and FREE_SPEECH are text), Slack delivers a
+``block_actions`` payload (over Socket Mode). We recover the case for that thread,
+submit the encoded turn, echo the choice as the clicker's turn, post the next
+result in-thread, and strip the clicked buttons so the same action can't be
+double-submitted.
 """
 
 from __future__ import annotations
@@ -33,6 +35,15 @@ def apply_action(
         intent_type=value.get("it"),
         intent_data=value.get("id"),
     )
+
+
+def _plain(text: str) -> str:
+    """Neutralize mrkdwn/entities so a label can't break the echo's formatting."""
+
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for ch in "*_~`":
+        text = text.replace(ch, "")
+    return text
 
 
 def _disable_actions(client: WebClient, body: dict) -> None:
@@ -89,7 +100,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
-                        text=f"> <@{user_id}> chose *{label}*",
+                        text=f"> <@{user_id}> chose *{_plain(label)}*",
                     )
 
                 client.chat_postMessage(

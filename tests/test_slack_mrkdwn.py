@@ -8,11 +8,35 @@ from slack_mrkdwn import to_mrkdwn
 
 def test_bold_double_to_single_asterisk():
     assert to_mrkdwn("the **root cause** here") == "the *root cause* here"
-    assert to_mrkdwn("__also bold__") == "*also bold*"
+
+
+def test_double_underscore_identifiers_are_not_bolded():
+    # __ is deliberately NOT bold: Python dunders / snake paths must survive.
+    assert to_mrkdwn("the __init__ method") == "the __init__ method"
+    assert to_mrkdwn("see __main__ and __str__") == "see __main__ and __str__"
 
 
 def test_italic_to_underscore():
     assert to_mrkdwn("it was *OOMKilled* again") == "it was _OOMKilled_ again"
+
+
+def test_bold_italic_triple():
+    assert to_mrkdwn("that is ***critical*** now") == "that is *_critical_* now"
+
+
+def test_bold_heading_is_not_double_wrapped():
+    # `### **Next Steps**` must become one clean bold line, not literal `**...**`.
+    assert to_mrkdwn("### **Next Steps**") == "*Next Steps*"
+    assert to_mrkdwn("## **Deployment logs**") == "*Deployment logs*"
+
+
+def test_titled_link_drops_the_title():
+    assert to_mrkdwn('[docs](https://x "the title")') == "<https://x|docs>"
+
+
+def test_control_chars_in_input_do_not_crash_or_spoof():
+    # Sentinels leaking in from input are stripped, so restore can't IndexError.
+    assert to_mrkdwn("literal \x00 5 \x01 here") == "literal  5  here"
 
 
 def test_heading_becomes_bold_line():
