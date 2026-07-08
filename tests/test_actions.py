@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from listeners.actions import apply_action
+from listeners.actions import _plain, apply_action
 from rendering import build_turn_blocks
+
+
+def test_plain_neutralizes_mrkdwn_in_echoed_label():
+    # The choice echo wraps the label in *...*; an active char must not break it.
+    assert _plain("Yes, let's investigate") == "Yes, let's investigate"
+    assert _plain("run *now* & <cmd>") == "run now &amp; &lt;cmd&gt;"
+    assert "*" not in _plain("a*b_c~d`e") and "_" not in _plain("a*b_c~d`e")
 
 
 class FakeFM:
@@ -51,7 +58,9 @@ def test_decide_becomes_primary_button_carrying_intent():
     assert value["id"]["user_confirmed"] is True
 
 
-def test_free_speech_becomes_conversation_button():
+def test_free_speech_is_not_clickable():
+    # FREE_SPEECH is a prompt to answer in your own words — NOT a button that
+    # submits fixed text (that would send text the engine can't act on).
     result = TurnResult(
         agent_response="?",
         suggested_actions=[
@@ -59,11 +68,10 @@ def test_free_speech_becomes_conversation_button():
              "payload": "Tell me about the 2pm deploy"}
         ],
     )
-    buttons = _buttons(build_turn_blocks(result))
-    value = json.loads(buttons[0]["value"])
-    assert value["it"] == "conversation"
-    assert value["q"] == "Tell me about the 2pm deploy"
-    assert "style" not in buttons[0]  # not primary
+    blocks = build_turn_blocks(result)
+    assert _buttons(blocks) == []  # no button
+    sections = [b["text"]["text"] for b in blocks if b["type"] == "section"]
+    assert any("Tell me about the deploy" in s for s in sections)  # rendered as a hint
 
 
 def test_run_action_is_not_a_button():
@@ -102,7 +110,8 @@ def test_multiple_buttons_get_unique_action_ids():
              "intent": {"type": "status_transition", "to_state": "resolved"}},
             {"type": "DECIDE", "label": "B", "payload": "b",
              "intent": {"type": "status_transition", "to_state": "closed"}},
-            {"type": "FREE_SPEECH", "label": "C", "payload": "c"},
+            {"type": "DECIDE", "label": "C", "payload": "c",
+             "intent": {"type": "confirmation", "confirmation_value": True}},
         ],
     )
     ids = [b["action_id"] for b in _buttons(build_turn_blocks(result))]
@@ -112,10 +121,13 @@ def test_multiple_buttons_get_unique_action_ids():
 
 
 def test_oversized_value_falls_back_to_text_not_button():
+    # A DECIDE whose encoded value exceeds Slack's button-value cap renders as
+    # text instead of a truncated (broken) button.
     result = TurnResult(
         agent_response="?",
         suggested_actions=[
-            {"type": "FREE_SPEECH", "label": "huge", "payload": "x" * 3000}
+            {"type": "DECIDE", "label": "huge", "payload": "x" * 3000,
+             "intent": {"type": "confirmation", "confirmation_value": True}}
         ],
     )
     assert _buttons(build_turn_blocks(result)) == []

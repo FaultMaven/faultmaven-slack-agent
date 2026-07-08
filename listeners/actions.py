@@ -1,9 +1,11 @@
 """Interactive suggested-action buttons (P2).
 
-When a user clicks a DECIDE / FREE_SPEECH button rendered on a turn result, Slack
-delivers a ``block_actions`` payload (over Socket Mode). We recover the case for
-that thread, submit the encoded turn, post the next result in-thread, and disable
-the clicked buttons so the same action can't be double-submitted.
+When a user clicks a DECIDE button rendered on a turn result (the only clickable
+suggestion type — RUN and FREE_SPEECH are text), Slack delivers a
+``block_actions`` payload (over Socket Mode). We recover the case for that thread,
+submit the encoded turn, echo the choice as the clicker's turn, post the next
+result in-thread, and strip the clicked buttons so the same action can't be
+double-submitted.
 """
 
 from __future__ import annotations
@@ -35,19 +37,20 @@ def apply_action(
     )
 
 
-def _disable_actions(client: WebClient, body: dict, label: str) -> None:
-    """Rewrite the clicked message without its buttons, noting the choice."""
+def _plain(text: str) -> str:
+    """Neutralize mrkdwn/entities so a label can't break the echo's formatting."""
+
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for ch in "*_~`":
+        text = text.replace(ch, "")
+    return text
+
+
+def _disable_actions(client: WebClient, body: dict) -> None:
+    """Strip the buttons off the clicked message so the choice can't be re-sent."""
 
     message = body["message"]
     kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
-    kept.append(
-        {
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f":point_right: _You chose: {label}_"}
-            ],
-        }
-    )
     client.chat_update(
         channel=body["channel"]["id"],
         ts=message["ts"],
@@ -86,7 +89,20 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     return
 
                 result = apply_action(fm, case_id, action["value"])
-                _disable_actions(client, body, label)
+                _disable_actions(client, body)
+
+                # A button click posts no user message on its own, so consecutive
+                # FaultMaven replies would pile up. Echo the choice as the
+                # clicker's turn, so the thread reads as an exchange:
+                #   [FM question] → "> @user chose X" → [FM reply].
+                user_id = (body.get("user") or {}).get("id")
+                if user_id and label:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f"> <@{user_id}> chose *{_plain(label)}*",
+                    )
+
                 client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
