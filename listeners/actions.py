@@ -122,14 +122,25 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     pass
 
         # A click advances the case, so it's a turn — reserve the thread and run
-        # in the background. If one is already running, tell the clicker to retry.
+        # in the background. If one is already running, the click is dropped.
         if not run_gated(
             client, team_id=team_id, channel=channel, thread_ts=thread_ts,
             skip_ts=None, work=work,
         ):
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=":hourglass_flowing_sand: Still working on the previous turn "
-                "— click that again once I've replied.",
-            )
+            # Notify only the clicker, ephemerally, so rapid clicks don't pile
+            # visible notices into the thread (mirrors the quiet ⏭️ a dropped
+            # text reply gets). Don't advise re-clicking: when the in-flight turn
+            # replies it strips these buttons and posts fresh ones, so this exact
+            # button is gone — the clicker just waits and acts on what comes next.
+            user_id = (body.get("user") or {}).get("id")
+            if user_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user=user_id,
+                        text=":hourglass_flowing_sand: I'm still finishing your "
+                        "previous step — hang on, I'll reply here in a moment.",
+                    )
+                except Exception:  # noqa: BLE001 — a notice must never raise on the drop path
+                    pass
