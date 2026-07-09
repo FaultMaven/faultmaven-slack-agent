@@ -1,14 +1,18 @@
 """Assistant container — the 1:1 AI side-panel investigation surface.
 
-Mirrors the Bolt assistant pattern: greet + suggested prompts on thread start,
-then run one FaultMaven turn per user message with a live status indicator.
+On thread start we greet with a short capability ("can-do") overview — static
+orientation the agent owns, never routed to the engine, so it's always correct
+and costs no turn. We deliberately do NOT set Slack "suggested prompts": every
+message here becomes an investigation turn, and prompt chips like "what can you
+do?" would submit a non-incident the engine can't answer. Then run one
+FaultMaven turn per user message with a live status indicator.
 """
 
 from __future__ import annotations
 
 from logging import Logger
 
-from slack_bolt import Assistant, BoltContext, Say, SetStatus, SetSuggestedPrompts
+from slack_bolt import Assistant, BoltContext, Say, SetStatus
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
@@ -18,23 +22,27 @@ from store import CaseStore
 
 from ._turn import Dedup, end_turn, resolve_query, run_turn, try_begin_turn
 
-# Shown as "Try these prompts" on a fresh (context-free) assistant thread, so
-# they must make sense cold — general or self-introductory, never referring to
-# "this incident/error/symptom" that doesn't exist yet.
-_SUGGESTED_PROMPTS = [
-    {
-        "title": "What can FaultMaven do?",
-        "message": "What can you help me with?",
-    },
-    {
-        "title": "Start an investigation",
-        "message": "I have an error to investigate — how do we begin?",
-    },
-    {
-        "title": "How does it work?",
-        "message": "How does FaultMaven investigate an incident?",
-    },
-]
+# Static capability overview shown once on thread start. Native Slack mrkdwn
+# (single *bold*, • bullets, :emoji:) — it is posted verbatim via say(), not run
+# through the Markdown→mrkdwn converter. It orients the user without asking the
+# engine to describe itself.
+_GREETING = (
+    ":wave: *I'm FaultMaven* — a troubleshooting copilot. I help you find the "
+    "*root cause* of an incident by connecting what you share to your runbooks, "
+    "docs, and past fixes.\n\n"
+    "*Here's what I can do*\n"
+    "• :mag: *Investigate* — paste an error, a log line, or describe a symptom "
+    "and I'll work toward the cause\n"
+    "• :bar_chart: *Read your evidence* — logs, metrics, stack traces, config; "
+    "I'll pull out what matters\n"
+    "• :books: *Use your knowledge* — I search your runbooks and past "
+    "resolutions for relevant fixes\n"
+    "• :clipboard: *Keep the case* — I track hypotheses and evidence and build a "
+    "report as we go\n\n"
+    "*To start, just tell me what's wrong* — an error message, a failing "
+    "service, or something like \"checkout latency spiked after this morning's "
+    "deploy.\""
+)
 
 
 def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
@@ -44,17 +52,9 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
     dedup = Dedup()
 
     @assistant.thread_started
-    def thread_started(
-        say: Say,
-        set_suggested_prompts: SetSuggestedPrompts,
-        logger: Logger,
-    ) -> None:
+    def thread_started(say: Say, logger: Logger) -> None:
         try:
-            say(
-                "Hi — I'm FaultMaven. Describe a symptom, paste an error or log, "
-                "and I'll help you investigate. What's going on?"
-            )
-            set_suggested_prompts(prompts=_SUGGESTED_PROMPTS)
+            say(_GREETING)
         except Exception as exc:  # noqa: BLE001
             logger.exception("assistant_thread_started failed: %s", exc)
 
