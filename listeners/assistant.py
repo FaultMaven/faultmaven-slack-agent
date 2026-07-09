@@ -18,22 +18,21 @@ from store import CaseStore
 
 from ._turn import Dedup, end_turn, resolve_query, run_turn, try_begin_turn
 
+# Shown as "Try these prompts" on a fresh (context-free) assistant thread, so
+# they must make sense cold — general or self-introductory, never referring to
+# "this incident/error/symptom" that doesn't exist yet.
 _SUGGESTED_PROMPTS = [
     {
-        "title": "Investigate an error",
-        "message": "I'm seeing this error and need help finding the cause:\n",
+        "title": "What can FaultMaven do?",
+        "message": "What can you help me with?",
     },
     {
-        "title": "Summarize an incident",
-        "message": "Summarize what's happened in this incident so far.",
+        "title": "Start an investigation",
+        "message": "I have an error to investigate — how do we begin?",
     },
     {
-        "title": "What changed recently?",
-        "message": "What recent deploys or config changes could explain this?",
-    },
-    {
-        "title": "Search our runbooks",
-        "message": "Is there a runbook for this symptom?",
+        "title": "How does it work?",
+        "message": "How does FaultMaven investigate an incident?",
     },
 ]
 
