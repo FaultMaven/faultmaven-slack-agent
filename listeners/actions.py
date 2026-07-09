@@ -122,25 +122,34 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     pass
 
         # A click advances the case, so it's a turn — reserve the thread and run
-        # in the background. If one is already running, the click is dropped.
+        # in the background. If one is already running, the click is dropped (not
+        # queued): the decision it carried is gone, so the clicker must redo it.
         if not run_gated(
             client, team_id=team_id, channel=channel, thread_ts=thread_ts,
             skip_ts=None, work=work,
         ):
-            # Notify only the clicker, ephemerally, so rapid clicks don't pile
-            # visible notices into the thread (mirrors the quiet ⏭️ a dropped
-            # text reply gets). Don't advise re-clicking: when the in-flight turn
-            # replies it strips these buttons and posts fresh ones, so this exact
-            # button is gone — the clicker just waits and acts on what comes next.
+            # Ephemeral (clicker-only) so rapid clicks don't pile notices into the
+            # thread. Tell them plainly it didn't register and to redo it after the
+            # reply — we can't promise the button will still be there (it's only
+            # stripped if the in-flight turn was itself a click on the same
+            # message; a text/mention turn leaves it live), so "pick it again if
+            # you still need it" covers both. The notice is transient by design,
+            # so a failure to post leaves no trace at all — log it, mirroring the
+            # loud warning the ⏭️ drop path uses (_turn.py), so a surface where
+            # ephemerals silently fail (e.g. missing scope) stays diagnosable.
             user_id = (body.get("user") or {}).get("id")
-            if user_id:
-                try:
-                    client.chat_postEphemeral(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        user=user_id,
-                        text=":hourglass_flowing_sand: I'm still finishing your "
-                        "previous step — hang on, I'll reply here in a moment.",
-                    )
-                except Exception:  # noqa: BLE001 — a notice must never raise on the drop path
-                    pass
+            try:
+                client.chat_postEphemeral(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    user=user_id,
+                    text=":hourglass_flowing_sand: I was still finishing the "
+                    "previous step, so that didn't register — I'll reply here in a "
+                    "moment; pick it again then if you still need it.",
+                )
+            except Exception as exc:  # noqa: BLE001 — a notice must never raise on the drop path
+                logger.warning(
+                    "Could not signal a dropped click to %s in %s (%s) — the drop "
+                    "had no visible signal.",
+                    user_id, channel, exc,
+                )
