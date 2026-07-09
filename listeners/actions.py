@@ -122,14 +122,28 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     pass
 
         # A click advances the case, so it's a turn — reserve the thread and run
-        # in the background. If one is already running, tell the clicker to retry.
+        # in the background. If one is already running, the click is dropped (not
+        # queued): its decision is lost, so tell the clicker to redo it.
         if not run_gated(
             client, team_id=team_id, channel=channel, thread_ts=thread_ts,
             skip_ts=None, work=work,
         ):
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=":hourglass_flowing_sand: Still working on the previous turn "
-                "— click that again once I've replied.",
-            )
+            # Ephemeral (clicker-only) so rapid clicks don't pile notices into the
+            # thread — and a transient notice suits a transient busy state (a
+            # persistent one would go stale the moment the turn finishes). A hard
+            # failure to post is logged rather than silently swallowed.
+            user_id = (body.get("user") or {}).get("id")
+            try:
+                client.chat_postEphemeral(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    user=user_id,
+                    text=":hourglass_flowing_sand: I was mid-step, so that didn't "
+                    "register — I'll reply shortly; redo your choice afterward if "
+                    "it still applies.",
+                )
+            except Exception as exc:  # noqa: BLE001 — a notice must never raise on the drop path
+                logger.warning(
+                    "Couldn't post the busy notice to %s in %s (%s).",
+                    user_id or "?", channel, exc,
+                )
