@@ -27,21 +27,20 @@ from ._turn import Dedup, end_turn, resolve_query, run_turn, try_begin_turn
 # through the Markdown→mrkdwn converter. It orients the user without asking the
 # engine to describe itself.
 _GREETING = (
-    ":wave: *I'm FaultMaven* — a troubleshooting copilot. I help you find the "
-    "*root cause* of an incident by connecting what you share to your runbooks, "
-    "docs, and past fixes.\n\n"
-    "*Here's what I can do*\n"
-    "• :mag: *Investigate* — paste an error, a log line, or describe a symptom "
-    "and I'll work toward the cause\n"
-    "• :bar_chart: *Read your evidence* — logs, metrics, stack traces, config; "
-    "I'll pull out what matters\n"
-    "• :books: *Use your knowledge* — I search your runbooks and past "
-    "resolutions for relevant fixes\n"
-    "• :clipboard: *Keep the case* — I track hypotheses and evidence and build a "
-    "report as we go\n\n"
-    "*To start, just tell me what's wrong* — an error message, a failing "
-    "service, or something like \"checkout latency spiked after this morning's "
-    "deploy.\""
+    ":wave: *I'm FaultMaven — your AI troubleshooting copilot.*\n"
+    "Hand me your data and I'll *spot what's wrong*, trace the *root cause*, "
+    "work out a fix, and *learn* from it — so the next one goes faster.\n\n"
+    "*Put me to work*\n"
+    "• :mag: *Share a file* — a log, an error, a config — ask me about it, or "
+    "\"does this look right?\"\n"
+    "• :warning: *Hit a problem* — I'll investigate for the root cause\n"
+    "• :bulb: *Stuck on a fix* — I'll propose one\n"
+    "• :books: *Wrap up* — I'll write it up so it's reusable next time\n\n"
+    "*How we work*\n"
+    "You bring the data — logs, errors, whatever you've got, noise and all. I "
+    "pull out the *evidence* and tell you what's still missing. You approve and "
+    "execute — you're always in control.\n\n"
+    "*Start anywhere* — paste an error, share a file, or tell me what's wrong."
 )
 
 
