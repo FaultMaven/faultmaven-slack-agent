@@ -5,8 +5,62 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from listeners.actions import _plain, apply_action
+from listeners.actions import _disable_actions, _plain, apply_action
 from rendering import build_turn_blocks
+
+
+class _CaptureClient:
+    """Minimal WebClient stand-in that records the last chat_update call."""
+
+    def __init__(self) -> None:
+        self.updated: dict | None = None
+
+    def chat_update(self, **kwargs) -> None:
+        self.updated = kwargs
+
+
+def _sections_of(blocks) -> list[str]:
+    return [b["text"]["text"] for b in blocks if b["type"] == "section"]
+
+
+def test_disable_actions_keeps_the_question_section():
+    # Clicking a choice strips the buttons but must leave the question visible.
+    client = _CaptureClient()
+    body = {
+        "channel": {"id": "C1"},
+        "message": {
+            "ts": "111.222",
+            "text": "Would you like to investigate?",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "Would you like to investigate?"}},
+                {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
+            ],
+        },
+    }
+    _disable_actions(client, body)
+    kept = client.updated["blocks"]
+    assert not any(b["type"] == "actions" for b in kept)  # buttons gone
+    assert "Would you like to investigate?" in _sections_of(kept)  # question stays
+
+
+def test_disable_actions_rebuilds_question_when_payload_has_no_section():
+    # Defensive: a thinner payload (blocks are only the actions) must not blank
+    # the message — the question is rebuilt from the fallback text.
+    client = _CaptureClient()
+    body = {
+        "channel": {"id": "C1"},
+        "message": {
+            "ts": "111.222",
+            "text": "Shall I proceed?",
+            "blocks": [
+                {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
+            ],
+        },
+    }
+    _disable_actions(client, body)
+    kept = client.updated["blocks"]
+    assert not any(b["type"] == "actions" for b in kept)
+    assert _sections_of(kept) == ["Shall I proceed?"]  # reconstructed, not blank
 
 
 def test_plain_neutralizes_mrkdwn_in_echoed_label():

@@ -47,15 +47,25 @@ def _plain(text: str) -> str:
 
 
 def _disable_actions(client: WebClient, body: dict) -> None:
-    """Strip the buttons off the clicked message so the choice can't be re-sent."""
+    """Strip the buttons off the clicked message so the choice can't be re-sent,
+    keeping the question itself visible.
+
+    Defensive: if the surface delivered a thinner message whose blocks carry no
+    section (so removing the ``actions`` block would leave the question blank),
+    rebuild a section from the message's fallback ``text`` — the question must
+    never vanish, leaving only the echoed choice with nothing it answered.
+    """
 
     message = body["message"]
+    text = message.get("text") or "FaultMaven"
     kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
+    if not any(b.get("type") == "section" for b in kept):
+        kept.insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": text}})
     client.chat_update(
         channel=body["channel"]["id"],
         ts=message["ts"],
         blocks=kept,
-        text=message.get("text", "FaultMaven"),
+        text=text,
     )
 
 

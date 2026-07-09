@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "FaultMaven",
-    "description": "AI troubleshooting copilot — investigate incidents in-thread, grounded in your runbooks and past fixes.",
+    "description": "AI troubleshooting copilot — finds a problem's root cause from your logs, errors, and configs. Methodical and evidence-based.",
     "background_color": "#1a1a2e"
   },
   "features": {
@@ -15,7 +15,7 @@
       "always_online": true
     },
     "assistant_view": {
-      "assistant_description": "Describe a symptom or paste an error and I'll help you investigate — grounded in your runbooks, telemetry, and past incidents.",
+      "assistant_description": "Hand me a log, an error, or a config and I'll help you find the root cause — methodical, evidence-based, grounded in your runbooks.",
       "suggested_prompts": []
     },
     "shortcuts": [
