@@ -1,9 +1,24 @@
-# FaultMaven Slack Agent — runtime dependencies (P0: Bolt + Assistant container)
+# FaultMaven Slack Agent — runtime dependencies
 
 # Slack Bolt for Python — Assistant/AI-App container, event routing, signature
-# verification, retry de-dup. Socket Mode for dev; HTTP/OAuth lands in P5.
+# verification, retry de-dup. Drives both transports: Socket Mode (local dev)
+# and the HTTP/Events + multi-workspace OAuth transport (hosted, the submission
+# target — docs/design.md §10, §16 P5).
 slack-bolt==1.28.0
 slack-sdk==3.42.0
+
+# HTTP transport: FastAPI hosts the Slack request handler (/slack/events,
+# /slack/install, /slack/oauth_redirect) plus /health for k8s liveness.
+fastapi==0.139.0
+uvicorn[standard]==0.34.0
+
+# Backs the multi-workspace OAuth stores (per-team bot tokens + OAuth state)
+# via slack_sdk's SQLAlchemy{Installation,OAuthState}Store. One SLACK_DATABASE_URL
+# drives both — SQLite locally, Postgres in the cluster. psycopg2 is SQLAlchemy's
+# default driver for a `postgresql://` URL (the hosted config); without it the
+# first connection raises ModuleNotFoundError and the pod crashes at boot.
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.10
 
 # Settings / validation
 pydantic==2.10.6

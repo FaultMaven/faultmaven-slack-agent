@@ -29,6 +29,9 @@
     ]
   },
   "oauth_config": {
+    "redirect_urls": [
+      "https://slack.faultmaven.ai/slack/oauth_redirect"
+    ],
     "scopes": {
       "bot": [
         "assistant:write",
@@ -45,6 +48,7 @@
   },
   "settings": {
     "event_subscriptions": {
+      "request_url": "https://slack.faultmaven.ai/slack/events",
       "bot_events": [
         "app_home_opened",
         "assistant_thread_started",
@@ -55,10 +59,11 @@
       ]
     },
     "interactivity": {
-      "is_enabled": true
+      "is_enabled": true,
+      "request_url": "https://slack.faultmaven.ai/slack/events"
     },
     "org_deploy_enabled": true,
-    "socket_mode_enabled": true,
+    "socket_mode_enabled": false,
     "token_rotation_enabled": false
   }
 }

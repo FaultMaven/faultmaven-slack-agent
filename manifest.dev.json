@@ -1,0 +1,64 @@
+{
+  "display_information": {
+    "name": "FaultMaven (Dev)",
+    "description": "Local-development build of the FaultMaven troubleshooting copilot (Socket Mode).",
+    "long_description": "Socket Mode development variant of FaultMaven. Create a SEPARATE Slack app from this manifest for local testing (SLACK_TRANSPORT=socket) — you cannot Socket-connect to the same app that the hosted HTTP/OAuth build serves. The production/submission manifest is manifest.json.",
+    "background_color": "#1a1a2e"
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "FaultMaven Dev",
+      "always_online": true
+    },
+    "assistant_view": {
+      "assistant_description": "I find a problem's root cause the way a seasoned engineer would — triage, hypotheses, targeted evidence, a verified fix — grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
+      "suggested_prompts": []
+    },
+    "shortcuts": [
+      {
+        "name": "Ask",
+        "type": "message",
+        "callback_id": "fm_investigate_message",
+        "description": "Open an investigation seeded with this message"
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "assistant:write",
+        "chat:write",
+        "commands",
+        "reactions:write",
+        "app_mentions:read",
+        "files:read",
+        "im:history",
+        "channels:history",
+        "groups:history"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_home_opened",
+        "assistant_thread_started",
+        "message.im",
+        "message.channels",
+        "message.groups",
+        "app_mention"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

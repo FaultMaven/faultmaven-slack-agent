@@ -80,15 +80,9 @@ def check_config() -> tuple[bool, Settings | None]:
         )
         return False, None
     _ok("settings loaded", f"backend={settings.faultmaven_api_url}")
-    if not settings.slack_app_token:
-        _fail(
-            "SLACK_APP_TOKEN is empty",
-            "Socket Mode needs an app-level token (xapp-…) with "
-            "connections:write. Create one under 'Basic Information → "
-            "App-Level Tokens'.",
-        )
-        return False, settings
-    _ok("SLACK_APP_TOKEN present", "(Socket Mode)")
+    # Per-transport credentials are already enforced by Settings validation (a
+    # missing one would have raised above), so here we just report the mode.
+    _ok(f"transport = {settings.slack_transport}")
     return True, settings
 
 
@@ -138,6 +132,29 @@ def check_slack_app(settings: Settings) -> bool:
     except Exception as exc:  # noqa: BLE001
         return _fail(f"could not reach Slack: {exc}", "check your network/proxy.")
     return _ok("apps.connections.open passed", "Socket Mode reachable")
+
+
+def check_oauth_db(settings: Settings) -> bool:
+    print("\nOAuth store (HTTP transport)")
+    try:
+        # Building the stores opens the engine and creates the tables, so this
+        # proves SLACK_DATABASE_URL is reachable AND the DB driver is installed
+        # (a missing psycopg2 for a postgresql:// URL fails right here, not at
+        # the first install in production).
+        from oauth_store import build_oauth_stores
+
+        stores = build_oauth_stores(
+            database_url=settings.slack_database_url,
+            client_id=settings.slack_client_id,
+        )
+        stores.engine.dispose()
+    except Exception as exc:  # noqa: BLE001 — driver missing / DB unreachable
+        return _fail(
+            f"could not open the OAuth store: {exc}",
+            "check SLACK_DATABASE_URL is reachable and its driver is installed "
+            "(postgresql:// needs psycopg2, in requirements.txt).",
+        )
+    return _ok("OAuth store reachable", "installation + state tables ready")
 
 
 def check_backend(fm: FaultMavenClient) -> bool:
@@ -233,8 +250,13 @@ def main() -> int:
         return _summarize(results)
 
     # Slack checks don't need the backend, and vice-versa — run all, report all.
-    results.append(check_slack_bot(settings))
-    results.append(check_slack_app(settings))
+    # The Slack-side checks differ by transport: Socket Mode verifies the static
+    # bot + app tokens; HTTP verifies the OAuth store (no static bot token exists).
+    if settings.slack_transport == "socket":
+        results.append(check_slack_bot(settings))
+        results.append(check_slack_app(settings))
+    else:  # http
+        results.append(check_oauth_db(settings))
 
     fm = make_fault_client(settings)
     try:
