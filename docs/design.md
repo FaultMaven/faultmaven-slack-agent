@@ -131,12 +131,16 @@ doesn't already cover them.
 
 ## 3. Architecture
 
+> **Rendered diagram:** [`docs/architecture.png`](architecture.png) is the
+> Devpost submission asset (regenerate via `python3 docs/architecture_diagram.py`).
+> The ASCII sketch below is the same system in text.
+
 ```text
                          Slack Workspace (per-tenant install)
    ┌──────────────────────────────────────────────────────────────────────┐
    │  Assistant side panel │ Channel threads (mention + auto-continue) │ Ask shortcut │
    └───────────────┬────────────────────────┬────────────────────────────┬───┘
-                   │ events / interactivity (Socket Mode today; HTTPS+OAuth is the target)
+                   │ events / interactivity (HTTPS+OAuth, shipped; Socket Mode = local dev)
                    ▼
    ┌────────────────────────────────────────────────────────────────────────┐
    │                 FaultMaven Slack Agent  (Bolt for Python)                │
@@ -161,10 +165,11 @@ doesn't already cover them.
 ```
 
 Deployment shape (Cloud OAuth): the agent runs as an **HTTP service** exposing
-`/slack/events`, `/slack/interactions`, `/slack/commands`, `/slack/install`,
-`/slack/oauth_redirect`, plus a `/health` endpoint. We use Bolt's **FastAPI
-adapter** (`slack_bolt.adapter.fastapi`) so we keep async I/O and the existing
-FastAPI operational surface while getting Bolt's listener ergonomics. Bolt owns
+`POST /slack/events` (events *and* interactivity — Bolt routes both here),
+`GET /slack/install`, `GET /slack/oauth_redirect`, plus a dependency-free
+`GET /health` probe (see `web.py`). We host Bolt's request handler on a
+**FastAPI** app so we keep async I/O and the existing FastAPI operational surface
+while getting Bolt's listener ergonomics. Bolt owns
 signature verification, the 3-second ack, and retry de-duplication; slow
 FaultMaven calls run **inside the listener** (the Assistant `user_message`
 handler streams as it works) or via Bolt **lazy listeners** for non-assistant
