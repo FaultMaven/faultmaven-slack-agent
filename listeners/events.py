@@ -24,7 +24,13 @@ from rendering import clean_mention
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
+from ._turn import (
+    Dedup,
+    post_placeholder,
+    resolve_query,
+    run_gated,
+    run_turn_and_post,
+)
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -89,6 +95,26 @@ def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> boo
     if bot_user_id and f"<@{bot_user_id}>" in text:
         return False
     return True
+
+
+def is_dm_summons(event: dict) -> bool:
+    """A first message in the plain DM composer that should open an investigation
+    (channel_type "im", no ``thread_ts``).
+
+    Messages in the assistant Chat carry a ``thread_ts`` (the container is
+    thread-based) and are claimed by Bolt's Assistant middleware; a plainly-typed
+    DM message has none, so it would reach no handler otherwise. We open the case
+    here, rooted at the message; follow-up replies then flow through the Assistant
+    handler (im + thread_ts). Ignores the bot's own posts and non-message subtypes
+    (edits, joins…).
+    """
+
+    return (
+        event.get("channel_type") == "im"
+        and not event.get("thread_ts")
+        and not event.get("bot_id")
+        and event.get("subtype") in (None, "file_share")
+    )
 
 
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
@@ -156,6 +182,63 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     def on_thread_message(
         event: dict, context: BoltContext, client: WebClient, logger: Logger
     ) -> None:
+        # A first message in the plain DM composer (channel_type "im", no
+        # thread_ts). Assistant-Chat messages carry a thread_ts and are claimed by
+        # Bolt's Assistant middleware; a plainly-typed DM has none, so it would
+        # otherwise reach no handler. Treat it as a summons: open the investigation
+        # in a thread rooted at this message — every follow-up reply in that thread
+        # then flows through the Assistant handler (im + thread_ts), same case.
+        if is_dm_summons(event):
+            channel = event["channel"]
+            team_id = context.team_id or ""
+            thread_ts = event["ts"]  # this message becomes the thread root
+            if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                return
+            text = clean_mention(event.get("text") or "").strip()
+            has_files = bool(event.get("files"))
+            if not text and not has_files:
+                return
+
+            def dm_work() -> None:
+                # Acknowledge up front — the file download below can be slow, so
+                # the user sees a placeholder rather than silence (mirrors
+                # on_app_mention).
+                placeholder_ts = post_placeholder(client, channel, thread_ts)
+                if placeholder_ts is None:
+                    return
+                files = (
+                    download_message_files(client.token, event) if has_files else []
+                )
+                # File(s) present but unreadable and no text → decline instead of
+                # opening a blank case (mirrors the Assistant surface).
+                query = resolve_query(text or None, downloaded_files=bool(files))
+                if query is None:
+                    client.chat_update(
+                        channel=channel,
+                        ts=placeholder_ts,
+                        text=":information_source: I couldn't read the attached "
+                        "file(s) (too large, or I lack access). Paste the key text "
+                        "and I'll take it from there.",
+                    )
+                    return
+                run_turn_and_post(
+                    client,
+                    fm,
+                    store,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    team_id=team_id,
+                    text=query,
+                    files=files or None,
+                    placeholder_ts=placeholder_ts,
+                )
+
+            run_gated(
+                client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+                skip_ts=event.get("ts"), work=dm_work,
+            )
+            return
+
         # Continue an *existing* investigation from a plain thread reply — no
         # re-@mention needed. Everything else is ignored (no firehose).
         if not is_thread_followup_candidate(

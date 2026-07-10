@@ -1,11 +1,11 @@
-"""Assistant container — the 1:1 AI side-panel investigation surface.
+"""Assistant container — the 1:1 AI side-panel investigation surface (the "Chat" tab).
 
-On thread start we greet with a short capability ("can-do") overview — static
-orientation the agent owns, never routed to the engine, so it's always correct
-and costs no turn. We deliberately do NOT set Slack "suggested prompts": every
-message here becomes an investigation turn, and prompt chips like "what can you
-do?" would submit a non-incident the engine can't answer. Then run one
-FaultMaven turn per user message with a live status indicator.
+On thread start we greet with a capability overview — static orientation the
+agent owns, never routed to the engine. We deliberately do NOT set Slack
+"suggested prompts": every message here becomes an investigation turn, and a
+prompt chip like "what can you do?" would submit a non-incident the engine isn't
+built to answer. Then run one FaultMaven turn per user message with a live status
+indicator.
 """
 
 from __future__ import annotations
@@ -22,25 +22,14 @@ from store import CaseStore
 
 from ._turn import Dedup, end_turn, resolve_query, run_turn, try_begin_turn
 
-# Static capability overview shown once on thread start. Native Slack mrkdwn
-# (single *bold*, • bullets, :emoji:) — it is posted verbatim via say(), not run
-# through the Markdown→mrkdwn converter. It orients the user without asking the
-# engine to describe itself.
+# Short conversational opener posted once on thread start. Kept deliberately
+# brief: the "Agent Overview" (assistant_description) already sits at the top of
+# the Chat tab describing what FaultMaven does, so the greeting only needs to
+# invite the user to start — repeating the capability list here would say the
+# same thing twice in one view. Native Slack mrkdwn, posted verbatim via say().
 _GREETING = (
-    ":wave: *I'm FaultMaven — your AI troubleshooting copilot.*\n"
-    "Hand me your data and I'll *spot what's wrong*, trace the *root cause*, "
-    "work out a fix, and *learn* from it — so the next one goes faster.\n\n"
-    "*Put me to work*\n"
-    "• :mag: *Share a file* — a log, an error, a config — ask me about it, or "
-    "\"does this look right?\"\n"
-    "• :warning: *Hit a problem* — I'll investigate for the root cause\n"
-    "• :bulb: *Stuck on a fix* — I'll propose one\n"
-    "• :books: *Wrap up* — I'll write it up so it's reusable next time\n\n"
-    "*How we work*\n"
-    "You bring the data — logs, errors, whatever you've got, noise and all. I "
-    "pull out the *evidence* and tell you what's still missing. You approve and "
-    "execute — you're always in control.\n\n"
-    "*Start anywhere* — paste an error, share a file, or tell me what's wrong."
+    ":wave: Ready when you are — paste an error, share a file, or just tell me "
+    "what's wrong, and I'll take it from there."
 )
 
 
@@ -81,7 +70,13 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         try:
             # set_status shows the native "investigating" indicator immediately,
             # so the file download below still has visible feedback in front of it.
-            set_status("is investigating…")
+            # It's cosmetic, and it can fail on a thread that wasn't opened via
+            # assistant_thread_started (e.g. a DM summons rooted by the events
+            # handler), so a status failure must never abort the actual turn.
+            try:
+                set_status("is investigating…")
+            except Exception as status_exc:  # noqa: BLE001
+                logger.warning("set_status failed; continuing turn: %s", status_exc)
             # download_message_files no-ops (returns []) when there are no files.
             files = download_message_files(client.token, payload)
 

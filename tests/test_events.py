@@ -10,9 +10,44 @@ from __future__ import annotations
 import httpx
 from slack_sdk.errors import SlackApiError
 
-from listeners.events import _fetch_thread_context, is_thread_followup_candidate
+from listeners.events import (
+    _fetch_thread_context,
+    is_dm_summons,
+    is_thread_followup_candidate,
+)
 
 _BOT = "UBOT"
+
+
+def _dm(**over) -> dict:
+    """A top-level typed message in the app's DM / assistant panel."""
+    e = {"channel_type": "im", "text": "the pods are crashlooping", "ts": "9"}
+    e.update(over)
+    return e
+
+
+# -- is_dm_summons (top-level DM opens an investigation) ----------------------
+def test_top_level_dm_is_a_summons():
+    # A plainly-typed first message in the panel (no thread_ts) must be handled
+    # here — the Assistant middleware only claims im messages once threaded.
+    assert is_dm_summons(_dm()) is True
+
+
+def test_dm_reply_is_not_a_summons_assistant_owns_it():
+    # Once it carries a thread_ts (a "reply"/"ask"), the Assistant handler owns it.
+    assert is_dm_summons(_dm(thread_ts="9")) is False
+
+
+def test_dm_bot_message_is_not_a_summons():
+    assert is_dm_summons(_dm(bot_id="B1")) is False
+
+
+def test_dm_edit_subtype_is_not_a_summons():
+    assert is_dm_summons(_dm(subtype="message_changed")) is False
+
+
+def test_channel_message_is_not_a_dm_summons():
+    assert is_dm_summons({"channel_type": "channel", "ts": "9", "text": "hi"}) is False
 
 
 def _reply(**over) -> dict:
