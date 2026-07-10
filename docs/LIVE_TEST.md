@@ -29,6 +29,22 @@ Budget ~15 minutes the first time.
    [`assets/slack-app-icon.png`](../assets/slack-app-icon.png) — the FaultMaven
    "FM" mark. Otherwise the bot shows a generic avatar.
 
+**Updating the manifest later — no copy-paste.** Once the app exists, apply
+`manifest.json` edits with [`scripts/push_manifest.py`](../scripts/push_manifest.py)
+instead of re-pasting into the App Manifest tab:
+
+```bash
+# one-time: generate an APP CONFIGURATION TOKEN (separate from the bot/app
+# tokens) at api.slack.com/apps → "Your app configuration tokens", then add to .env:
+#   SLACK_CONFIG_TOKEN=xoxe.xoxp-...
+#   SLACK_APP_ID=A0XXXXXXX
+python scripts/push_manifest.py --diff   # preview live-vs-local, then update
+```
+
+It validates, updates, and tells you whether the change also needs a **reinstall**
+(only OAuth-scope changes do). Config tokens expire ~12 h — regenerate on a token
+error. It reads only the config token, never your bot/app tokens.
+
 The manifest pre-wires everything this agent uses:
 
 | Manifest section | Enables |
