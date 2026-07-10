@@ -33,8 +33,10 @@ Built for the **Slack Agent Builder Challenge**.
 
 ```text
 faultmaven-slack-agent/
-├── app.py                # Bolt app entrypoint (Socket Mode)
-├── config.py             # Settings + env validation (fail-fast)
+├── app.py                # Bolt app builder (dual transport: http | socket)
+├── web.py                # FastAPI host for the HTTP/OAuth transport (+ /health)
+├── oauth_store.py        # multi-workspace OAuth Installation + state stores (Postgres)
+├── config.py             # Settings + per-transport env validation (fail-fast)
 ├── store.py              # thread→case map (SQLite)
 ├── rendering.py          # TurnResult → Block Kit
 ├── slack_text.py         # Slack message (blocks/attachments) → readable text
@@ -73,25 +75,35 @@ then smoke each surface (Assistant panel, @mention, message shortcut, buttons).
 
 ## Slack app setup
 
-Create the app from [`manifest.json`](manifest.json) (api.slack.com/apps → *From
-a manifest*). It enables Socket Mode and requests least-privilege scopes —
-`assistant:write`, `chat:write`, `app_mentions:read`, `commands` (the shortcut),
-`reactions:write` (the ⏭️ skip mark), `files:read` (attached evidence), and
-`*:history` (thread catch-up + the reply events that drive continuity) — and
-registers the **Ask** message shortcut (shown as *Ask FaultMaven*). Then create
-an app-level token with `connections:write` (→ `SLACK_APP_TOKEN`) and install to
-your workspace. Full walkthrough: [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
+Two manifests, two transports:
+
+- **Hosted / production** — [`manifest.json`](manifest.json): HTTP/Events +
+  multi-workspace OAuth (`socket_mode_enabled: false`, request/redirect URLs on
+  `slack.faultmaven.ai`). This is the Marketplace-eligible submission app. Deploy
+  guide: [docs/HOSTING.md](docs/HOSTING.md).
+- **Local dev** — [`manifest.dev.json`](manifest.dev.json): Socket Mode on, no
+  public URL. Fastest path to a real test. Walkthrough:
+  [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
+
+Both request the same least-privilege scopes — `assistant:write`, `chat:write`,
+`app_mentions:read`, `commands` (the shortcut), `reactions:write` (the ⏭️ skip
+mark), `files:read` (attached evidence), and `*:history` (thread catch-up + the
+reply events that drive continuity) — and register the **Ask** message shortcut
+(shown as *Ask FaultMaven*).
 
 ## Status
 
-Working: Assistant container + `@mention`, **thread-reply auto-continue**, the
+**Working:** Assistant container + `@mention`, **thread-reply auto-continue**, the
 **Ask FaultMaven** message shortcut (open a case seeded from any message),
 **file ingestion** on all surfaces (attached logs/screenshots → multipart
-evidence), **one-turn-per-thread drop-if-busy** with ⏭️ skip marks and
-replier `@mention`s, the corrected case/turn backend contract, thread→case
-mapping, Block Kit rendering, and **interactive suggested-action buttons**
-(DECIDE/FREE_SPEECH clicks submit typed turns). A **preflight doctor**
-(`scripts/preflight.py`) verifies the wiring before a live test. Token-streaming
-reasoning timeline, terminal-state reports, and multi-workspace OAuth (currently
-Socket Mode) follow next — see the roadmap in
-[docs/design.md](docs/design.md) §16.
+evidence), **one-turn-per-thread drop-if-busy** with ⏭️ skip marks and replier
+`@mention`s, the corrected case/turn backend contract, thread→case mapping, Block
+Kit rendering, **interactive suggested-action buttons**, the Home tab, and
+**HTTP/Events transport + multi-workspace OAuth** with a Postgres
+`InstallationStore` (`SLACK_TRANSPORT=http`; Socket Mode remains the local-dev
+transport). A **preflight doctor** (`scripts/preflight.py`) verifies the wiring
+before a live test.
+
+**Next:** per-user FaultMaven account linking (workspace→org binding), a
+token-streaming reasoning timeline, and terminal-state reports — see the roadmap
+in [docs/design.md](docs/design.md) §16.
