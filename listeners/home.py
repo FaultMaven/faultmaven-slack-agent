@@ -31,8 +31,7 @@ _HOME_BLOCKS = [
             "type": "mrkdwn",
             "text": (
                 ":wave: I work a problem the way a seasoned engineer does — "
-                "*goal-driven, methodical, evidence-based,* and *self-learning* — "
-                "and I never forget what I learn."
+                "*goal-driven, methodical, evidence-based,* and *self-learning*."
             ),
         },
     },
@@ -70,9 +69,10 @@ _HOME_BLOCKS = [
         "text": {
             "type": "mrkdwn",
             "text": (
-                "*Start* — open the *Messages* tab and tell me what's wrong. Each "
-                "new problem opens its own thread, so separate investigations "
-                "stay separate."
+                "*Start* — open the *Chat* tab and tell me what's wrong. In a "
+                "channel, *@mention* me in any thread, or run *Ask FaultMaven* "
+                "from a message's ⋮ menu to investigate that message. Each problem "
+                "opens its own thread, so separate investigations stay separate."
             ),
         },
     },

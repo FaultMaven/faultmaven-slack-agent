@@ -99,6 +99,12 @@ result — so a flash-then-update is the healthy signal.
 **Expect:** a threaded reply that engages with the symptom (asks a clarifying
 question or names what it needs). A new case is created for this assistant thread.
 
+**Also — the plain DM composer** (the app's direct-message box, *not* the
+Assistant rail — messages here carry no `thread_ts`): type a first message with
+no thread. **Expect** exactly *one* investigation opens — a single placeholder,
+one case, one reply (the Assistant middleware must *not* also claim it). Then
+reply in that thread and confirm it continues the *same* case.
+
 ### B. @mention war-room + auto-continue (channels)
 
 1. In a channel thread (or a fresh message), post an incident note, then:

@@ -98,14 +98,15 @@ def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> boo
 
 
 def is_dm_summons(event: dict) -> bool:
-    """A top-level message in a DM / the assistant panel that should open an
-    investigation (channel_type "im", no ``thread_ts``).
+    """A first message in the plain DM composer that should open an investigation
+    (channel_type "im", no ``thread_ts``).
 
-    Bolt's Assistant middleware claims an ``im`` message only once it carries a
-    ``thread_ts`` (a "reply"/"ask"), so a plainly-typed first message reaches no
-    handler otherwise. We open the case here, rooted at the message; follow-up
-    replies then flow through the Assistant handler (im + thread_ts). Ignores the
-    bot's own posts and non-message subtypes (edits, joins…).
+    Messages in the assistant Chat carry a ``thread_ts`` (the container is
+    thread-based) and are claimed by Bolt's Assistant middleware; a plainly-typed
+    DM message has none, so it would reach no handler otherwise. We open the case
+    here, rooted at the message; follow-up replies then flow through the Assistant
+    handler (im + thread_ts). Ignores the bot's own posts and non-message subtypes
+    (edits, joins…).
     """
 
     return (
@@ -181,13 +182,12 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     def on_thread_message(
         event: dict, context: BoltContext, client: WebClient, logger: Logger
     ) -> None:
-        # A top-level message in a DM / the assistant panel (channel_type "im",
-        # no thread_ts). Bolt's Assistant middleware only claims im messages that
-        # already carry a thread_ts (i.e. a "reply"/"ask"), so a plainly-typed
-        # first message would otherwise reach no handler at all. Treat it as a
-        # summons: open the investigation in a thread rooted at this message —
-        # every follow-up reply in that thread then flows through the Assistant
-        # handler (im + thread_ts), keyed to the same case.
+        # A first message in the plain DM composer (channel_type "im", no
+        # thread_ts). Assistant-Chat messages carry a thread_ts and are claimed by
+        # Bolt's Assistant middleware; a plainly-typed DM has none, so it would
+        # otherwise reach no handler. Treat it as a summons: open the investigation
+        # in a thread rooted at this message — every follow-up reply in that thread
+        # then flows through the Assistant handler (im + thread_ts), same case.
         if is_dm_summons(event):
             channel = event["channel"]
             team_id = context.team_id or ""

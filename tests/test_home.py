@@ -27,4 +27,7 @@ def test_home_view_carries_the_positioning():
     # The four pillars and the "start here" pointer are present.
     for phrase in ("goal-driven", "methodical", "evidence-based", "self-learning"):
         assert phrase in body
-    assert "Messages" in body  # tells the user where to start
+    # Home is the orientation surface — it teaches all three entry points.
+    assert "Chat" in body
+    assert "@mention" in body
+    assert "Ask FaultMaven" in body
