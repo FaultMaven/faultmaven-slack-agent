@@ -91,6 +91,25 @@ def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> boo
     return True
 
 
+def is_dm_summons(event: dict) -> bool:
+    """A top-level message in a DM / the assistant panel that should open an
+    investigation (channel_type "im", no ``thread_ts``).
+
+    Bolt's Assistant middleware claims an ``im`` message only once it carries a
+    ``thread_ts`` (a "reply"/"ask"), so a plainly-typed first message reaches no
+    handler otherwise. We open the case here, rooted at the message; follow-up
+    replies then flow through the Assistant handler (im + thread_ts). Ignores the
+    bot's own posts and non-message subtypes (edits, joins…).
+    """
+
+    return (
+        event.get("channel_type") == "im"
+        and not event.get("thread_ts")
+        and not event.get("bot_id")
+        and event.get("subtype") in (None, "file_share")
+    )
+
+
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
     followup_dedup = Dedup()
@@ -156,6 +175,45 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     def on_thread_message(
         event: dict, context: BoltContext, client: WebClient, logger: Logger
     ) -> None:
+        # A top-level message in a DM / the assistant panel (channel_type "im",
+        # no thread_ts). Bolt's Assistant middleware only claims im messages that
+        # already carry a thread_ts (i.e. a "reply"/"ask"), so a plainly-typed
+        # first message would otherwise reach no handler at all. Treat it as a
+        # summons: open the investigation in a thread rooted at this message —
+        # every follow-up reply in that thread then flows through the Assistant
+        # handler (im + thread_ts), keyed to the same case.
+        if is_dm_summons(event):
+            channel = event["channel"]
+            team_id = context.team_id or ""
+            thread_ts = event["ts"]  # this message becomes the thread root
+            if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                return
+            text = clean_mention(event.get("text") or "").strip()
+            has_files = bool(event.get("files"))
+            if not text and not has_files:
+                return
+
+            def dm_work() -> None:
+                files = (
+                    download_message_files(client.token, event) if has_files else []
+                )
+                run_turn_and_post(
+                    client,
+                    fm,
+                    store,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    team_id=team_id,
+                    text=text or "Please investigate this.",
+                    files=files or None,
+                )
+
+            run_gated(
+                client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+                skip_ts=event.get("ts"), work=dm_work,
+            )
+            return
+
         # Continue an *existing* investigation from a plain thread reply — no
         # re-@mention needed. Everything else is ignored (no firehose).
         if not is_thread_followup_candidate(

@@ -8,6 +8,7 @@ from store import CaseStore
 from .actions import register_actions
 from .assistant import build_assistant
 from .events import register_events
+from .home import register_home
 from .shortcuts import register_shortcuts
 
 
@@ -18,3 +19,4 @@ def register_listeners(app: App, fm: FaultMavenClient, store: CaseStore) -> None
     register_events(app, fm, store)
     register_actions(app, fm, store)
     register_shortcuts(app, fm, store)
+    register_home(app)
