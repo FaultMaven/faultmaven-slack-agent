@@ -70,7 +70,13 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         try:
             # set_status shows the native "investigating" indicator immediately,
             # so the file download below still has visible feedback in front of it.
-            set_status("is investigating…")
+            # It's cosmetic, and it can fail on a thread that wasn't opened via
+            # assistant_thread_started (e.g. a DM summons rooted by the events
+            # handler), so a status failure must never abort the actual turn.
+            try:
+                set_status("is investigating…")
+            except Exception as status_exc:  # noqa: BLE001
+                logger.warning("set_status failed; continuing turn: %s", status_exc)
             # download_message_files no-ops (returns []) when there are no files.
             files = download_message_files(client.token, payload)
 

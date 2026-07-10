@@ -24,7 +24,13 @@ from rendering import clean_mention
 from slack_files import download_message_files
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
+from ._turn import (
+    Dedup,
+    post_placeholder,
+    resolve_query,
+    run_gated,
+    run_turn_and_post,
+)
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -194,9 +200,27 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 return
 
             def dm_work() -> None:
+                # Acknowledge up front — the file download below can be slow, so
+                # the user sees a placeholder rather than silence (mirrors
+                # on_app_mention).
+                placeholder_ts = post_placeholder(client, channel, thread_ts)
+                if placeholder_ts is None:
+                    return
                 files = (
                     download_message_files(client.token, event) if has_files else []
                 )
+                # File(s) present but unreadable and no text → decline instead of
+                # opening a blank case (mirrors the Assistant surface).
+                query = resolve_query(text or None, downloaded_files=bool(files))
+                if query is None:
+                    client.chat_update(
+                        channel=channel,
+                        ts=placeholder_ts,
+                        text=":information_source: I couldn't read the attached "
+                        "file(s) (too large, or I lack access). Paste the key text "
+                        "and I'll take it from there.",
+                    )
+                    return
                 run_turn_and_post(
                     client,
                     fm,
@@ -204,8 +228,9 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     channel=channel,
                     thread_ts=thread_ts,
                     team_id=team_id,
-                    text=text or "Please investigate this.",
+                    text=query,
                     files=files or None,
+                    placeholder_ts=placeholder_ts,
                 )
 
             run_gated(

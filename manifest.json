@@ -16,7 +16,7 @@
       "always_online": true
     },
     "assistant_view": {
-      "assistant_description": "I investigate a problem to its root cause the way a seasoned engineer would: triage, hypotheses, targeted evidence requests, verified fix. Every step is grounded in your evidence — logs, errors, configs — and in your runbooks and past fixes; every case I resolve makes the next one faster. You stay in control: I suggest, you approve and execute.",
+      "assistant_description": "I find a problem's root cause the way a seasoned engineer would — triage, hypotheses, targeted evidence, a verified fix — grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
       "suggested_prompts": []
     },
     "shortcuts": [
