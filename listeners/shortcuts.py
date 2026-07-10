@@ -8,11 +8,12 @@ that message. No copy-paste, no thread read.
 
 from __future__ import annotations
 
+import logging
 from logging import Logger
 
+import httpx
 from slack_bolt import Ack, App, BoltContext
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient
 from slack_files import download_message_files
@@ -21,10 +22,41 @@ from store import CaseStore
 
 from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
 
+logger = logging.getLogger(__name__)
+
 # The shortcut seeds the message as evidence (pasted_content); this is the query.
 _SEED_QUERY = "Please investigate this."
 # Cap the seed size (the backend size-guards too); matches events.py.
 _SEED_LIMIT = 8000
+
+_CANNOT_POST_TEXT = (
+    ":information_source: I can't post in this conversation — `/invite "
+    "@FaultMaven` to the channel, or use *Ask FaultMaven* somewhere I'm a "
+    "member."
+)
+
+
+def _respond_ephemeral(response_url: str | None, text: str) -> None:
+    """Reply to the invoker via the shortcut's ``response_url``.
+
+    A message shortcut is offered in every conversation the USER can see —
+    including private channels and human-to-human DMs the bot can never post
+    in. There, every ``chat_postMessage`` fails and the shortcut would appear
+    to do nothing at all; the ``response_url`` posts an ephemeral note to the
+    invoker without needing channel membership. Best-effort: it expires after
+    30 minutes and must never raise.
+    """
+
+    if not response_url:
+        return
+    try:
+        httpx.post(
+            response_url,
+            json={"response_type": "ephemeral", "text": text},
+            timeout=5.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("response_url post failed: %s", exc)
 
 
 def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
@@ -60,9 +92,15 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
         alert_text = message_to_text(message)[:_SEED_LIMIT]
         has_files = bool(message.get("files"))
 
+        response_url = shortcut.get("response_url")
+
         # Cheap decline before any work: nothing to read and nothing attached.
         if not alert_text.strip() and not has_files:
-            _decline(client, channel, thread_ts, " — describe the problem or @mention me.")
+            _decline(
+                client, channel, thread_ts,
+                " — describe the problem or @mention me.",
+                response_url=response_url,
+            )
             return
 
         def work() -> None:
@@ -70,7 +108,10 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             # feedback; reuse it for the reply.
             placeholder_ts = post_placeholder(client, channel, thread_ts)
             if placeholder_ts is None:
-                return  # can't post in this channel — /invite @FaultMaven
+                # Can't post here (not a member / private conversation) — tell
+                # the invoker ephemerally instead of failing in total silence.
+                _respond_ephemeral(response_url, _CANNOT_POST_TEXT)
+                return
 
             # Download attached files (logs, screenshots) to forward as evidence.
             files = download_message_files(client.token, message) if has_files else []
@@ -90,13 +131,16 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 return
 
             # Best-effort permalink back to the alert, for case provenance.
+            # Broad guard: a TRANSPORT error here (reset, timeout) is not a
+            # SlackApiError, and letting it escape after the placeholder was
+            # posted would strand ":mag: Investigating…" with no turn run.
             source_url = None
             try:
                 source_url = client.chat_getPermalink(
                     channel=channel, message_ts=message_ts
                 ).get("permalink")
-            except SlackApiError:
-                pass
+            except Exception as exc:  # noqa: BLE001 — provenance is best-effort
+                logger.debug("permalink fetch failed: %s", exc)
 
             run_turn_and_post(
                 client,
@@ -122,17 +166,28 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             _decline(
                 client, channel, thread_ts,
                 " — I'm still working on this thread; try again once I've replied.",
+                response_url=response_url,
             )
 
 
-def _decline(client: WebClient, channel: str, thread_ts: str, note: str) -> None:
-    """Post a short 'couldn't read that' note without opening a case."""
+def _decline(
+    client: WebClient,
+    channel: str,
+    thread_ts: str,
+    note: str,
+    *,
+    response_url: str | None = None,
+) -> None:
+    """Post a short 'couldn't read that' note without opening a case.
 
+    Falls back to the shortcut's ``response_url`` (ephemeral, no membership
+    needed) when the in-channel post fails — otherwise a shortcut run where the
+    bot can't post would decline in total silence.
+    """
+
+    text = f":information_source: I couldn't read that message{note}"
     try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f":information_source: I couldn't read that message{note}",
-        )
-    except SlackApiError:
-        pass
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception as exc:  # noqa: BLE001 — a decline must never raise
+        logger.debug("decline post failed in %s: %s", channel, exc)
+        _respond_ephemeral(response_url, text)

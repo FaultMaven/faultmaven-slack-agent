@@ -18,22 +18,152 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import OrderedDict
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from faultmaven import FaultMavenClient, TurnResult
+from faultmaven import (
+    CaseNotFoundError,
+    FaultMavenAPIError,
+    FaultMavenClient,
+    FaultMavenTimeoutError,
+    TurnResult,
+)
 from rendering import build_turn_blocks
+from slack_mrkdwn import escape_mrkdwn, to_mrkdwn
 from store import CaseStore
 
 logger = logging.getLogger(__name__)
+
+# Set by app.py at the start of shutdown: in-flight turns that fail from the
+# teardown itself (closed store/client) must not blame the turn or advise a
+# retry the user can't evaluate.
+_shutting_down = threading.Event()
+
+
+def begin_shutdown() -> None:
+    """Mark the process as shutting down (affects in-flight error messages)."""
+
+    _shutting_down.set()
 
 INVESTIGATING_PLACEHOLDER = ":mag: Investigating…"
 TURN_ERROR_TEXT = (
     ":warning: FaultMaven hit an error on that turn. Please try again or "
     "@mention me."
 )
+# The turn may have completed backend-side — do NOT advise a retry (a resent
+# message would run a duplicate turn against state the user never saw).
+TURN_TIMEOUT_TEXT = (
+    ":hourglass: I gave up waiting for that turn — the analysis may still have "
+    "landed on the case. Give it a moment before re-sending the same message "
+    "or evidence."
+)
+# Stale mapping evicted; unlike TURN_ERROR_TEXT, a retry WILL work (fresh case).
+CASE_GONE_TEXT = (
+    ":warning: This investigation's case no longer exists on the backend, so "
+    "I've unlinked it — your next message here starts a fresh investigation."
+)
+# The failure came from our own teardown, not the turn: say so.
+RESTARTING_TEXT = (
+    ":arrows_counterclockwise: I'm restarting and couldn't finish that turn — "
+    "please resend it in a minute."
+)
+# Shared decline for a message whose only content was undownloadable files.
+UNREADABLE_FILES_TEXT = (
+    ":information_source: I couldn't read the attached file(s) (too large, or "
+    "I lack access). Paste the key text and I'll take it from there."
+)
+
+
+def turn_error_text(exc: Exception) -> str:
+    """The user-facing message for a failed turn, by failure class.
+
+    One generic "try again" for everything actively misleads: a 4xx reproduces
+    identically on retry, and a timeout's turn may have committed — only
+    transient transport/5xx failures deserve the retry advice.
+    """
+
+    if _shutting_down.is_set():
+        return RESTARTING_TEXT
+    if isinstance(exc, CaseNotFoundError):
+        return CASE_GONE_TEXT
+    if isinstance(exc, FaultMavenTimeoutError):
+        return TURN_TIMEOUT_TEXT
+    if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
+        if exc.status_code == 429:
+            return TURN_ERROR_TEXT  # backend backpressure IS transient
+        detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
+        suffix = f": _{detail}_" if detail else "."
+        return (
+            f":warning: FaultMaven rejected that turn "
+            f"(HTTP {exc.status_code}){suffix} "
+            "Re-sending the same input won't help."
+        )
+    return TURN_ERROR_TEXT
+
+
+def notification_text(result: TurnResult) -> str:
+    """The short ``text=`` fallback accompanying a blocks post, neutralized."""
+
+    return escape_mrkdwn(str(result.agent_response))[:300]
+
+
+def plain_fallback(agent_response: str) -> str:
+    """Plain-text degradation of a committed turn's reply.
+
+    Runs through :func:`to_mrkdwn` so the degraded path keeps BOTH properties
+    of the blocks path: untrusted entities stay neutralized (a raw
+    ``agent_response`` here would re-open the ``<!channel>`` injection exactly
+    when blocks fail) and Markdown still renders. ``str()`` guards schema
+    drift — this function must never raise.
+    """
+
+    text = to_mrkdwn(str(agent_response))
+    if len(text) > 3500:
+        text = text[:3500] + "…\n_(reply truncated — full analysis is on the case)_"
+    return text
+
+
+def deliver_turn_result(
+    post,
+    result: TurnResult,
+    *,
+    case_id: str | None = None,
+    decorate=None,
+) -> None:
+    """Render and post a COMMITTED turn via ``post(text, blocks) -> bool``.
+
+    ``post`` must be guarded (log-and-return-False, never raise). The backend
+    already advanced the case, so every degradation step here — rendering
+    failure, blocks rejected, plain retry — avoids "try again"; the last
+    resort is a plain-text reply, and total posting failure is the caller's
+    logs, never a retry prompt. ``decorate`` may mutate the built blocks
+    (addressing, intro notes) and is guarded with the rendering.
+    """
+
+    blocks = None
+    try:
+        blocks = build_turn_blocks(result, case_id=case_id)
+        if decorate is not None:
+            decorate(blocks)
+    except Exception as exc:  # noqa: BLE001 — rendering must not eat a committed turn
+        logger.exception("rendering turn result failed: %s", exc)
+    if blocks is not None and post(notification_text(result), blocks):
+        return
+    post(plain_fallback(result.agent_response), None)
+
+
+def unlink_stale_case(
+    store: CaseStore, team_id: str, channel: str, thread_ts: str, case_id: str
+) -> None:
+    """Evict a thread's mapping after the backend 404ed its case."""
+
+    store.delete(team_id, channel, thread_ts)
+    logger.warning(
+        "Case %s vanished server-side; unlinked thread %s", case_id, thread_ts
+    )
 # Reaction added to a message that was skipped because the thread was busy.
 SKIPPED_REACTION = "track_next"  # ⏭️
 # One-time etiquette note on the first reply in a channel thread.
@@ -89,6 +219,10 @@ class _ThreadGate:
             self._busy.add(key)
             return True
 
+    def is_busy(self, key: str) -> bool:
+        with self._guard:
+            return key in self._busy
+
     def release(self, key: str) -> None:
         with self._guard:
             self._busy.discard(key)
@@ -96,9 +230,38 @@ class _ThreadGate:
 
 _gate = _ThreadGate()
 
+# Turn worker threads currently in flight, so shutdown can drain them (a
+# daemon thread killed mid-turn strands its placeholder at "Investigating…").
+_active_turns: set[threading.Thread] = set()
+_active_turns_lock = threading.Lock()
+
 
 def _thread_key(team_id: str, channel: str, thread_ts: str) -> str:
     return "\x00".join((team_id, channel, thread_ts))
+
+
+def is_thread_busy(team_id: str, channel: str, thread_ts: str) -> bool:
+    """True while a turn is running for this thread (gate held)."""
+
+    return _gate.is_busy(_thread_key(team_id, channel, thread_ts))
+
+
+def mark_skipped(client: WebClient, channel: str, ts: str) -> None:
+    """Mark a dropped message ⏭️ so its sender knows to resend. Never raises."""
+
+    try:
+        client.reactions_add(
+            channel=channel, timestamp=ts, name=SKIPPED_REACTION
+        )
+    except Exception as exc:  # noqa: BLE001 — reacting must never raise on the drop path
+        # e.g. reactions:write not (re)consented → the skip has no visible
+        # signal; log it loudly so the missing scope is diagnosable.
+        logger.warning(
+            "Could not mark a skipped message in %s (%s) — is reactions:write "
+            "granted? The message was dropped with no ⏭️.",
+            channel,
+            exc,
+        )
 
 
 def try_begin_turn(
@@ -120,19 +283,7 @@ def try_begin_turn(
     if _gate.try_enter(_thread_key(team_id, channel, thread_ts)):
         return True
     if skip_ts:
-        try:
-            client.reactions_add(
-                channel=channel, timestamp=skip_ts, name=SKIPPED_REACTION
-            )
-        except Exception as exc:  # noqa: BLE001 — reacting must never raise on the drop path
-            # e.g. reactions:write not (re)consented → the skip has no visible
-            # signal; log it loudly so the missing scope is diagnosable.
-            logger.warning(
-                "Could not mark a skipped message in %s (%s) — is reactions:write "
-                "granted? The message was dropped with no ⏭️.",
-                channel,
-                exc,
-            )
+        mark_skipped(client, channel, skip_ts)
     return False
 
 
@@ -140,6 +291,60 @@ def end_turn(team_id: str, channel: str, thread_ts: str) -> None:
     """Release a thread reserved by :func:`try_begin_turn` (call in ``finally``)."""
 
     _gate.release(_thread_key(team_id, channel, thread_ts))
+
+
+def offload_turn(work, *, team_id: str, channel: str, thread_ts: str) -> None:
+    """Run ``work()`` on a tracked background daemon, releasing the gate after.
+
+    The caller must already hold the thread gate (:func:`try_begin_turn`). The
+    thread is registered so :func:`drain_turns` can wait for it at shutdown.
+    """
+
+    def runner() -> None:
+        try:
+            work()
+        except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
+            logger.exception("gated turn failed in %s: %s", channel, exc)
+        finally:
+            end_turn(team_id, channel, thread_ts)
+            with _active_turns_lock:
+                _active_turns.discard(threading.current_thread())
+
+    thread = threading.Thread(target=runner, daemon=True)
+    with _active_turns_lock:
+        _active_turns.add(thread)
+    try:
+        thread.start()
+    except BaseException:
+        # start() can fail under resource exhaustion ("can't start new
+        # thread"); the runner's finally never runs then, so undo its work
+        # here — otherwise the gate stays held forever (a permanently
+        # ⏭️-wedged Slack thread) and drain_turns would later join() a
+        # never-started Thread, which raises.
+        with _active_turns_lock:
+            _active_turns.discard(thread)
+        end_turn(team_id, channel, thread_ts)
+        raise
+
+
+def drain_turns(timeout: float) -> None:
+    """Give in-flight turns up to ``timeout`` seconds to finish (at shutdown)."""
+
+    deadline = time.monotonic() + timeout
+    with _active_turns_lock:
+        pending = list(_active_turns)
+    for thread in pending:
+        try:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        except Exception as exc:  # noqa: BLE001 — drain must never abort shutdown cleanup
+            logger.warning("drain join failed for %s: %s", thread.name, exc)
+    leftover = sum(1 for t in pending if t.is_alive())
+    if leftover:
+        logger.warning(
+            "Shutting down with %d turn(s) still in flight after %.0fs grace",
+            leftover,
+            timeout,
+        )
 
 
 def run_gated(
@@ -165,16 +370,7 @@ def run_gated(
         skip_ts=skip_ts,
     ):
         return False
-
-    def runner() -> None:
-        try:
-            work()
-        except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
-            logger.exception("gated turn failed in %s: %s", channel, exc)
-        finally:
-            end_turn(team_id, channel, thread_ts)
-
-    threading.Thread(target=runner, daemon=True).start()
+    offload_turn(work, team_id=team_id, channel=channel, thread_ts=thread_ts)
     return True
 
 
@@ -220,9 +416,11 @@ def run_turn(
       message) and is sent on **every** turn, new case or existing.
     - ``files`` are *this turn's* attachments (already-downloaded
       ``(name, bytes, content_type)`` tuples), forwarded as multipart evidence.
-    - ``prior_context`` is the one-time catch-up (the prior thread discussion on
-      an ``@mention``); it augments the evidence **only when the case is
-      created**, never on later turns.
+    - ``prior_context`` is the one-time catch-up (the prior thread discussion
+      on an ``@mention``); it is merged into the evidence whenever provided.
+      Callers pass it only while the thread is not yet **seeded**
+      (``store.is_seeded``) — i.e. until a first turn actually lands — so a
+      failed opening turn re-delivers it instead of silently losing it.
     - ``source_url`` (e.g. a permalink to the alert) is passed through for case
       provenance.
     """
@@ -230,25 +428,42 @@ def run_turn(
     case_id = store.get(team_id, channel_id, thread_ts)
     if case_id is None:
         case_id = fm.create_case(title=None)
+        # Map the thread immediately (unseeded) so the thread stays linked
+        # even if this first submit fails: in-thread retries keep routing to
+        # the case, and a timed-out-but-committed first turn stays reachable.
+        # The seed isn't lost either — the row stays unseeded until a turn
+        # lands, and callers re-fetch/re-send prior_context while unseeded.
         store.put(team_id, channel_id, thread_ts, case_id)
         logger.info("Opened case %s for thread %s", case_id, thread_ts)
-        if prior_context:
-            pasted_content = (
-                f"{prior_context}\n\n{pasted_content}"
-                if pasted_content
-                else prior_context
-            )
 
-    if pasted_content or source_url or files:
-        return fm.submit_turn(
-            case_id,
-            query=text,
-            pasted_content=pasted_content or None,
-            source_url=source_url,
-            files=files or None,
-            input_type="paste" if pasted_content else None,
+    if prior_context:
+        pasted_content = (
+            f"{prior_context}\n\n{pasted_content}"
+            if pasted_content
+            else prior_context
         )
-    return fm.submit_turn(case_id, query=text)
+
+    try:
+        if pasted_content or source_url or files:
+            result = fm.submit_turn(
+                case_id,
+                query=text,
+                pasted_content=pasted_content or None,
+                source_url=source_url,
+                files=files or None,
+                input_type="paste" if pasted_content else None,
+            )
+        else:
+            result = fm.submit_turn(case_id, query=text)
+    except CaseNotFoundError:
+        # Case deleted server-side (dashboard delete, DB reset) — evict the
+        # stale mapping so the NEXT message starts fresh instead of routing
+        # to the same dead case_id forever.
+        unlink_stale_case(store, team_id, channel_id, thread_ts, case_id)
+        raise
+
+    store.mark_seeded(team_id, channel_id, thread_ts)
+    return result
 
 
 def post_placeholder(
@@ -267,11 +482,24 @@ def post_placeholder(
             channel=channel, thread_ts=thread_ts, text=INVESTIGATING_PLACEHOLDER
         )
     except SlackApiError as exc:
+        error = exc.response.get("error", "")
+        if error in ("not_in_channel", "channel_not_found"):
+            logger.warning(
+                "Cannot post in channel %s (%s) — is FaultMaven invited? "
+                "Try /invite @FaultMaven",
+                channel,
+                error,
+            )
+        else:
+            # Rate limits, restrictions, transient API failures — do NOT
+            # misdiagnose these as a missing invite.
+            logger.warning(
+                "Placeholder post failed in channel %s (%s)", channel, error
+            )
+        return None
+    except Exception as exc:  # noqa: BLE001 — transport failure: Slack is unreachable
         logger.warning(
-            "Cannot post in channel %s (%s) — is FaultMaven invited? "
-            "Try /invite @FaultMaven",
-            channel,
-            exc.response.get("error"),
+            "Placeholder post failed in channel %s (transport: %s)", channel, exc
         )
         return None
     return resp["ts"]
@@ -301,20 +529,45 @@ def run_turn_and_post(
     files: list[tuple[str, bytes, str]] | None = None,
     placeholder_ts: str | None = None,
     mention_user: str | None = None,
+    intro_note: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place.
 
     The caller holds the per-thread gate (:func:`try_begin_turn`), so no two turns
     overlap here. ``mention_user`` addresses the reply to the person whose message
     it answers (channels), and the first reply in a thread carries a one-time
-    etiquette note about the one-at-a-time behavior. ``placeholder_ts`` reuses a
-    placeholder a caller already posted (e.g. before a slow file download).
+    etiquette note about the one-at-a-time behavior (``intro_note`` overrides that
+    note for surfaces with different etiquette, e.g. the plain DM).
+    ``placeholder_ts`` reuses a placeholder a caller already posted (e.g. before a
+    slow file download).
+
+    Failure discipline: "the turn failed" and "the turn succeeded but Slack
+    wouldn't take the reply" are different failures. Only the former may advise
+    a retry — after the backend committed the turn, a retry runs a duplicate
+    turn against state the user never saw, so the post-side fallback degrades
+    to plain text instead.
     """
 
     if placeholder_ts is None:
         placeholder_ts = post_placeholder(client, channel, thread_ts)
         if placeholder_ts is None:
             return
+
+    def update(text_: str, blocks_: list[dict] | None = None) -> bool:
+        """chat_update that reports failure instead of raising (never strands
+        the placeholder by letting an exception skip later recovery)."""
+
+        try:
+            if blocks_ is None:
+                client.chat_update(channel=channel, ts=placeholder_ts, text=text_)
+            else:
+                client.chat_update(
+                    channel=channel, ts=placeholder_ts, text=text_, blocks=blocks_
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chat_update failed in %s: %s", channel, exc)
+            return False
 
     try:
         first_turn = store.get(team_id, channel, thread_ts) is None
@@ -330,26 +583,29 @@ def run_turn_and_post(
             prior_context=prior_context,
             files=files,
         )
-        # Stamp the case pointer only on the opening reply (thread = case).
-        opening_case_id = store.get(team_id, channel, thread_ts) if first_turn else None
-        blocks = build_turn_blocks(result, case_id=opening_case_id)
-        if mention_user:
-            _address(blocks, mention_user)
-            if first_turn:
-                blocks.append(
-                    {
-                        "type": "context",
-                        "elements": [{"type": "mrkdwn", "text": _INTRO_WARNING}],
-                    }
-                )
-        client.chat_update(
-            channel=channel,
-            ts=placeholder_ts,
-            text=result.agent_response[:300],
-            blocks=blocks,
-        )
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
         logger.exception("turn failed in %s: %s", channel, exc)
-        client.chat_update(
-            channel=channel, ts=placeholder_ts, text=TURN_ERROR_TEXT
-        )
+        update(turn_error_text(exc))
+        return
+
+    # The turn is committed backend-side; deliver_turn_result owns the
+    # never-say-try-again degradation ladder from here.
+    # Stamp the case pointer only on the opening reply (thread = case).
+    opening_case_id = store.get(team_id, channel, thread_ts) if first_turn else None
+
+    def decorate(blocks: list[dict]) -> None:
+        if mention_user:
+            _address(blocks, mention_user)
+        if first_turn and (intro_note or mention_user):
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": intro_note or _INTRO_WARNING}
+                    ],
+                }
+            )
+
+    deliver_turn_result(
+        update, result, case_id=opening_case_id, decorate=decorate
+    )

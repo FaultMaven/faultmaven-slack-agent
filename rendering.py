@@ -14,7 +14,7 @@ import re
 from typing import Any, Pattern
 
 from faultmaven.client import TurnResult
-from slack_mrkdwn import to_mrkdwn
+from slack_mrkdwn import escape_mrkdwn, to_mrkdwn
 
 # Slack section ``mrkdwn`` text tops out at 3000 chars; stay safely under.
 _SECTION_LIMIT = 2900
@@ -33,6 +33,9 @@ SUGGESTED_ACTION_PATTERN: Pattern[str] = re.compile(
 )
 _MAX_BUTTONS = 10
 _BUTTON_VALUE_LIMIT = 1900  # Slack caps button value at 2000 chars
+# A RUN command rendered in a code span; a bullet must stay readable and one
+# oversized payload must not blow the whole section past the 3000-char limit.
+_COMMAND_LIMIT = 600
 
 
 def clean_mention(text: str) -> str:
@@ -57,13 +60,41 @@ def _chunk(text: str) -> list[str]:
             current = candidate
     if current:
         chunks.append(current)
-    # Hard-wrap any single oversized paragraph.
+    # Hard-wrap any single oversized paragraph — on a line break when one
+    # exists in the back half, so mrkdwn spans and Slack entities aren't cut
+    # mid-sequence (a severed <url|text> renders as angle-bracket garbage).
     out: list[str] = []
     for c in chunks:
         while len(c) > _SECTION_LIMIT:
-            out.append(c[:_SECTION_LIMIT])
-            c = c[_SECTION_LIMIT:]
+            cut = c.rfind("\n", _SECTION_LIMIT // 2, _SECTION_LIMIT)
+            cut = cut + 1 if cut != -1 else _SECTION_LIMIT
+            out.append(c[:cut].rstrip("\n") or c[:cut])
+            c = c[cut:]
         out.append(c)
+    return _balance_fences(out)
+
+
+def _balance_fences(chunks: list[str]) -> list[str]:
+    """Re-close/reopen a code fence split across chunks.
+
+    A fence cut in half renders half the code as plain mrkdwn (log asterisks
+    become bold/italics) and drops a stray ``` mid-message. Closing the open
+    fence at the chunk edge and reopening it in the next keeps every chunk
+    self-contained. The +8 chars stay inside the 3000-char headroom above
+    ``_SECTION_LIMIT``.
+    """
+
+    out: list[str] = []
+    open_fence = False
+    for chunk in chunks:
+        starts_open = open_fence
+        if chunk.count("```") % 2 == 1:
+            open_fence = not open_fence
+        if starts_open:
+            chunk = "```\n" + chunk
+        if open_fence:
+            chunk = chunk + "\n```"
+        out.append(chunk)
     return out
 
 
@@ -86,9 +117,10 @@ def _format_evidence(action: dict[str, Any]) -> str:
     label = to_mrkdwn(_action_label(action))
     hints = action.get("hints")
     if isinstance(hints, list) and hints:
-        return f"• {label} — _{', '.join(str(h) for h in hints)}_"
+        joined = escape_mrkdwn(", ".join(str(h) for h in hints))
+        return f"• {label} — _{joined}_"
     if isinstance(hints, str) and hints.strip():
-        return f"• {label} — _{hints.strip()}_"
+        return f"• {label} — _{escape_mrkdwn(hints.strip())}_"
     return f"• {label}"
 
 
@@ -102,7 +134,14 @@ def _format_action(action: dict[str, Any]) -> str:
 
     a_type = (action.get("type") or action.get("action_type") or "").upper()
     if a_type == "RUN":
-        command = action.get("payload") or action.get("body") or _action_label(action)
+        command = str(
+            action.get("payload") or action.get("body") or _action_label(action)
+        )
+        # A backtick inside the payload would close the code span and re-enable
+        # mrkdwn parsing for the rest of the line; entities must not go live.
+        command = escape_mrkdwn(command.replace("`", "'"))
+        if len(command) > _COMMAND_LIMIT:
+            command = command[: _COMMAND_LIMIT - 1] + "…"
         return f"• *Run:* `{command}`"  # command stays literal in the code span
     label = to_mrkdwn(_action_label(action))
     if a_type == "DECIDE":
@@ -207,15 +246,18 @@ def build_turn_blocks(
 
     terminal = (result.case_state or "").lower() in _TERMINAL_STATES
 
+    # These aggregate sections are unbounded input (one bullet per suggested
+    # action), so they go through _chunk like the response body — an oversized
+    # single section fails the whole post with invalid_blocks.
     if evidence:
         lines = "\n".join(_format_evidence(a) for a in evidence)
-        blocks.append(
-            _section(f":mag: *To move forward, FaultMaven needs:*\n{lines}")
-        )
+        for part in _chunk(f":mag: *To move forward, FaultMaven needs:*\n{lines}"):
+            blocks.append(_section(part))
 
     if text_actions:
         lines = "\n".join(_format_action(a) for a in text_actions)
-        blocks.append(_section(f"*Suggested next steps*\n{lines}"))
+        for part in _chunk(f"*Suggested next steps*\n{lines}"):
+            blocks.append(_section(part))
 
     # action_id must be unique within a message; suffix each button by index.
     # The handler matches the shared prefix (see SUGGESTED_ACTION_PATTERN).
