@@ -16,13 +16,13 @@ from slack_bolt import Assistant, BoltContext, Say, SetStatus
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
-from rendering import build_turn_blocks
 from slack_files import download_message_files
 from store import CaseStore
 
 from ._turn import (
+    UNREADABLE_FILES_TEXT,
     Dedup,
-    end_turn,
+    deliver_turn_result,
     offload_turn,
     resolve_query,
     run_turn,
@@ -76,6 +76,20 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         ):
             return
 
+        def post(text: str, blocks: list[dict] | None = None) -> bool:
+            """Guarded say(): log-and-False instead of raising, so a posting
+            failure can never fall through to a handler that blames the turn."""
+
+            try:
+                if blocks is None:
+                    say(text)
+                else:
+                    say(text=text, blocks=blocks)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("assistant post failed in %s: %s", channel, exc)
+                return False
+
         def turn_work() -> None:
             try:
                 # download_message_files no-ops (returns []) when there are no
@@ -89,10 +103,8 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     # No text and nothing ingestible — don't open a blank case;
                     # say why (mirrors the shortcut's decline instead of a
                     # generic error).
-                    say(
-                        ":information_source: I couldn't read the attached "
-                        "file(s) (too large, or I lack access). Paste the key "
-                        "text and I'll take it from there."
+                    post(
+                        UNREADABLE_FILES_TEXT
                         if payload.get("files")
                         else "Tell me what's going on — describe a symptom, "
                         "paste an error, or attach a log."
@@ -109,31 +121,18 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     text=query,
                     files=files or None,
                 )
-                # Stamp the case pointer only on the opening reply
-                # (thread = case).
-                opening_case_id = (
-                    store.get(team_id, channel, thread_ts) if first_turn else None
-                )
-                try:
-                    say(
-                        text=result.agent_response[:300],
-                        blocks=build_turn_blocks(result, case_id=opening_case_id),
-                    )
-                except Exception as post_exc:  # noqa: BLE001
-                    # The turn is committed — degrade to plain text rather than
-                    # report an error for a turn that succeeded.
-                    logger.warning(
-                        "assistant reply post failed; falling back to plain "
-                        "text: %s",
-                        post_exc,
-                    )
-                    say(result.agent_response[:3500])
             except Exception as exc:  # noqa: BLE001
                 logger.exception("assistant user_message failed: %s", exc)
-                try:
-                    say(turn_error_text(exc))
-                except Exception:  # noqa: BLE001 — Slack posting is down
-                    logger.warning("could not post assistant error notice")
+                post(turn_error_text(exc))
+                return
+
+            # The turn is committed — deliver_turn_result owns the
+            # never-say-try-again degradation from here (every post guarded).
+            # Stamp the case pointer only on the opening reply (thread = case).
+            opening_case_id = (
+                store.get(team_id, channel, thread_ts) if first_turn else None
+            )
+            deliver_turn_result(post, result, case_id=opening_case_id)
 
         # set_status shows the native "investigating" indicator immediately, so
         # the offloaded download/turn has visible feedback in front of it. It's
@@ -149,13 +148,10 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         # 120s API timeout) to a tracked daemon, exactly like the channel
         # surfaces: Bolt's listener executor defaults to FIVE workers, and five
         # concurrent Assistant turns would otherwise starve every ack() in the
-        # app (buttons, shortcuts) past Slack's 3-second window.
-        try:
-            offload_turn(
-                turn_work, team_id=team_id, channel=channel, thread_ts=thread_ts
-            )
-        except BaseException:
-            end_turn(team_id, channel, thread_ts)  # never leak the gate
-            raise
+        # app (buttons, shortcuts) past Slack's 3-second window. offload_turn
+        # itself releases the gate if the worker can't start.
+        offload_turn(
+            turn_work, team_id=team_id, channel=channel, thread_ts=thread_ts
+        )
 
     return assistant

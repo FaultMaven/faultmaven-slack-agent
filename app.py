@@ -23,7 +23,7 @@ from slack_sdk.http_retry.builtin_handlers import (
 from config import Settings, get_settings
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
-from listeners._turn import drain_turns
+from listeners._turn import begin_shutdown, drain_turns
 from store import CaseStore
 
 logger = logging.getLogger("faultmaven.slack")
@@ -35,8 +35,13 @@ logger = logging.getLogger("faultmaven.slack")
 # without this the bot wedges "alive" while answering nothing).
 _WATCH_POLL_SECONDS = 30.0
 _MAX_DISCONNECTED_SECONDS = 600.0
-# Grace given to in-flight turns at shutdown before closing shared resources.
-_SHUTDOWN_GRACE_SECONDS = 15.0
+# Headroom added to the turn timeout for the shutdown drain: a normal turn can
+# legitimately run the full FAULTMAVEN_REQUEST_TIMEOUT, so the drain must
+# outlast it or closing the store/API client yanks resources from live workers
+# mid-turn. Deployment note: the supervisor's kill grace (e.g. Kubernetes
+# terminationGracePeriodSeconds, systemd TimeoutStopSec) should exceed
+# timeout + this headroom, or a SIGKILL lands mid-drain.
+_SHUTDOWN_DRAIN_HEADROOM_SECONDS = 10.0
 
 
 def make_fault_client(settings: Settings) -> FaultMavenClient:
@@ -145,14 +150,21 @@ def main() -> None:
         handler.connect()
         _watch_connection(handler)
     finally:
+        # In-flight turns that fail from the teardown itself must say
+        # "restarting", not blame the turn or advise a retry.
+        begin_shutdown()
         try:
             handler.close()
         except Exception as exc:  # noqa: BLE001 — shutdown must keep going
             logger.warning("Socket Mode close failed: %s", exc)
-        # Let running turns finish (bounded) BEFORE closing the store and API
-        # client they're using; a turn killed mid-flight strands its
-        # ":mag: Investigating…" placeholder forever.
-        drain_turns(_SHUTDOWN_GRACE_SECONDS)
+        # Let running turns finish BEFORE closing the store and API client
+        # they're using: the drain must outlast the turn timeout, or a live
+        # worker gets its resources yanked mid-turn and the thread's
+        # ":mag: Investigating…" placeholder strands forever.
+        drain_turns(
+            get_settings().faultmaven_request_timeout
+            + _SHUTDOWN_DRAIN_HEADROOM_SECONDS
+        )
         store.close()
         fm.close()
 

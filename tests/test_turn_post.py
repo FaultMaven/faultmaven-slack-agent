@@ -56,12 +56,19 @@ class FakeFM:
 class FakeStore:
     def __init__(self) -> None:
         self.m: dict = {}
+        self.seeded: set = set()
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
 
     def put(self, t, c, th, cid):
         self.m[(t, c, th)] = cid
+
+    def mark_seeded(self, t, c, th):
+        self.seeded.add((t, c, th))
+
+    def is_seeded(self, t, c, th):
+        return (t, c, th) in self.seeded
 
 
 _COMMON = dict(channel="C", thread_ts="TS", team_id="T")

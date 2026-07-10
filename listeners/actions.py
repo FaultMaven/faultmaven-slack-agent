@@ -17,10 +17,16 @@ from slack_bolt import Ack, App, BoltContext
 from slack_sdk import WebClient
 
 from faultmaven import CaseNotFoundError, FaultMavenClient, TurnResult
-from rendering import SUGGESTED_ACTION_PATTERN, build_turn_blocks
+from rendering import SUGGESTED_ACTION_PATTERN
 from store import CaseStore
 
-from ._turn import CASE_GONE_TEXT, run_gated, turn_error_text
+from ._turn import (
+    CASE_GONE_TEXT,
+    deliver_turn_result,
+    run_gated,
+    turn_error_text,
+    unlink_stale_case,
+)
 
 
 def apply_action(
@@ -124,12 +130,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             try:
                 result = apply_action(fm, case_id, action["value"])
             except CaseNotFoundError:
-                store.delete(team_id, channel, thread_ts)
-                logger.warning(
-                    "Case %s vanished server-side; unlinked thread %s",
-                    case_id,
-                    thread_ts,
-                )
+                unlink_stale_case(store, team_id, channel, thread_ts, case_id)
                 post(CASE_GONE_TEXT)
                 return
             except Exception as exc:  # noqa: BLE001
@@ -146,10 +147,11 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             if user_id and label:
                 post(f"> <@{user_id}> chose *{_plain(label)}*")
 
-            # The substantive output. If Block Kit is rejected (limits), the
-            # reply still exists on the case — degrade to plain text.
-            if not post(result.agent_response[:300], build_turn_blocks(result)):
-                post(result.agent_response[:3500])
+            # The substantive output, via the shared committed-turn ladder:
+            # rendering guarded, blocks post, then escaped plain-text fallback
+            # — a render failure must not skip the fallback or the button
+            # strip below.
+            deliver_turn_result(post, result)
 
             # Strip the clicked buttons last, and best-effort: the decision is
             # already applied, so a failure here (message deleted, rate limit)

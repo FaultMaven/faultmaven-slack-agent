@@ -356,14 +356,22 @@ class FaultMavenClient:
                 "a turn needs at least one of query / pasted_content / files"
             )
 
+        start = time.monotonic()
+        polled = False
         try:
             resp = self._post(
                 f"/api/v1/cases/{case_id}/turns", data=form, files=file_parts
             )
             # The current backend answers turns synchronously (200). The 202 +
             # Location poll is kept as a forward-compatible safety net only.
+            # The poll shares the POST's time budget: self._timeout is the
+            # upper bound for the WHOLE turn (see config.py), not per leg.
             if resp.status_code == 202:
-                resp = self._poll(resp.headers.get("Location", ""))
+                polled = True
+                resp = self._poll(
+                    resp.headers.get("Location", ""),
+                    deadline=start + self._timeout,
+                )
         except httpx.TimeoutException as exc:
             # The backend may still complete (and commit) this turn — typed so
             # the user-facing message can warn against a blind re-send.
@@ -373,25 +381,36 @@ class FaultMavenClient:
             ) from exc
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"submit_turn failed: {exc}") from exc
-        self._raise_for_status(resp, "submit_turn", not_found_is_case=True)
+        # A 404 means "case deleted" only on the turn POST itself. A 404 from
+        # the polled Location URL is the STATUS resource expiring/moving — the
+        # case may be alive, so it must not trigger the caller's mapping
+        # eviction.
+        self._raise_for_status(resp, "submit_turn", not_found_is_case=not polled)
 
         return self._parse_turn(resp.json())
 
     # -- helpers ------------------------------------------------------------
-    def _poll(self, location: str) -> httpx.Response:
-        """Poll an async-turn ``Location`` until it returns a result."""
+    def _poll(
+        self, location: str, *, deadline: float | None = None
+    ) -> httpx.Response:
+        """Poll an async-turn ``Location`` until it returns a result.
+
+        ``deadline`` (monotonic) is the whole TURN's budget — set by
+        submit_turn before its POST, so POST time plus polling never exceeds
+        the configured single-turn bound. Both the inter-poll sleep and each
+        GET's timeout are clamped to what remains.
+        """
 
         if not location:
             raise FaultMavenError("202 response without a Location header")
+        if deadline is None:
+            deadline = time.monotonic() + self._timeout
 
-        deadline = time.monotonic() + self._timeout
         delay = 1.5
         reauthed = False
         while time.monotonic() < deadline:
-            time.sleep(delay)
-            # Clamp each GET to the remaining budget: the loop deadline and the
-            # client's per-request timeout are both self._timeout, so an
-            # unclamped GET issued late could ~double the intended bound.
+            if delay:
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             remaining = max(1.0, deadline - time.monotonic())
             resp = self._http.get(
                 location,
@@ -405,28 +424,36 @@ class FaultMavenClient:
                 and not self._token_is_preset
             ):
                 # A dev-login token (1h TTL) can expire mid-poll on a long
-                # async turn; re-login once, same as _post.
+                # async turn; re-login once, same as _post. The endpoint is
+                # known-ready — retry immediately, don't burn budget sleeping.
                 logger.info("token rejected (401) mid-poll; re-authenticating")
                 self._token = ""
                 self._ensure_token()
                 reauthed = True
+                delay = 0.0
                 continue
             if resp.status_code != 202:
                 return resp
-            delay = min(delay * 1.5, 10.0)
+            delay = min(max(delay, 1.5) * 1.5, 10.0)
         raise FaultMavenTimeoutError("timed out polling for async turn result")
 
     @staticmethod
     def _parse_turn(body: dict[str, Any]) -> TurnResult:
         """Map a ``TurnResponse`` body onto :class:`TurnResult`, tolerantly."""
 
+        response = (
+            body.get("agent_response")
+            or body.get("summary")
+            or body.get("message")
+            or "FaultMaven returned no message for this turn."
+        )
+        if not isinstance(response, str):
+            # Schema drift (e.g. a structured message object) must degrade to
+            # displayable text, not TypeError deep inside a render/fallback
+            # path where it would strand the thread's placeholder.
+            response = json.dumps(response, default=str)
         return TurnResult(
-            agent_response=(
-                body.get("agent_response")
-                or body.get("summary")
-                or body.get("message")
-                or "FaultMaven returned no message for this turn."
-            ),
+            agent_response=response,
             case_state=body.get("case_state"),
             turn_number=body.get("turn_number"),
             progress_made=bool(body.get("progress_made", False)),

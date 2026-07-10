@@ -32,10 +32,21 @@ from faultmaven import (
     TurnResult,
 )
 from rendering import build_turn_blocks
-from slack_mrkdwn import escape_mrkdwn
+from slack_mrkdwn import escape_mrkdwn, to_mrkdwn
 from store import CaseStore
 
 logger = logging.getLogger(__name__)
+
+# Set by app.py at the start of shutdown: in-flight turns that fail from the
+# teardown itself (closed store/client) must not blame the turn or advise a
+# retry the user can't evaluate.
+_shutting_down = threading.Event()
+
+
+def begin_shutdown() -> None:
+    """Mark the process as shutting down (affects in-flight error messages)."""
+
+    _shutting_down.set()
 
 INVESTIGATING_PLACEHOLDER = ":mag: Investigating…"
 TURN_ERROR_TEXT = (
@@ -54,6 +65,16 @@ CASE_GONE_TEXT = (
     ":warning: This investigation's case no longer exists on the backend, so "
     "I've unlinked it — your next message here starts a fresh investigation."
 )
+# The failure came from our own teardown, not the turn: say so.
+RESTARTING_TEXT = (
+    ":arrows_counterclockwise: I'm restarting and couldn't finish that turn — "
+    "please resend it in a minute."
+)
+# Shared decline for a message whose only content was undownloadable files.
+UNREADABLE_FILES_TEXT = (
+    ":information_source: I couldn't read the attached file(s) (too large, or "
+    "I lack access). Paste the key text and I'll take it from there."
+)
 
 
 def turn_error_text(exc: Exception) -> str:
@@ -64,6 +85,8 @@ def turn_error_text(exc: Exception) -> str:
     transient transport/5xx failures deserve the retry advice.
     """
 
+    if _shutting_down.is_set():
+        return RESTARTING_TEXT
     if isinstance(exc, CaseNotFoundError):
         return CASE_GONE_TEXT
     if isinstance(exc, FaultMavenTimeoutError):
@@ -79,6 +102,68 @@ def turn_error_text(exc: Exception) -> str:
             "Re-sending the same input won't help."
         )
     return TURN_ERROR_TEXT
+
+
+def notification_text(result: TurnResult) -> str:
+    """The short ``text=`` fallback accompanying a blocks post, neutralized."""
+
+    return escape_mrkdwn(str(result.agent_response))[:300]
+
+
+def plain_fallback(agent_response: str) -> str:
+    """Plain-text degradation of a committed turn's reply.
+
+    Runs through :func:`to_mrkdwn` so the degraded path keeps BOTH properties
+    of the blocks path: untrusted entities stay neutralized (a raw
+    ``agent_response`` here would re-open the ``<!channel>`` injection exactly
+    when blocks fail) and Markdown still renders. ``str()`` guards schema
+    drift — this function must never raise.
+    """
+
+    text = to_mrkdwn(str(agent_response))
+    if len(text) > 3500:
+        text = text[:3500] + "…\n_(reply truncated — full analysis is on the case)_"
+    return text
+
+
+def deliver_turn_result(
+    post,
+    result: TurnResult,
+    *,
+    case_id: str | None = None,
+    decorate=None,
+) -> None:
+    """Render and post a COMMITTED turn via ``post(text, blocks) -> bool``.
+
+    ``post`` must be guarded (log-and-return-False, never raise). The backend
+    already advanced the case, so every degradation step here — rendering
+    failure, blocks rejected, plain retry — avoids "try again"; the last
+    resort is a plain-text reply, and total posting failure is the caller's
+    logs, never a retry prompt. ``decorate`` may mutate the built blocks
+    (addressing, intro notes) and is guarded with the rendering.
+    """
+
+    blocks = None
+    try:
+        blocks = build_turn_blocks(result, case_id=case_id)
+        if decorate is not None:
+            decorate(blocks)
+    except Exception as exc:  # noqa: BLE001 — rendering must not eat a committed turn
+        logger.exception("rendering turn result failed: %s", exc)
+    if blocks is not None and post(notification_text(result), blocks):
+        return
+    post(plain_fallback(result.agent_response), None)
+
+
+def unlink_stale_case(
+    store: CaseStore, team_id: str, channel: str, thread_ts: str, case_id: str
+) -> None:
+    """Evict a thread's mapping after the backend 404ed its case."""
+
+    store.delete(team_id, channel, thread_ts)
+    logger.warning(
+        "Case %s vanished server-side; unlinked thread %s", case_id, thread_ts
+    )
 # Reaction added to a message that was skipped because the thread was busy.
 SKIPPED_REACTION = "track_next"  # ⏭️
 # One-time etiquette note on the first reply in a channel thread.
@@ -228,7 +313,18 @@ def offload_turn(work, *, team_id: str, channel: str, thread_ts: str) -> None:
     thread = threading.Thread(target=runner, daemon=True)
     with _active_turns_lock:
         _active_turns.add(thread)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        # start() can fail under resource exhaustion ("can't start new
+        # thread"); the runner's finally never runs then, so undo its work
+        # here — otherwise the gate stays held forever (a permanently
+        # ⏭️-wedged Slack thread) and drain_turns would later join() a
+        # never-started Thread, which raises.
+        with _active_turns_lock:
+            _active_turns.discard(thread)
+        end_turn(team_id, channel, thread_ts)
+        raise
 
 
 def drain_turns(timeout: float) -> None:
@@ -238,7 +334,10 @@ def drain_turns(timeout: float) -> None:
     with _active_turns_lock:
         pending = list(_active_turns)
     for thread in pending:
-        thread.join(max(0.0, deadline - time.monotonic()))
+        try:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        except Exception as exc:  # noqa: BLE001 — drain must never abort shutdown cleanup
+            logger.warning("drain join failed for %s: %s", thread.name, exc)
     leftover = sum(1 for t in pending if t.is_alive())
     if leftover:
         logger.warning(
@@ -317,23 +416,32 @@ def run_turn(
       message) and is sent on **every** turn, new case or existing.
     - ``files`` are *this turn's* attachments (already-downloaded
       ``(name, bytes, content_type)`` tuples), forwarded as multipart evidence.
-    - ``prior_context`` is the one-time catch-up (the prior thread discussion on
-      an ``@mention``); it augments the evidence **only when the case is
-      created**, never on later turns.
+    - ``prior_context`` is the one-time catch-up (the prior thread discussion
+      on an ``@mention``); it is merged into the evidence whenever provided.
+      Callers pass it only while the thread is not yet **seeded**
+      (``store.is_seeded``) — i.e. until a first turn actually lands — so a
+      failed opening turn re-delivers it instead of silently losing it.
     - ``source_url`` (e.g. a permalink to the alert) is passed through for case
       provenance.
     """
 
     case_id = store.get(team_id, channel_id, thread_ts)
-    new_case = case_id is None
-    if new_case:
+    if case_id is None:
         case_id = fm.create_case(title=None)
-        if prior_context:
-            pasted_content = (
-                f"{prior_context}\n\n{pasted_content}"
-                if pasted_content
-                else prior_context
-            )
+        # Map the thread immediately (unseeded) so the thread stays linked
+        # even if this first submit fails: in-thread retries keep routing to
+        # the case, and a timed-out-but-committed first turn stays reachable.
+        # The seed isn't lost either — the row stays unseeded until a turn
+        # lands, and callers re-fetch/re-send prior_context while unseeded.
+        store.put(team_id, channel_id, thread_ts, case_id)
+        logger.info("Opened case %s for thread %s", case_id, thread_ts)
+
+    if prior_context:
+        pasted_content = (
+            f"{prior_context}\n\n{pasted_content}"
+            if pasted_content
+            else prior_context
+        )
 
     try:
         if pasted_content or source_url or files:
@@ -348,26 +456,13 @@ def run_turn(
         else:
             result = fm.submit_turn(case_id, query=text)
     except CaseNotFoundError:
-        if not new_case:
-            # Case deleted server-side (dashboard delete, DB reset) — evict the
-            # stale mapping so the NEXT message starts fresh instead of routing
-            # to the same dead case_id forever.
-            store.delete(team_id, channel_id, thread_ts)
-            logger.warning(
-                "Case %s vanished server-side; unlinked thread %s",
-                case_id,
-                thread_ts,
-            )
+        # Case deleted server-side (dashboard delete, DB reset) — evict the
+        # stale mapping so the NEXT message starts fresh instead of routing
+        # to the same dead case_id forever.
+        unlink_stale_case(store, team_id, channel_id, thread_ts, case_id)
         raise
 
-    if new_case:
-        # Commit the mapping only after the first turn lands: the one-time seed
-        # evidence (prior thread catch-up) is delivered on that turn, and a
-        # mapping stored before a failed first submit would silently drop it
-        # from every retry. An orphaned (empty) case on retry is the backend's
-        # normal debris; a context-less investigation is a wrong answer.
-        store.put(team_id, channel_id, thread_ts, case_id)
-        logger.info("Opened case %s for thread %s", case_id, thread_ts)
+    store.mark_seeded(team_id, channel_id, thread_ts)
     return result
 
 
@@ -493,11 +588,12 @@ def run_turn_and_post(
         update(turn_error_text(exc))
         return
 
-    # ── The turn is committed backend-side. Never say "try again" below. ──
-    try:
-        # Stamp the case pointer only on the opening reply (thread = case).
-        opening_case_id = store.get(team_id, channel, thread_ts) if first_turn else None
-        blocks = build_turn_blocks(result, case_id=opening_case_id)
+    # The turn is committed backend-side; deliver_turn_result owns the
+    # never-say-try-again degradation ladder from here.
+    # Stamp the case pointer only on the opening reply (thread = case).
+    opening_case_id = store.get(team_id, channel, thread_ts) if first_turn else None
+
+    def decorate(blocks: list[dict]) -> None:
         if mention_user:
             _address(blocks, mention_user)
         if first_turn and (intro_note or mention_user):
@@ -509,15 +605,7 @@ def run_turn_and_post(
                     ],
                 }
             )
-    except Exception as exc:  # noqa: BLE001 — rendering must not eat a committed turn
-        logger.exception("rendering turn result failed in %s: %s", channel, exc)
-        blocks = None
 
-    if blocks is not None and update(result.agent_response[:300], blocks):
-        return
-    # Blocks rejected (invalid_blocks / limits) or rendering failed — the
-    # reply exists on the case; degrade to plain text rather than lose it.
-    fallback = result.agent_response[:3500]
-    if len(result.agent_response) > 3500:
-        fallback += "…\n_(reply truncated — full analysis is on the case)_"
-    update(fallback)
+    deliver_turn_result(
+        update, result, case_id=opening_case_id, decorate=decorate
+    )

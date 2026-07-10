@@ -25,12 +25,19 @@ class FakeFM:
 class FakeStore:
     def __init__(self) -> None:
         self.m: dict = {}
+        self.seeded: set = set()
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
 
     def put(self, t, c, th, cid):
         self.m[(t, c, th)] = cid
+
+    def mark_seeded(self, t, c, th):
+        self.seeded.add((t, c, th))
+
+    def is_seeded(self, t, c, th):
+        return (t, c, th) in self.seeded
 
 
 # -- run_turn -----------------------------------------------------------------
@@ -46,14 +53,18 @@ def test_first_turn_creates_case_without_initial_message_and_routes_text():
     assert kwargs.get("pasted_content") is None
 
 
-def test_prior_context_replayed_only_on_case_creation():
+def test_prior_context_merged_whenever_the_caller_provides_it():
+    """Callers gate prior_context on ``store.is_seeded`` (so a failed opening
+    turn re-delivers it on retry); run_turn merges it whenever passed."""
+
     fm, store = FakeFM(), FakeStore()
     run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1",
              text="now", prior_context="earlier discussion")
     assert fm.turns[0][1]["pasted_content"] == "earlier discussion"
+    assert store.is_seeded("T", "C", "t1")  # landed → callers stop passing it
 
     run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1",
-             text="again", prior_context="should be ignored")
+             text="again")
     assert len(fm.creates) == 1  # reuses the existing case
     assert fm.turns[1][1].get("pasted_content") is None
 

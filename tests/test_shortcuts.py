@@ -131,6 +131,12 @@ def test_shortcut_core_seeds_case_with_extracted_message():
         def put(self, t, c, th, cid):
             self.m[(t, c, th)] = cid
 
+        def mark_seeded(self, t, c, th):
+            pass
+
+        def is_seeded(self, t, c, th):
+            return (t, c, th) in self.m
+
     fm, store = FakeFM(), FakeStore()
     alert = message_to_text(
         {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "disk 98%"}}]}
@@ -181,6 +187,12 @@ def test_pasted_content_is_sent_on_an_existing_case_too():
         def put(self, t, c, th, cid):
             self.m[(t, c, th)] = cid
 
+        def mark_seeded(self, t, c, th):
+            pass
+
+        def is_seeded(self, t, c, th):
+            return (t, c, th) in self.m
+
     fm, store = FakeFM(), FakeStore()
     kw = dict(team_id="T", channel_id="C", thread_ts="t1")
     _turn.run_turn(fm, store, text="q1", pasted_content="alert A", **kw)  # creates
@@ -217,6 +229,12 @@ def test_run_turn_forwards_files_even_without_text_evidence():
 
         def put(self, t, c, th, cid):
             self.m[(t, c, th)] = cid
+
+        def mark_seeded(self, t, c, th):
+            pass
+
+        def is_seeded(self, t, c, th):
+            return (t, c, th) in self.m
 
     files = [("app.log", b"boom", "text/plain")]
     _turn.run_turn(

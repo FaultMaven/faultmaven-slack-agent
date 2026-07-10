@@ -38,6 +38,10 @@ _BOLD = re.compile(r"\*\*(.+?)\*\*")  # only ** — __ is left alone (protects d
 _ITALIC = re.compile(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)")
 _STRIKE = re.compile(r"~~(.+?)~~")
 _BULLET = re.compile(r"(?m)^(\s*)[-*+]\s+")
+# CommonMark autolink: <https://url> with NO label. Safe to keep live through
+# the escape pass — with no label there is nothing to spoof (the rendered text
+# IS the destination), unlike <url|label> which stays neutralized.
+_AUTOLINK = re.compile(r"<(https?://[^\s<>|]+)>")
 
 # Control-char sentinels that won't occur in real text (any that leak in from the
 # input are stripped up front, so a stash index can never be spoofed).
@@ -70,17 +74,21 @@ def to_mrkdwn(text: str) -> str:
     if not text:
         return text
     text = text.translate(_STRIP_SENTINELS)  # never let input spoof a sentinel
-    # Neutralize Slack entities BEFORE any conversion: everything on this path
-    # is untrusted (LLM output seeded from user evidence). The <url|text> links
-    # this converter emits are built after the escape, so they stay live — and
-    # Slack itself requires & inside link URLs to be entity-escaped.
-    text = escape_mrkdwn(text)
 
     stash: list[str] = []
 
     def _hold(value: str) -> str:
         stash.append(value)
         return f"{_HOLD_L}{len(stash) - 1}{_HOLD_R}"
+
+    # 0. Keep label-less autolinks (<https://url> — common LLM Markdown) live
+    #    by stashing them ahead of the escape; Slack wants & inside entities
+    #    escaped. Then neutralize Slack entities in everything else BEFORE any
+    #    conversion: this path is untrusted (LLM output seeded from user
+    #    evidence). The <url|text> links this converter emits are built after
+    #    the escape, so they stay live too.
+    text = _AUTOLINK.sub(lambda m: _hold(f"<{m.group(1).replace('&', '&amp;')}>"), text)
+    text = escape_mrkdwn(text)
 
     # 1. Protect code and links so no later pass rewrites their insides.
     text = _FENCE.sub(lambda m: _hold("```\n" + m.group(1).rstrip("\n") + "\n```"), text)

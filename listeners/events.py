@@ -25,6 +25,7 @@ from slack_files import download_message_files
 from store import CaseStore
 
 from ._turn import (
+    UNREADABLE_FILES_TEXT,
     Dedup,
     is_thread_busy,
     mark_skipped,
@@ -44,11 +45,6 @@ _THREAD_CONTEXT_LIMIT = 8000
 _DM_INTRO = (
     ":bulb: Reply *in this thread* to continue this investigation — a new "
     "message in the box below starts a separate one."
-)
-
-_UNREADABLE_FILES_TEXT = (
-    ":information_source: I couldn't read the attached file(s) (too large, or "
-    "I lack access). Paste the key text and I'll take it from there."
 )
 
 
@@ -166,9 +162,11 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             if placeholder_ts is None:
                 return  # can't post here — /invite @FaultMaven
 
-            # First summons into a thread → replay the prior discussion.
+            # Replay the prior discussion until the case has actually landed a
+            # turn (unseeded): a mapping whose first submit failed still needs
+            # the catch-up on the retry, or the engine investigates blind.
             prior_context = None
-            if store.get(team_id, channel, thread_ts) is None:
+            if not store.is_seeded(team_id, channel, thread_ts):
                 prior_context = _fetch_thread_context(
                     client, channel, thread_ts, exclude_ts=event.get("ts")
                 )
@@ -233,7 +231,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client.chat_update(
                         channel=channel,
                         ts=placeholder_ts,
-                        text=_UNREADABLE_FILES_TEXT,
+                        text=UNREADABLE_FILES_TEXT,
                     )
                     return
                 run_turn_and_post(
@@ -296,11 +294,18 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
-                        text=_UNREADABLE_FILES_TEXT,
+                        text=UNREADABLE_FILES_TEXT,
                     )
                 except Exception as exc:  # noqa: BLE001 — decline is best-effort
                     logger.warning("decline post failed in %s: %s", channel, exc)
                 return
+            # A mapped-but-unseeded thread means the opening turn never landed
+            # — re-deliver the catch-up context that turn was carrying.
+            prior_context = None
+            if not store.is_seeded(team_id, channel, thread_ts):
+                prior_context = _fetch_thread_context(
+                    client, channel, thread_ts, exclude_ts=event.get("ts")
+                )
             run_turn_and_post(
                 client,
                 fm,
@@ -310,6 +315,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 team_id=team_id,
                 text=text or "Please continue the investigation with this evidence.",
                 files=files or None,
+                prior_context=prior_context,
                 mention_user=event.get("user"),
             )
 

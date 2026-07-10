@@ -210,6 +210,7 @@ class _Store:
     def __init__(self) -> None:
         self.m: dict = {}
         self.deleted: list = []
+        self.seeded: set = set()
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
@@ -220,6 +221,13 @@ class _Store:
     def delete(self, t, c, th):
         self.deleted.append((t, c, th))
         self.m.pop((t, c, th), None)
+        self.seeded.discard((t, c, th))
+
+    def mark_seeded(self, t, c, th):
+        self.seeded.add((t, c, th))
+
+    def is_seeded(self, t, c, th):
+        return (t, c, th) in self.seeded
 
 
 class _FM:
@@ -237,10 +245,11 @@ class _FM:
         return TurnResult(agent_response="on it")
 
 
-def test_mapping_committed_only_after_first_turn_succeeds():
-    """A transient failure on turn 1 must NOT leave a mapping behind: the
-    retry would find the case 'existing' and never re-deliver the one-time
-    seed context."""
+def test_failed_first_turn_keeps_thread_linked_but_unseeded():
+    """Turn 1 failing transiently must keep BOTH properties: the thread stays
+    linked to the case (in-thread retries route to it; a timed-out-but-
+    committed turn stays reachable) AND the one-time seed is re-delivered —
+    tracked by the ``seeded`` flag, which flips only when a turn lands."""
 
     store = _Store()
     fm = _FM(fail=FaultMavenAPIError("boom", status_code=502, detail=""))
@@ -248,13 +257,16 @@ def test_mapping_committed_only_after_first_turn_succeeds():
         _turn.run_turn(
             fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi"
         )
-    assert store.m == {}  # no mapping → the retry re-seeds prior_context
+    assert store.get("T", "C", "TS") == "case_1"  # linked: retries route here
+    assert not store.is_seeded("T", "C", "TS")  # callers re-send the seed
 
     fm_ok = _FM()
     _turn.run_turn(
-        fm_ok, store, team_id="T", channel_id="C", thread_ts="TS", text="hi"
+        fm_ok, store, team_id="T", channel_id="C", thread_ts="TS",
+        text="hi again", prior_context="the catch-up, re-delivered",
     )
-    assert store.get("T", "C", "TS") == "case_1"
+    assert fm_ok.turns[0][1]["pasted_content"] == "the catch-up, re-delivered"
+    assert store.is_seeded("T", "C", "TS")
 
 
 def test_stale_mapping_evicted_on_server_side_404():
@@ -404,3 +416,108 @@ def test_relative_store_path_is_anchored_to_repo_not_cwd(monkeypatch):
 def test_absolute_store_path_is_kept(monkeypatch):
     settings = _settings(monkeypatch, CASE_STORE_PATH="/var/lib/fm.db")
     assert settings.case_store_path == "/var/lib/fm.db"
+
+
+# -- review-fix regressions (PR #16 code review) ---------------------------------
+def test_plain_fallback_neutralizes_entities_and_notes_truncation():
+    """The degraded (plain-text) path must keep the escaping guarantee — a raw
+    agent_response here would re-open the <!channel> injection exactly when
+    blocks fail — and must not raise on schema-drift (non-string) input."""
+
+    out = _turn.plain_fallback("per the log: <!channel> rotate now")
+    assert "<!channel>" not in out and "&lt;!channel>" in out
+    long = "x" * 4000
+    truncated = _turn.plain_fallback(long)
+    assert len(truncated) < 3600 and "truncated" in truncated
+    assert "{'a': 1}" in _turn.plain_fallback({"a": 1})  # str-coerced, no raise
+
+
+def test_post_failure_fallback_is_escaped_end_to_end():
+    client = _SlackClient(fail_updates=1)
+    fm = _FM()
+    fm.submit_turn = lambda cid, **kw: TurnResult(
+        agent_response="quoting evidence: <!here> ping"
+    )
+    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON)
+    fallback = client.updates[0]
+    assert "<!here>" not in fallback["text"]
+    assert "&lt;!here>" in fallback["text"]
+
+
+def test_deliver_turn_result_survives_render_failure(monkeypatch):
+    """A rendering exception must not skip the plain-text fallback (or, on the
+    actions surface, the button strip that follows)."""
+
+    posts: list = []
+
+    def post(text, blocks=None):
+        posts.append((text, blocks))
+        return True
+
+    monkeypatch.setattr(
+        _turn, "build_turn_blocks",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad blocks")),
+    )
+    _turn.deliver_turn_result(post, TurnResult(agent_response="the reply"))
+    assert posts == [("the reply", None)]  # fallback posted, nothing raised
+
+
+def test_autolinks_stay_live_through_the_escape():
+    out = to_mrkdwn("see <https://grafana.internal/d/abc> for the dashboard")
+    assert "<https://grafana.internal/d/abc>" in out
+    # …but the spoofable labeled form stays neutralized.
+    assert "<https://evil|ok>" not in to_mrkdwn("<https://evil|ok>")
+
+
+def test_parse_turn_coerces_non_string_agent_response():
+    result = FaultMavenClient._parse_turn(
+        {"agent_response": {"text": "structured"}, "turn_number": 3}
+    )
+    assert isinstance(result.agent_response, str)
+    assert "structured" in result.agent_response
+
+
+def test_poll_location_404_is_not_case_not_found():
+    """A 404 from the polled Location means the STATUS resource expired — it
+    must not trigger the caller's mapping eviction (CaseNotFoundError)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            return httpx.Response(202, headers={"Location": "/status/1"})
+        return httpx.Response(404, json={"detail": "status expired"})
+
+    client = _client(handler, token="tok")
+    client._timeout = 3.0  # keep the poll's first sleep short
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi")
+    assert not isinstance(err.value, CaseNotFoundError)
+    assert err.value.status_code == 404
+
+
+def test_offload_start_failure_releases_gate_and_registry(monkeypatch):
+    class BrokenThread:
+        def __init__(self, *a, **k):
+            self.name = "broken"
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(_turn.threading, "Thread", BrokenThread)
+    key = ("T", "C", "TS-start")
+    assert _turn._gate.try_enter(_turn._thread_key(*key))
+    with pytest.raises(RuntimeError):
+        _turn.offload_turn(
+            lambda: None, team_id=key[0], channel=key[1], thread_ts=key[2]
+        )
+    assert not _turn.is_thread_busy(*key)  # gate released — thread not wedged
+    _turn.drain_turns(0.1)  # registry clean — join can't hit an unstarted thread
+
+
+def test_error_text_during_shutdown_blames_the_restart():
+    _turn.begin_shutdown()
+    try:
+        text = _turn.turn_error_text(RuntimeError("store is closed"))
+        assert text == _turn.RESTARTING_TEXT
+        assert "try again" not in text.lower()
+    finally:
+        _turn._shutting_down.clear()
