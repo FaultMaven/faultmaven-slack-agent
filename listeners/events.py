@@ -26,6 +26,8 @@ from store import CaseStore
 
 from ._turn import (
     Dedup,
+    is_thread_busy,
+    mark_skipped,
     post_placeholder,
     resolve_query,
     run_gated,
@@ -34,6 +36,20 @@ from ._turn import (
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
+
+# One-time etiquette note for a plain-DM investigation: in a DM the natural
+# reply box is the main composer, but a top-level composer message is a NEW
+# summons (new case) — without this pointer a user answering FaultMaven's
+# question in the composer forks the investigation.
+_DM_INTRO = (
+    ":bulb: Reply *in this thread* to continue this investigation — a new "
+    "message in the box below starts a separate one."
+)
+
+_UNREADABLE_FILES_TEXT = (
+    ":information_source: I couldn't read the attached file(s) (too large, or "
+    "I lack access). Paste the key text and I'll take it from there."
+)
 
 
 def _fetch_thread_context(
@@ -74,8 +90,9 @@ def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> boo
     the (slightly less cheap) store lookup the caller then does:
 
     - the bot's own posts (``bot_id``),
-    - non-message subtypes (edits, deletes, joins…) — only a normal message or a
-      ``file_share`` carries new user input,
+    - non-message subtypes (edits, deletes, joins…) — a normal message, a
+      ``file_share``, or a ``thread_broadcast`` ("Also send to #channel", used
+      constantly in incident threads) carries new user input; nothing else does,
     - DMs (``channel_type == "im"``) — the Assistant surface owns those,
     - top-level channel messages (no ``thread_ts``) — we never start an
       investigation from ambient channel chatter, only continue one in a thread,
@@ -85,7 +102,7 @@ def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> boo
 
     if event.get("bot_id"):
         return False
-    if event.get("subtype") not in (None, "file_share"):
+    if event.get("subtype") not in (None, "file_share", "thread_broadcast"):
         return False
     if event.get("channel_type") == "im":
         return False
@@ -216,9 +233,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client.chat_update(
                         channel=channel,
                         ts=placeholder_ts,
-                        text=":information_source: I couldn't read the attached "
-                        "file(s) (too large, or I lack access). Paste the key text "
-                        "and I'll take it from there.",
+                        text=_UNREADABLE_FILES_TEXT,
                     )
                     return
                 run_turn_and_post(
@@ -231,6 +246,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     text=query,
                     files=files or None,
                     placeholder_ts=placeholder_ts,
+                    intro_note=_DM_INTRO,
                 )
 
             run_gated(
@@ -249,8 +265,15 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         channel = event["channel"]
         thread_ts = event["thread_ts"]
         team_id = context.team_id or ""  # install team — see on_app_mention
-        # Only act on threads that are already an investigation.
+        # Only act on threads that are already an investigation. During the
+        # case-OPENING turn the mapping doesn't exist yet (it's committed when
+        # the first turn lands) but the gate is held — a reply in that window
+        # is a real follow-up, so give it the ⏭️ skip signal instead of the
+        # silent drop an unknown thread gets.
         if store.get(team_id, channel, thread_ts) is None:
+            if is_thread_busy(team_id, channel, thread_ts) and event.get("ts"):
+                if not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                    mark_skipped(client, channel, event["ts"])
             return
         if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
             return
@@ -265,6 +288,19 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
 
         def work() -> None:
             files = download_message_files(client.token, event) if has_files else []
+            # File(s) attached but none ingestible, and no text: say so instead
+            # of submitting a phantom-evidence turn the engine can only be
+            # confused by (mirrors the DM-summons and Assistant declines).
+            if not text and not files:
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=_UNREADABLE_FILES_TEXT,
+                    )
+                except Exception as exc:  # noqa: BLE001 — decline is best-effort
+                    logger.warning("decline post failed in %s: %s", channel, exc)
+                return
             run_turn_and_post(
                 client,
                 fm,

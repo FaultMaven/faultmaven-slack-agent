@@ -16,11 +16,11 @@ from logging import Logger
 from slack_bolt import Ack, App, BoltContext
 from slack_sdk import WebClient
 
-from faultmaven import FaultMavenClient, TurnResult
+from faultmaven import CaseNotFoundError, FaultMavenClient, TurnResult
 from rendering import SUGGESTED_ACTION_PATTERN, build_turn_blocks
 from store import CaseStore
 
-from ._turn import run_gated
+from ._turn import CASE_GONE_TEXT, run_gated, turn_error_text
 
 
 def apply_action(
@@ -84,52 +84,83 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = message.get("thread_ts") or message["ts"]
         team_id = context.team_id or ""
 
-        def work() -> None:
+        def post(text: str, blocks: list[dict] | None = None) -> bool:
+            """Threaded post that reports failure instead of raising."""
+
             try:
-                action = body["actions"][0]
-                label = action.get("text", {}).get("text", "")
-                case_id = store.get(team_id, channel, thread_ts)
-                if not case_id:
+                if blocks is None:
+                    client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts, text=text
+                    )
+                else:
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
-                        text=":warning: I lost track of this investigation's case. "
-                        "Please @mention me to continue.",
+                        text=text,
+                        blocks=blocks,
                     )
-                    return
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("post failed in %s: %s", channel, exc)
+                return False
 
-                result = apply_action(fm, case_id, action["value"])
-                _disable_actions(client, body)
-
-                # A button click posts no user message on its own, so consecutive
-                # FaultMaven replies would pile up. Echo the choice as the
-                # clicker's turn, so the thread reads as an exchange:
-                #   [FM question] → "> @user chose X" → [FM reply].
-                user_id = (body.get("user") or {}).get("id")
-                if user_id and label:
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=f"> <@{user_id}> chose *{_plain(label)}*",
-                    )
-
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=result.agent_response[:300],
-                    blocks=build_turn_blocks(result),
+        def work() -> None:
+            action = body["actions"][0]
+            label = action.get("text", {}).get("text", "")
+            case_id = store.get(team_id, channel, thread_ts)
+            if not case_id:
+                post(
+                    ":warning: I lost track of this investigation's case. "
+                    "Please @mention me to continue."
                 )
+                return
+
+            # Submit first; everything after is presentation. The two failure
+            # regimes get opposite advice: a failed SUBMIT may be retried (the
+            # buttons stay live for that), but once the backend committed the
+            # decision, no Slack-side failure may claim the action errored —
+            # that message plus still-live buttons invites double-submitting
+            # the same decision.
+            try:
+                result = apply_action(fm, case_id, action["value"])
+            except CaseNotFoundError:
+                store.delete(team_id, channel, thread_ts)
+                logger.warning(
+                    "Case %s vanished server-side; unlinked thread %s",
+                    case_id,
+                    thread_ts,
+                )
+                post(CASE_GONE_TEXT)
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.exception("suggested-action failed: %s", exc)
-                try:
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=":warning: That action hit an error. "
-                        "Please try again or @mention me.",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+                post(turn_error_text(exc))
+                return
+
+            # A button click posts no user message on its own, so consecutive
+            # FaultMaven replies would pile up. Echo the choice as the
+            # clicker's turn, so the thread reads as an exchange:
+            #   [FM question] → "> @user chose X" → [FM reply].
+            # Cosmetic — its failure must not cost the reply below.
+            user_id = (body.get("user") or {}).get("id")
+            if user_id and label:
+                post(f"> <@{user_id}> chose *{_plain(label)}*")
+
+            # The substantive output. If Block Kit is rejected (limits), the
+            # reply still exists on the case — degrade to plain text.
+            if not post(result.agent_response[:300], build_turn_blocks(result)):
+                post(result.agent_response[:3500])
+
+            # Strip the clicked buttons last, and best-effort: the decision is
+            # already applied, so a failure here (message deleted, rate limit)
+            # only risks a re-click — which the backend's own state handles —
+            # and must not discard the reply that was already posted.
+            try:
+                _disable_actions(client, body)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "could not strip clicked buttons in %s: %s", channel, exc
+                )
 
         # A click advances the case, so it's a turn — reserve the thread and run
         # in the background. If one is already running, the click is dropped (not

@@ -47,12 +47,34 @@ _HOLD_RE = re.compile(_HOLD_L + r"(\d+)" + _HOLD_R)
 _STRIP_SENTINELS = str.maketrans({c: None for c in (_HOLD_L, _HOLD_R, _BOLD_L, _BOLD_R)})
 
 
+def escape_mrkdwn(text: str) -> str:
+    """Escape Slack's entity openers (``&`` ``<``) in untrusted text.
+
+    Slack parses ``<...>`` sequences — ``<!channel>`` broadcasts, ``<@U...>``
+    mentions, ``<url|label>`` links — in every mrkdwn field, including code
+    spans. The engine's reply quotes untrusted evidence (pasted alerts, logs)
+    verbatim, so without this a crafted log line echoed by the LLM could ping
+    the whole channel or spoof a link under the bot's identity.
+
+    ``>`` is deliberately left alone: an entity can only ever start with ``<``
+    (which is always escaped here), so a bare ``>`` is inert — and escaping it
+    would break the ``> quote`` blockquotes the engine legitimately emits.
+    """
+
+    return text.replace("&", "&amp;").replace("<", "&lt;")
+
+
 def to_mrkdwn(text: str) -> str:
     """Best-effort Markdown → Slack mrkdwn. Leaves already-mrkdwn text intact."""
 
     if not text:
         return text
     text = text.translate(_STRIP_SENTINELS)  # never let input spoof a sentinel
+    # Neutralize Slack entities BEFORE any conversion: everything on this path
+    # is untrusted (LLM output seeded from user evidence). The <url|text> links
+    # this converter emits are built after the escape, so they stay live — and
+    # Slack itself requires & inside link URLs to be entity-escaped.
+    text = escape_mrkdwn(text)
 
     stash: list[str] = []
 
@@ -62,6 +84,17 @@ def to_mrkdwn(text: str) -> str:
 
     # 1. Protect code and links so no later pass rewrites their insides.
     text = _FENCE.sub(lambda m: _hold("```\n" + m.group(1).rstrip("\n") + "\n```"), text)
+    # An unterminated multi-line fence (e.g. a token-cap-truncated reply) runs
+    # to EOF — stash it too, or the emphasis/bullet passes would rewrite its
+    # contents while Slack still renders it as a code block. Same-line pairs
+    # (```cmd```) are left for the inline-code pass, which already stashes them.
+    dangling = text.find("```")
+    if dangling != -1:
+        after = text[dangling + 3 :]
+        newline = after.find("\n")
+        if newline != -1 and "```" not in after[:newline]:
+            body = after[newline + 1 :]
+            text = text[:dangling] + _hold("```\n" + body.rstrip("\n") + "\n```")
     text = _INLINE_CODE.sub(lambda m: _hold("`" + m.group(1) + "`"), text)
     text = _LINK.sub(lambda m: _hold(f"<{m.group(2)}|{m.group(1)}>"), text)
 

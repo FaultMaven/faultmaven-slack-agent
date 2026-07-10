@@ -42,6 +42,38 @@ class FaultMavenError(Exception):
     """Raised when the FaultMaven API cannot service a request."""
 
 
+class FaultMavenAPIError(FaultMavenError):
+    """An HTTP error response from the backend, with its status and detail.
+
+    ``detail`` carries the backend's (truncated) error body — the Pydantic
+    ``detail`` explaining *why* — so callers can log it and show a 4xx-specific
+    message instead of a generic "try again" that would just reproduce the
+    same rejection.
+    """
+
+    def __init__(self, message: str, *, status_code: int, detail: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
+class CaseNotFoundError(FaultMavenAPIError):
+    """The case behind a thread no longer exists server-side (404).
+
+    Distinguished so callers can evict the stale thread→case mapping — without
+    that, every retry the generic error message suggests routes straight back
+    to the same dead case_id and the thread is stuck forever.
+    """
+
+
+class FaultMavenTimeoutError(FaultMavenError):
+    """The client gave up waiting, but the backend may still complete the turn.
+
+    Distinguished so the user-facing message can warn against blind re-sends
+    (a resent message runs a duplicate turn against state the user never saw).
+    """
+
+
 @dataclass(slots=True)
 class TurnResult:
     """Normalized turn response, ready to render into Block Kit.
@@ -73,6 +105,10 @@ class FaultMavenClient:
         timeout: float = 120.0,
     ) -> None:
         self._token = token
+        # A preset token can't be re-acquired: never wipe it on a 401 (a
+        # transient auth blip would otherwise discard it and every later
+        # request would fail into a misleading dev-login error).
+        self._token_is_preset = bool(token)
         self._dev_login_username = dev_login_username
         self._timeout = timeout
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
@@ -202,7 +238,16 @@ class FaultMavenClient:
         resp = self._http.post(
             url, json=json, data=data, files=files, headers=self._headers()
         )
-        if resp.status_code == 401 and self._dev_login_username:
+        if resp.status_code == 401:
+            if self._token_is_preset or not self._dev_login_username:
+                # Nothing to re-acquire — surface the 401 as-is (the operator
+                # must rotate FAULTMAVEN_API_TOKEN), keeping the token in place
+                # so a transient backend auth blip self-heals.
+                logger.error(
+                    "FaultMaven rejected the configured token (401); "
+                    "check FAULTMAVEN_API_TOKEN"
+                )
+                return resp
             logger.info("FaultMaven token rejected (401); re-authenticating")
             self._token = ""
             self._ensure_token()
@@ -210,6 +255,36 @@ class FaultMavenClient:
                 url, json=json, data=data, files=files, headers=self._headers()
             )
         return resp
+
+    @staticmethod
+    def _error_detail(resp: httpx.Response) -> str:
+        """The backend's error explanation, truncated — for logs and messages."""
+
+        try:
+            body = resp.json()
+            detail = body.get("detail") if isinstance(body, dict) else None
+            text = detail if isinstance(detail, str) else resp.text
+        except ValueError:
+            text = resp.text
+        return " ".join((text or "").split())[:300]
+
+    def _raise_for_status(
+        self, resp: httpx.Response, op: str, *, not_found_is_case: bool = False
+    ) -> None:
+        """Map an HTTP error onto the typed exception hierarchy."""
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = self._error_detail(resp)
+            message = f"{op} failed: HTTP {resp.status_code}: {detail}"
+            if not_found_is_case and resp.status_code == 404:
+                raise CaseNotFoundError(
+                    message, status_code=404, detail=detail
+                ) from exc
+            raise FaultMavenAPIError(
+                message, status_code=resp.status_code, detail=detail
+            ) from exc
 
     # -- core calls ---------------------------------------------------------
     def create_case(
@@ -226,9 +301,13 @@ class FaultMavenClient:
             body["initial_message"] = initial_message
         try:
             resp = self._post("/api/v1/cases", json=body)
-            resp.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise FaultMavenTimeoutError(
+                f"create_case timed out after {self._timeout}s"
+            ) from exc
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"create_case failed: {exc}") from exc
+        self._raise_for_status(resp, "create_case")
 
         case_id = resp.json().get("case_id")
         if not case_id:
@@ -285,9 +364,16 @@ class FaultMavenClient:
             # Location poll is kept as a forward-compatible safety net only.
             if resp.status_code == 202:
                 resp = self._poll(resp.headers.get("Location", ""))
-            resp.raise_for_status()
+        except httpx.TimeoutException as exc:
+            # The backend may still complete (and commit) this turn — typed so
+            # the user-facing message can warn against a blind re-send.
+            raise FaultMavenTimeoutError(
+                f"submit_turn timed out after {self._timeout}s; the turn may "
+                "still complete on the backend"
+            ) from exc
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"submit_turn failed: {exc}") from exc
+        self._raise_for_status(resp, "submit_turn", not_found_is_case=True)
 
         return self._parse_turn(resp.json())
 
@@ -300,13 +386,35 @@ class FaultMavenClient:
 
         deadline = time.monotonic() + self._timeout
         delay = 1.5
+        reauthed = False
         while time.monotonic() < deadline:
             time.sleep(delay)
-            resp = self._http.get(location, headers=self._headers())
+            # Clamp each GET to the remaining budget: the loop deadline and the
+            # client's per-request timeout are both self._timeout, so an
+            # unclamped GET issued late could ~double the intended bound.
+            remaining = max(1.0, deadline - time.monotonic())
+            resp = self._http.get(
+                location,
+                headers=self._headers(),
+                timeout=min(self._timeout, remaining),
+            )
+            if (
+                resp.status_code == 401
+                and not reauthed
+                and self._dev_login_username
+                and not self._token_is_preset
+            ):
+                # A dev-login token (1h TTL) can expire mid-poll on a long
+                # async turn; re-login once, same as _post.
+                logger.info("token rejected (401) mid-poll; re-authenticating")
+                self._token = ""
+                self._ensure_token()
+                reauthed = True
+                continue
             if resp.status_code != 202:
                 return resp
             delay = min(delay * 1.5, 10.0)
-        raise FaultMavenError("timed out polling for async turn result")
+        raise FaultMavenTimeoutError("timed out polling for async turn result")
 
     @staticmethod
     def _parse_turn(body: dict[str, Any]) -> TurnResult:

@@ -57,5 +57,23 @@ class CaseStore:
             )
             self._conn.commit()
 
+    def delete(self, team_id: str, channel_id: str, thread_ts: str) -> None:
+        """Evict a mapping whose case no longer exists server-side.
+
+        Without eviction a 404-ing case pins its thread forever: every retry
+        routes back to the same dead case_id.
+        """
+
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+
     def close(self) -> None:
-        self._conn.close()
+        # Under the lock: shutdown must not close the connection out from
+        # under a get/put still running on a turn worker thread.
+        with self._lock:
+            self._conn.close()

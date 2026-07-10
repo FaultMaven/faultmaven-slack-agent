@@ -8,7 +8,9 @@ tests can patch the environment before the first access.
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -74,6 +76,33 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, value: str) -> str:
+        # logging.basicConfig only accepts the uppercase names; a lowercase
+        # LOG_LEVEL=debug would otherwise crash at startup with an opaque
+        # "Unknown level" ValueError that never names the setting.
+        level = value.strip().upper()
+        if level not in logging.getLevelNamesMapping():
+            raise ValueError(
+                f"LOG_LEVEL must be one of "
+                f"{sorted(logging.getLevelNamesMapping())}, got {value!r}"
+            )
+        return level
+
+    @field_validator("case_store_path")
+    @classmethod
+    def _anchor_store_path(cls, value: str) -> str:
+        # The thread→case map is the source of truth for which case a thread
+        # belongs to. Anchor a relative path to the repo (this file's parent),
+        # not the cwd — starting the agent from a different directory would
+        # otherwise silently fork an empty store and every active thread would
+        # lose its investigation.
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        return str(path)
 
 
 @lru_cache
