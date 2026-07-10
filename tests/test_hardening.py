@@ -387,7 +387,11 @@ def test_store_delete_evicts_mapping(tmp_path):
 def _settings(monkeypatch, **env):
     from config import Settings
 
+    # A minimal-valid Socket Mode config (the default transport); these tests
+    # assert on unrelated fields (log level, store path), so both socket tokens
+    # are present to satisfy the transport credential check.
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-x")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-x")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return Settings(_env_file=None)

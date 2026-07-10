@@ -1,0 +1,17 @@
+# Non-secret runtime config for the hosted Slack agent.
+# Secrets (Slack client secret/signing secret, the Postgres URL, any FM token)
+# live in the Secret — see secret.example.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: faultmaven-slack-agent
+  namespace: faultmaven
+data:
+  SLACK_TRANSPORT: "http"
+  HTTP_PORT: "3000"
+  LOG_LEVEL: "INFO"
+  # The hosted agent talks to the cluster FM API, not a local standalone.
+  FAULTMAVEN_API_URL: "https://api.faultmaven.ai"
+  # Pin the redirect so it matches the manifest even if the app sees a
+  # different Host behind the ingress/proxy chain.
+  SLACK_OAUTH_REDIRECT_URI: "https://slack.faultmaven.ai/slack/oauth_redirect"

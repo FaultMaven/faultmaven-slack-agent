@@ -1,9 +1,20 @@
-"""FaultMaven Slack Agent — Bolt entrypoint (P0, Socket Mode).
+"""FaultMaven Slack Agent — Bolt app construction and the Socket Mode runtime.
 
-Wires the Slack Bolt app (Assistant container + ``app_mention``) to the
-FaultMaven core API and starts a Socket Mode connection — the fastest path to a
-working end-to-end loop with no public URL. The HTTP + multi-workspace OAuth
-transport lands in P5 (see ``docs/design.md`` §8, §14).
+Two transports share one set of listeners (the turn pipeline is transport-blind:
+every listener uses Bolt's per-request ``client`` and ``context.team_id``, never
+a captured global token):
+
+* **HTTP/OAuth** (``SLACK_TRANSPORT=http``) — the hosted, submission transport.
+  Multi-workspace OAuth (``/slack/install`` → ``/slack/oauth_redirect``) with a
+  per-team ``InstallationStore``; served over HTTP by :mod:`web`. This is what
+  makes the app installable into 5+ workspaces and Marketplace-eligible
+  (``docs/design.md`` §10, §16 P5).
+* **Socket Mode** (``SLACK_TRANSPORT=socket``) — local development against a
+  single dev app; no public URL, not multi-workspace. Runs from :func:`main`.
+
+This module builds the Bolt ``App`` for either transport and owns the Socket
+Mode process loop; :mod:`web` owns the HTTP process loop. Both funnel shutdown
+through :func:`shutdown_runtime`.
 """
 
 from __future__ import annotations
@@ -13,6 +24,7 @@ import signal
 import time
 
 from slack_bolt import App
+from slack_bolt.oauth.oauth_settings import OAuthSettings
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
 from slack_sdk.http_retry.builtin_handlers import (
@@ -20,10 +32,11 @@ from slack_sdk.http_retry.builtin_handlers import (
     RateLimitErrorRetryHandler,
 )
 
-from config import Settings, get_settings
+from config import DEFAULT_BOT_SCOPES, Settings, get_settings
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
+from oauth_store import build_oauth_stores
 from store import CaseStore
 
 logger = logging.getLogger("faultmaven.slack")
@@ -78,9 +91,8 @@ def make_web_client(token: str) -> WebClient:
     )
 
 
-def build_app() -> tuple[App, CaseStore, FaultMavenClient, str]:
-    settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+def _build_core(settings: Settings) -> tuple[CaseStore, FaultMavenClient]:
+    """Build the transport-independent dependencies: FM client + case store."""
 
     fm = make_fault_client(settings)
     fm.startup()
@@ -90,14 +102,75 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, str]:
     # location diagnosable (a forked/mislocated store silently orphans every
     # active investigation).
     logger.info("Case store: %s", settings.case_store_path)
+    return store, fm
 
-    app = App(
-        client=make_web_client(settings.slack_bot_token),
-        signing_secret=settings.slack_signing_secret or None,
+
+def _oauth_settings(settings: Settings) -> OAuthSettings:
+    """Bolt OAuth config: per-team InstallationStore + CSRF state store.
+
+    The scopes here mirror ``manifest.json`` (see :data:`DEFAULT_BOT_SCOPES`) —
+    they are what the authorize URL requests; the redirect URI is derived from
+    the request unless pinned via ``SLACK_OAUTH_REDIRECT_URI``.
+    """
+
+    stores = build_oauth_stores(
+        database_url=settings.slack_database_url,
+        client_id=settings.slack_client_id,
     )
+    return OAuthSettings(
+        client_id=settings.slack_client_id,
+        client_secret=settings.slack_client_secret,
+        scopes=list(DEFAULT_BOT_SCOPES),
+        installation_store=stores.installation_store,
+        state_store=stores.state_store,
+        redirect_uri=settings.slack_oauth_redirect_uri or None,
+    )
+
+
+def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
+    """Build the Bolt app and its dependencies for the configured transport.
+
+    HTTP mode wires multi-workspace OAuth (no static bot token — per-team tokens
+    are resolved from the InstallationStore per request). Socket mode uses the
+    single static bot token. Listeners are identical across both.
+    """
+
+    settings = get_settings()
+    logging.basicConfig(level=settings.log_level)
+    store, fm = _build_core(settings)
+
+    if settings.slack_transport == "http":
+        app = App(
+            signing_secret=settings.slack_signing_secret,
+            oauth_settings=_oauth_settings(settings),
+        )
+    else:
+        app = App(
+            client=make_web_client(settings.slack_bot_token),
+            signing_secret=settings.slack_signing_secret or None,
+        )
     register_listeners(app, fm, store)
 
-    return app, store, fm, settings.slack_app_token
+    return app, store, fm, settings
+
+
+def shutdown_runtime(store: CaseStore, fm: FaultMavenClient) -> None:
+    """Drain in-flight turns, then release shared resources. Idempotent-safe.
+
+    Shared by both transports' shutdown paths. In-flight turns that fail from
+    the teardown itself must say "restarting", not blame the turn or advise a
+    retry — :func:`begin_shutdown` flips that message. The drain must outlast
+    the turn timeout, or a live worker gets its resources yanked mid-turn and
+    the thread's ":mag: Investigating…" placeholder strands forever.
+    """
+
+    begin_shutdown()
+    drain_turns(
+        get_settings().faultmaven_request_timeout
+        + _SHUTDOWN_DRAIN_HEADROOM_SECONDS
+    )
+    store.close()
+    fm.close()
 
 
 def _watch_connection(handler: SocketModeHandler) -> None:
@@ -128,8 +201,18 @@ def _watch_connection(handler: SocketModeHandler) -> None:
 
 
 def main() -> None:
-    app, store, fm, app_token = build_app()
-    if not app_token:
+    """Process entrypoint. Dispatches to the HTTP runtime or the Socket loop."""
+
+    settings = get_settings()
+    if settings.slack_transport == "http":
+        # The HTTP transport is an ASGI server; hand off to :mod:`web`.
+        from web import run_http
+
+        run_http()
+        return
+
+    app, store, fm, settings = build_app()
+    if not settings.slack_app_token:
         raise SystemExit(
             "SLACK_APP_TOKEN (xapp-...) is required for Socket Mode. "
             "Create one with the connections:write scope."
@@ -144,29 +227,18 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _sigterm)
 
-    logger.info("FaultMaven Slack Agent starting")
-    handler = SocketModeHandler(app, app_token)
+    logger.info("FaultMaven Slack Agent starting (Socket Mode)")
+    handler = SocketModeHandler(app, settings.slack_app_token)
     try:
         handler.connect()
         _watch_connection(handler)
     finally:
-        # In-flight turns that fail from the teardown itself must say
-        # "restarting", not blame the turn or advise a retry.
-        begin_shutdown()
         try:
             handler.close()
         except Exception as exc:  # noqa: BLE001 — shutdown must keep going
             logger.warning("Socket Mode close failed: %s", exc)
-        # Let running turns finish BEFORE closing the store and API client
-        # they're using: the drain must outlast the turn timeout, or a live
-        # worker gets its resources yanked mid-turn and the thread's
-        # ":mag: Investigating…" placeholder strands forever.
-        drain_turns(
-            get_settings().faultmaven_request_timeout
-            + _SHUTDOWN_DRAIN_HEADROOM_SECONDS
-        )
-        store.close()
-        fm.close()
+        # Let running turns finish BEFORE closing the store and API client.
+        shutdown_runtime(store, fm)
 
 
 if __name__ == "__main__":

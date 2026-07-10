@@ -49,8 +49,8 @@ not exist.** The real contract is: **create a case**
 
 | State | Surfaces / features |
 |---|---|
-| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · preflight doctor — on **Socket Mode**. |
-| **Designed, not yet built** | multi-workspace OAuth / per-user account linking (§10; today Socket Mode, single install) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
+| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport. |
+| **Designed, not yet built** | per-user FaultMaven account linking + workspace→org binding (§10.2/10.3 — blocked on backend asks §15.2/15.3; beta runs all workspaces under one cloud FM service token) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
 | **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
 ---
@@ -695,7 +695,9 @@ identity** (the team→org binding), attributed to the Slack user in metadata. T
 
 ```text
 faultmaven-slack-agent/
-├── app.py                      # Bolt App (Socket Mode today; FastAPI+OAuth is the target); register listeners
+├── app.py                      # Bolt App builder (dual transport) + Socket Mode loop; register listeners
+├── web.py                      # FastAPI HTTP transport: /slack/{events,install,oauth_redirect} + /health
+├── oauth_store.py              # SQLAlchemy InstallationStore + OAuthStateStore (Postgres/SQLite)
 ├── manifest.json               # scopes, events, assistant_view, shortcut
 ├── config.py                   # settings (kept, extended): lifecycle windows, etc.
 ├── listeners/

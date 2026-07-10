@@ -12,8 +12,24 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Bot scopes requested at install time. Kept in lockstep with manifest.json's
+# oauth_config.bot scopes — the manifest is what Slack shows on the consent
+# screen; this list is what Bolt's OAuthSettings sends in the authorize URL, and
+# a mismatch yields an install that silently lacks a scope a listener needs.
+DEFAULT_BOT_SCOPES: tuple[str, ...] = (
+    "assistant:write",
+    "chat:write",
+    "commands",
+    "reactions:write",
+    "app_mentions:read",
+    "files:read",
+    "im:history",
+    "channels:history",
+    "groups:history",
+)
 
 
 class Settings(BaseSettings):
@@ -26,15 +42,48 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # --- Transport ---------------------------------------------------------
+    # "http"   → HTTP/Events + multi-workspace OAuth (the hosted, submission
+    #            transport; installs into many workspaces, Marketplace-eligible).
+    # "socket" → Socket Mode against a single dev app (local development only;
+    #            no public URL, not multi-workspace).
+    slack_transport: str = Field(
+        default="socket", validation_alias="SLACK_TRANSPORT"
+    )
+
     # --- Slack credentials -------------------------------------------------
-    # Bot User OAuth token ("xoxb-..."): used to call the Slack Web API.
-    slack_bot_token: str = Field(..., validation_alias="SLACK_BOT_TOKEN")
-    # Signing secret: verifies inbound requests (used by Bolt in HTTP mode).
+    # Bot User OAuth token ("xoxb-..."): the single static bot token used by
+    # Socket Mode. In HTTP/OAuth mode there is NO static bot token — per-team
+    # tokens come from the InstallationStore — so this is optional there.
+    slack_bot_token: str = Field(default="", validation_alias="SLACK_BOT_TOKEN")
+    # Signing secret: verifies inbound HTTP requests (required in HTTP mode).
     slack_signing_secret: str = Field(
         default="", validation_alias="SLACK_SIGNING_SECRET"
     )
-    # App-level token ("xapp-..."): required for Socket Mode (the P0 dev transport).
+    # App-level token ("xapp-..."): required for Socket Mode.
     slack_app_token: str = Field(default="", validation_alias="SLACK_APP_TOKEN")
+
+    # --- Slack OAuth (HTTP mode) -------------------------------------------
+    # From "Basic Information → App Credentials". Drive the /slack/install →
+    # /slack/oauth_redirect distribution flow that yields per-team bot tokens.
+    slack_client_id: str = Field(default="", validation_alias="SLACK_CLIENT_ID")
+    slack_client_secret: str = Field(
+        default="", validation_alias="SLACK_CLIENT_SECRET"
+    )
+    # SQLAlchemy URL backing the per-team InstallationStore + OAuthStateStore.
+    # SQLite file locally; a Postgres URL in the cluster. Both stores share it.
+    slack_database_url: str = Field(
+        default="", validation_alias="SLACK_DATABASE_URL"
+    )
+    # Optional explicit redirect URI. If empty, Bolt derives it from the inbound
+    # request host + the redirect path — correct behind a well-configured proxy,
+    # but pin it here when the public host differs from what the app sees.
+    slack_oauth_redirect_uri: str = Field(
+        default="", validation_alias="SLACK_OAUTH_REDIRECT_URI"
+    )
+    # Port the HTTP transport binds inside the container (k8s maps the Service
+    # to it; the public HTTPS termination happens at the ingress).
+    http_port: int = Field(default=3000, validation_alias="HTTP_PORT")
 
     # --- FaultMaven core API -----------------------------------------------
     faultmaven_api_url: str = Field(
@@ -63,14 +112,70 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
+    @field_validator("slack_transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        mode = value.strip().lower()
+        if mode not in ("http", "socket"):
+            raise ValueError(
+                f"SLACK_TRANSPORT must be 'http' or 'socket', got {value!r}"
+            )
+        return mode
+
     @field_validator("slack_bot_token")
     @classmethod
     def _validate_bot_token(cls, value: str) -> str:
-        if not value.startswith(("xoxb-", "xoxp-")):
+        # Optional overall (HTTP/OAuth mode has no static bot token — per-team
+        # tokens come from the InstallationStore). Validate the shape only when
+        # one is actually provided; the transport check below enforces presence
+        # for Socket Mode.
+        if value and not value.startswith(("xoxb-", "xoxp-")):
             raise ValueError(
                 "SLACK_BOT_TOKEN must start with 'xoxb-' or 'xoxp-'"
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_transport_requirements(self) -> "Settings":
+        """Fail fast at startup when a transport is missing its credentials.
+
+        Each transport needs a disjoint credential set; deferring the check to
+        the first inbound Slack event would surface it as an opaque runtime
+        error instead of a clear boot failure.
+        """
+
+        if self.slack_transport == "socket":
+            missing = [
+                name
+                for name, val in (
+                    ("SLACK_BOT_TOKEN", self.slack_bot_token),
+                    ("SLACK_APP_TOKEN", self.slack_app_token),
+                )
+                if not val
+            ]
+            if missing:
+                raise ValueError(
+                    "Socket Mode requires "
+                    + " and ".join(missing)
+                    + " (set SLACK_TRANSPORT=http for the hosted OAuth transport)"
+                )
+        else:  # http
+            missing = [
+                name
+                for name, val in (
+                    ("SLACK_CLIENT_ID", self.slack_client_id),
+                    ("SLACK_CLIENT_SECRET", self.slack_client_secret),
+                    ("SLACK_SIGNING_SECRET", self.slack_signing_secret),
+                )
+                if not val
+            ]
+            if missing:
+                raise ValueError(
+                    "HTTP/OAuth transport requires "
+                    + ", ".join(missing)
+                    + " (from the app's Basic Information → App Credentials)"
+                )
+        return self
 
     @field_validator("faultmaven_api_url")
     @classmethod
@@ -90,6 +195,18 @@ class Settings(BaseSettings):
                 f"{sorted(logging.getLevelNamesMapping())}, got {value!r}"
             )
         return level
+
+    @field_validator("slack_database_url")
+    @classmethod
+    def _default_oauth_db_url(cls, value: str) -> str:
+        # When unset, back the OAuth stores with a repo-anchored SQLite file
+        # (same anchoring rationale as the case store: a cwd-relative path would
+        # silently fork an empty install store and orphan every workspace's
+        # bot token). A real Postgres URL passes through untouched.
+        if value:
+            return value
+        path = Path(__file__).resolve().parent / "data" / "slack_oauth.db"
+        return f"sqlite:///{path}"
 
     @field_validator("case_store_path")
     @classmethod

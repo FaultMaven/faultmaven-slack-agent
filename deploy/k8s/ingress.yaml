@@ -1,0 +1,32 @@
+# Public HTTPS entry for the Slack agent. slack.faultmaven.ai must resolve to
+# the ingress and the TLS cert must be valid — Slack refuses an events/redirect
+# URL that isn't publicly reachable over verified HTTPS.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: faultmaven-slack-agent
+  namespace: faultmaven
+  annotations:
+    # cert-manager issues/renews the TLS cert. Adjust the issuer to match the
+    # cluster's (matches the pattern used for api.faultmaven.ai).
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Slack signs event bodies; the agent needs the raw body. Keep proxy body
+    # buffering default and allow a modest body size for pasted evidence.
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - slack.faultmaven.ai
+      secretName: faultmaven-slack-agent-tls
+  rules:
+    - host: slack.faultmaven.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: faultmaven-slack-agent
+                port:
+                  name: http
