@@ -71,7 +71,10 @@ class Settings(BaseSettings):
         default="", validation_alias="SLACK_CLIENT_SECRET"
     )
     # SQLAlchemy URL backing the per-team InstallationStore + OAuthStateStore.
-    # SQLite file locally; a Postgres URL in the cluster. Both stores share it.
+    # REQUIRED in http mode (validated below) — there is deliberately no default:
+    # a silent SQLite fallback on the container's ephemeral disk would drop every
+    # workspace's bot token on the first restart. A Postgres URL in the cluster;
+    # for local http testing, set it explicitly (e.g. sqlite:///data/oauth.db).
     slack_database_url: str = Field(
         default="", validation_alias="SLACK_DATABASE_URL"
     )
@@ -166,6 +169,9 @@ class Settings(BaseSettings):
                     ("SLACK_CLIENT_ID", self.slack_client_id),
                     ("SLACK_CLIENT_SECRET", self.slack_client_secret),
                     ("SLACK_SIGNING_SECRET", self.slack_signing_secret),
+                    # Required so per-team bot tokens land in durable storage,
+                    # never an ephemeral pod-local SQLite file.
+                    ("SLACK_DATABASE_URL", self.slack_database_url),
                 )
                 if not val
             ]
@@ -195,18 +201,6 @@ class Settings(BaseSettings):
                 f"{sorted(logging.getLevelNamesMapping())}, got {value!r}"
             )
         return level
-
-    @field_validator("slack_database_url")
-    @classmethod
-    def _default_oauth_db_url(cls, value: str) -> str:
-        # When unset, back the OAuth stores with a repo-anchored SQLite file
-        # (same anchoring rationale as the case store: a cwd-relative path would
-        # silently fork an empty install store and orphan every workspace's
-        # bot token). A real Postgres URL passes through untouched.
-        if value:
-            return value
-        path = Path(__file__).resolve().parent / "data" / "slack_oauth.db"
-        return f"sqlite:///{path}"
 
     @field_validator("case_store_path")
     @classmethod

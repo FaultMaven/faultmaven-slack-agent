@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from slack_sdk.oauth.installation_store.sqlalchemy import (
     SQLAlchemyInstallationStore,
 )
 from slack_sdk.oauth.state_store.sqlalchemy import SQLAlchemyOAuthStateStore
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 
 logger = logging.getLogger("faultmaven.slack.oauth")
 
@@ -56,11 +57,14 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     # threads, so disable the single-thread guard (the stores open short-lived
     # connections per call; SQLite serializes writes itself). Harmless for
     # Postgres, which ignores the connect arg.
-    connect_args = (
-        {"check_same_thread": False}
-        if database_url.startswith("sqlite")
-        else {}
-    )
+    is_sqlite = database_url.startswith("sqlite")
+    if is_sqlite:
+        # SQLite won't create a missing parent directory — it raises "unable to
+        # open database file". Create it (as CaseStore does for its own path).
+        db_path = make_url(database_url).database
+        if db_path and db_path != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    connect_args = {"check_same_thread": False} if is_sqlite else {}
     engine = create_engine(database_url, connect_args=connect_args)
 
     installation_store = SQLAlchemyInstallationStore(

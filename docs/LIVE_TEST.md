@@ -22,8 +22,13 @@ Budget ~15 minutes the first time.
 
 ## 1. Create the Slack app from the manifest
 
+> This guide is for **local Socket Mode** testing. Use the **dev** manifest
+> ([`manifest.dev.json`](../manifest.dev.json), Socket Mode **on**) — NOT the
+> hosted `manifest.json`, which has Socket Mode off and points at
+> `slack.faultmaven.ai`. Create a **separate** app for the hosted transport.
+
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From a manifest**.
-2. Pick the workspace, paste [`manifest.json`](../manifest.json), create.
+2. Pick the workspace, paste [`manifest.dev.json`](../manifest.dev.json), create.
 3. **Set the app icon** (the manifest can't carry it): *Basic Information* →
    *Display Information* → **App icon** → upload
    [`assets/slack-app-icon.png`](../assets/slack-app-icon.png) — the FaultMaven

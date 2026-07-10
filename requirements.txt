@@ -14,8 +14,11 @@ uvicorn[standard]==0.34.0
 
 # Backs the multi-workspace OAuth stores (per-team bot tokens + OAuth state)
 # via slack_sdk's SQLAlchemy{Installation,OAuthState}Store. One SLACK_DATABASE_URL
-# drives both — SQLite locally, Postgres in the cluster.
+# drives both — SQLite locally, Postgres in the cluster. psycopg2 is SQLAlchemy's
+# default driver for a `postgresql://` URL (the hosted config); without it the
+# first connection raises ModuleNotFoundError and the pod crashes at boot.
 sqlalchemy==2.0.51
+psycopg2-binary==2.9.10
 
 # Settings / validation
 pydantic==2.10.6

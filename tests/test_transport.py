@@ -57,9 +57,24 @@ def test_http_mode_valid_settings_construct(monkeypatch):
         SLACK_CLIENT_ID="123.456",
         SLACK_CLIENT_SECRET="secret",
         SLACK_SIGNING_SECRET="signsign",
+        SLACK_DATABASE_URL="postgresql://u:p@db/faultmaven_slack",
     )
     assert s.slack_transport == "http"
     assert s.slack_bot_token == ""  # no static bot token in OAuth mode
+
+
+def test_http_mode_requires_database_url(monkeypatch):
+    # No silent SQLite default in http mode: an unset URL must fail fast so
+    # per-team bot tokens can't land in ephemeral pod-local storage.
+    with pytest.raises(ValueError, match="SLACK_DATABASE_URL"):
+        _settings(
+            monkeypatch,
+            SLACK_TRANSPORT="http",
+            SLACK_CLIENT_ID="123.456",
+            SLACK_CLIENT_SECRET="secret",
+            SLACK_SIGNING_SECRET="signsign",
+            SLACK_DATABASE_URL="",
+        )
 
 
 def test_unknown_transport_is_rejected(monkeypatch):
@@ -75,19 +90,6 @@ def test_bot_token_shape_validated_when_present(monkeypatch):
             SLACK_BOT_TOKEN="not-a-token",
             SLACK_APP_TOKEN="xapp-x",
         )
-
-
-def test_default_oauth_db_url_is_repo_anchored_sqlite(monkeypatch):
-    s = _settings(
-        monkeypatch,
-        SLACK_TRANSPORT="http",
-        SLACK_CLIENT_ID="123.456",
-        SLACK_CLIENT_SECRET="secret",
-        SLACK_SIGNING_SECRET="signsign",
-        SLACK_DATABASE_URL="",
-    )
-    assert s.slack_database_url.startswith("sqlite:///")
-    assert s.slack_database_url.endswith("data/slack_oauth.db")
 
 
 def test_explicit_postgres_url_passes_through(monkeypatch):
@@ -132,6 +134,17 @@ def test_oauth_stores_create_tables_and_roundtrip(tmp_path):
     assert stores.state_store.consume(state) is True
     # A state is single-use — a replayed redirect must fail.
     assert stores.state_store.consume(state) is False
+
+
+def test_oauth_stores_create_missing_parent_dir(tmp_path):
+    from oauth_store import build_oauth_stores
+
+    # Parent dir does not exist yet — the store must create it (SQLite would
+    # otherwise raise "unable to open database file").
+    url = f"sqlite:///{tmp_path / 'nested' / 'sub' / 'oauth.db'}"
+    stores = build_oauth_stores(database_url=url, client_id="123.456")
+    assert (tmp_path / "nested" / "sub").is_dir()
+    stores.engine.dispose()
 
 
 # --- FastAPI app -------------------------------------------------------------
@@ -187,7 +200,9 @@ def test_unsigned_event_is_rejected(http_client):
 # --- transport selection in build_app ---------------------------------------
 
 
-def test_build_app_http_wires_oauth_flow(monkeypatch, tmp_path):
+def test_build_app_http_wires_oauth_flow_and_rate_limit_retry(monkeypatch, tmp_path):
+    from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
+
     monkeypatch.setenv("SLACK_TRANSPORT", "http")
     monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
     monkeypatch.setenv("SLACK_CLIENT_SECRET", "secret")
@@ -203,11 +218,28 @@ def test_build_app_http_wires_oauth_flow(monkeypatch, tmp_path):
         try:
             assert settings.slack_transport == "http"
             assert bolt_app.oauth_flow is not None
+            # The base client must carry the rate-limit retry handler, or the
+            # per-team clients Bolt derives from it drop replies on a 429.
+            assert any(
+                isinstance(h, RateLimitErrorRetryHandler)
+                for h in bolt_app.client.retry_handlers
+            )
         finally:
             store.close()
             fm.close()
     finally:
         config.get_settings.cache_clear()
+
+
+def test_uvicorn_log_level_maps_extra_names():
+    from web import _uvicorn_log_level
+
+    assert _uvicorn_log_level("INFO") == "info"
+    assert _uvicorn_log_level("WARNING") == "warning"
+    # Names config accepts but uvicorn does not must be remapped, never passed raw.
+    assert _uvicorn_log_level("WARN") == "warning"
+    assert _uvicorn_log_level("FATAL") == "critical"
+    assert _uvicorn_log_level("NOTSET") == "trace"
 
 
 def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):

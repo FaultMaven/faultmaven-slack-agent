@@ -72,7 +72,7 @@ def make_fault_client(settings: Settings) -> FaultMavenClient:
     )
 
 
-def make_web_client(token: str) -> WebClient:
+def make_web_client(token: str | None = None) -> WebClient:
     """A WebClient that retries rate limits, not just connection errors.
 
     slack_sdk installs only ``ConnectionErrorRetryHandler`` by default: every
@@ -80,6 +80,11 @@ def make_web_client(token: str) -> WebClient:
     reply across threads exceeds chat.postMessage's ~1 msg/sec/channel) would
     silently drop replies. ``RateLimitErrorRetryHandler`` honors Retry-After.
     Bolt copies these handlers onto its per-request clients.
+
+    In OAuth mode the base client carries **no token** (per-team tokens come
+    from the InstallationStore); it exists only so Bolt copies its retry
+    handlers onto every per-team client — without this, the hosted transport
+    would lose rate-limit retries entirely.
     """
 
     return WebClient(
@@ -92,10 +97,15 @@ def make_web_client(token: str) -> WebClient:
 
 
 def _build_core(settings: Settings) -> tuple[CaseStore, FaultMavenClient]:
-    """Build the transport-independent dependencies: FM client + case store."""
+    """Build the transport-independent dependencies: FM client + case store.
+
+    Does NOT call ``fm.startup()`` — the token bootstrap makes a (best-effort)
+    network call, which each transport runs at *startup* rather than at object
+    construction, so building the app never blocks on the backend (and, for
+    HTTP, never blocks before uvicorn binds the port).
+    """
 
     fm = make_fault_client(settings)
-    fm.startup()
 
     store = CaseStore(settings.case_store_path)
     # The store is the source of truth for thread→case; make its resolved
@@ -140,7 +150,11 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
     store, fm = _build_core(settings)
 
     if settings.slack_transport == "http":
+        # Pass a tokenless base client so Bolt copies its retry handlers onto
+        # the per-team clients it builds from InstallationStore tokens; the
+        # oauth_settings drive per-request authorization, not this client.
         app = App(
+            client=make_web_client(),
             signing_secret=settings.slack_signing_secret,
             oauth_settings=_oauth_settings(settings),
         )
@@ -212,11 +226,8 @@ def main() -> None:
         return
 
     app, store, fm, settings = build_app()
-    if not settings.slack_app_token:
-        raise SystemExit(
-            "SLACK_APP_TOKEN (xapp-...) is required for Socket Mode. "
-            "Create one with the connections:write scope."
-        )
+    # SLACK_APP_TOKEN presence is already enforced for socket mode by
+    # Settings._validate_transport_requirements, so no re-check here.
 
     # Python's default SIGTERM action kills the process without unwinding the
     # stack: `docker stop`/systemd would skip the finally below, abandoning
@@ -228,6 +239,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _sigterm)
 
     logger.info("FaultMaven Slack Agent starting (Socket Mode)")
+    fm.startup()  # best-effort token bootstrap, before the first event
     handler = SocketModeHandler(app, settings.slack_app_token)
     try:
         handler.connect()
