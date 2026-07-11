@@ -1,0 +1,162 @@
+name: Publish Docker Image
+
+# Publishes the Slack-agent image. The main-branch path runs only AFTER "CI"
+# succeeds (gates on the full lint + test + build). Version tags (v*.*.*) and
+# manual dispatch publish directly and do NOT run through CI — use them only for
+# commits already validated on main. Mirrors the faultmaven repo's
+# publish-docker.yml so this app plugs into the same CI → Queue → Promote → CD
+# pipeline (no kubectl in this repo; the image is deployed by
+# faultmaven-enterprise-infra via promote-images + cd-pipeline).
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+env:
+  REGISTRY_GHCR: ghcr.io
+  IMAGE_NAME: faultmaven-slack-agent
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Only when the triggering CI run passed (workflow_run), or a tag/manual run.
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log into GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Image digest
+        run: echo "Published image with digest ${{ steps.meta.outputs.digest }}"
+
+      # Cross-repo queue update via the faultmaven-infra-queue-bot GitHub App.
+      # This repo is PRIVATE, so the App ID/private key are stored REPO-LEVEL
+      # (GitHub Free does not expose org secrets to private repos) — same as
+      # faultmaven-cloud. Runs only on the canonical repo's main.
+      - name: Mint infra token (GitHub App)
+        id: infra-token
+        if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.INFRA_BOT_APP_ID }}
+          private-key: ${{ secrets.INFRA_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: faultmaven-enterprise-infra
+
+      - name: Note skipped queue update (fork)
+        if: github.ref == 'refs/heads/main' && github.repository != 'FaultMaven/faultmaven-slack-agent'
+        run: echo "::warning::Not the canonical repo — skipping enterprise-infra image queue update (expected on forks)."
+
+      - name: Checkout enterprise-infra
+        if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
+        uses: actions/checkout@v6
+        with:
+          repository: FaultMaven/faultmaven-enterprise-infra
+          ref: main
+          token: ${{ steps.infra-token.outputs.token }}
+          path: enterprise-infra
+
+      - name: Install yq
+        if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update image queue
+        if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
+        run: |
+          cd enterprise-infra
+          git config user.name "faultmaven-infra-queue-bot[bot]"
+          git config user.email "faultmaven-infra-queue-bot[bot]@users.noreply.github.com"
+
+          QUEUE_FILE="available-images/staging/faultmaven-slack-agent.yaml"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          TAG="sha-${SHA_SHORT}"
+
+          if [ ! -f "$QUEUE_FILE" ]; then
+            echo "::error::Queue file not found: $QUEUE_FILE — register the service in faultmaven-enterprise-infra first."
+            exit 1
+          fi
+
+          # Mutate only the changed fields (matches the faultmaven/dashboard
+          # publish workflows and ci-snippets/update-image-queue.yaml) so a future
+          # queue-schema field the infra repo adds is preserved, not overwritten.
+          apply_update() {
+            yq -i ".tag = \"${TAG}\"" "$QUEUE_FILE"
+            yq -i ".updated_at = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" "$QUEUE_FILE"
+            yq -i ".commit_sha = \"${GITHUB_SHA}\"" "$QUEUE_FILE"
+            git add "$QUEUE_FILE"
+          }
+          apply_update
+
+          if git diff --staged --quiet; then
+            echo "No changes to queue file"
+            exit 0
+          fi
+
+          git commit -m "chore(queue): update faultmaven-slack-agent image to ${TAG}
+
+          Built from: ${{ github.repository }}@${GITHUB_SHA}
+          Triggered by: @${{ github.actor }}
+          Workflow: ${{ github.workflow }}"
+
+          # Push with rebase-retry: several service repos push queue commits to
+          # enterprise-infra main, so a concurrent publish can move the branch out
+          # from under us. Bare push would fail non-fast-forward and silently strand
+          # the tag. (Mirrors ci-snippets/update-image-queue.yaml.)
+          for attempt in 1 2 3 4; do
+            if git push origin main; then
+              echo "✓ Updated image queue: ${TAG}"
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}/4); rebasing on latest main and retrying…"
+            git pull --rebase origin main
+            apply_update
+            git diff --cached --quiet || git commit --amend --no-edit
+            sleep $((attempt * 2))
+          done
+
+          echo "::error::Failed to push queue update after 4 attempts"
+          exit 1

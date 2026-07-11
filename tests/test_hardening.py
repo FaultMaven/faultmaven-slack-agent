@@ -7,8 +7,6 @@ Block Kit limit handling, typed backend errors (404 eviction / preset-token
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -22,7 +20,7 @@ from faultmaven.client import TurnResult
 from listeners import _turn
 from listeners.events import is_thread_followup_candidate
 from rendering import _chunk, build_turn_blocks
-from slack_mrkdwn import escape_mrkdwn, to_mrkdwn
+from slack_mrkdwn import to_mrkdwn
 from store import CaseStore
 
 
@@ -126,7 +124,9 @@ def _client(handler, *, token: str = "", dev: str = "") -> FaultMavenClient:
 
 
 def test_submit_turn_404_raises_case_not_found_with_detail():
-    handler = lambda req: httpx.Response(404, json={"detail": "Case not found"})
+    def handler(req):
+        return httpx.Response(404, json={"detail": "Case not found"})
+
     client = _client(handler, token="tok")
     with pytest.raises(CaseNotFoundError) as err:
         client.submit_turn("dead", query="hi")
@@ -135,9 +135,9 @@ def test_submit_turn_404_raises_case_not_found_with_detail():
 
 
 def test_submit_turn_4xx_carries_backend_detail():
-    handler = lambda req: httpx.Response(
-        400, json={"detail": "file type not allowed"}
-    )
+    def handler(req):
+        return httpx.Response(400, json={"detail": "file type not allowed"})
+
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
         client.submit_turn("c1", query="hi")
