@@ -4,10 +4,10 @@ Two transports share one set of listeners (the turn pipeline is transport-blind:
 every listener uses Bolt's per-request ``client`` and ``context.team_id``, never
 a captured global token):
 
-* **HTTP/OAuth** (``SLACK_TRANSPORT=http``) — the hosted, submission transport.
+* **HTTP/OAuth** (``SLACK_TRANSPORT=http``) — the hosted, production transport.
   Multi-workspace OAuth (``/slack/install`` → ``/slack/oauth_redirect``) with a
   per-team ``InstallationStore``; served over HTTP by :mod:`web`. This is what
-  makes the app installable into 5+ workspaces and Marketplace-eligible
+  makes the app installable into many workspaces and Marketplace-eligible
   (``docs/design.md`` §10, §16 P5).
 * **Socket Mode** (``SLACK_TRANSPORT=socket``) — local development against a
   single dev app; no public URL, not multi-workspace. Runs from :func:`main`.

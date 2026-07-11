@@ -1,6 +1,6 @@
 """HTTP/OAuth transport — the FastAPI server hosting the Slack request handler.
 
-This is the submission transport (``docs/design.md`` §10, §16 P5). It exposes:
+This is the production transport (``docs/design.md`` §10, §16 P5). It exposes:
 
 * ``POST /slack/events``        — event + interactivity callbacks (Bolt verifies
                                   the signing secret and replay timestamp).
