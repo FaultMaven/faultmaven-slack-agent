@@ -1,0 +1,5 @@
+# Lint config for the FaultMaven Slack agent. Pinned so CI (`ruff check .`) is
+# deterministic across ruff releases. Default rule set (E4/E7/E9 + F) — the
+# high-signal correctness/pyflakes checks — is sufficient here.
+target-version = "py312"
+line-length = 100
