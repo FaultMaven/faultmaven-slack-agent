@@ -14,27 +14,26 @@ the AI side panel — with full feature parity to the
 [FaultMaven Copilot browser extension](https://github.com/FaultMaven/faultmaven-copilot),
 backed by the existing **FaultMaven core API** (`faultmaven`).
 
-Two requirements drive every decision, and they are **complementary, not in
-tension**:
+Two goals drive every decision, and they are **complementary, not in tension**:
 
 1. **Business value** — deliver Copilot-grade troubleshooting (turn-based
    investigations, evidence capture, hypotheses, suggested actions, knowledge
    grounding, reports) using the FaultMaven API server as the backend.
-2. **Challenge fit** — meet the
-   [Slack Agent Builder Challenge](https://slackhack.devpost.com/) (deadline
-   **2026-07-13**), judged on Technological Implementation, Design/UX, Impact,
-   and Idea quality.
+2. **A trustworthy, Slack-native experience** — a multi-workspace,
+   publicly-installable (App Directory-eligible) agent built on Slack's own
+   AI-App capabilities, so it feels native rather than bolted-on and enterprises
+   can adopt it with confidence.
 
 ### Decisions locked
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives the challenge rewards; the skeleton uses none of them. |
+| Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives that make the agent feel native; the skeleton uses none of them. |
 | Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` (+ auto-continue) + the **Ask** message shortcut | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
 | Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
 | Case scoping & lifecycle | **Thread-scoped collaborative cases under the org**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
-| Deploy / auth | **Cloud OAuth, multi-workspace** → "Agent for Organizations" track | Slack workspace ↔ FaultMaven organization; per-user FaultMaven account linking. |
+| Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ FaultMaven organization; per-user FaultMaven account linking. |
 | Privacy posture | **Subscribe-and-gate** — `message.channels`/`message.groups` for in-thread continuity, but act only on already-owned threads (never ambient) | Same enterprise-trust "no firehose" guarantee as strict mention-only, with the in-thread UX; ownership gate does the filtering. |
 | Backend integration | **FaultMaven REST** (`/cases`, `/cases/{id}/turns`, `/reports`, `/knowledge`) | Carries the case state machine, evidence pipeline, and milestones. |
 
@@ -107,8 +106,7 @@ uniquely great at.
 ## 2. Why re-create the skeleton
 
 The existing skeleton is a competent raw-FastAPI webhook service, but it was
-built against a model that the challenge and the business requirement have since
-moved past:
+built against a model that the product design has since moved past:
 
 | Current skeleton | This design |
 |---|---|
@@ -131,9 +129,9 @@ doesn't already cover them.
 
 ## 3. Architecture
 
-> **Rendered diagram:** [`docs/architecture.png`](architecture.png) is the
-> Devpost submission asset (regenerate via `python3 docs/architecture_diagram.py`).
-> The ASCII sketch below is the same system in text.
+> **Rendered diagram:** [`docs/architecture.png`](architecture.png) (regenerate
+> via `python3 docs/architecture_diagram.py`). The ASCII sketch below is the same
+> system in text.
 
 ```text
                          Slack Workspace (per-tenant install)
@@ -735,26 +733,27 @@ only any replay/observability extras Bolt doesn't already give us.
 
 ---
 
-## 13. Challenge submission alignment
+## 13. Positioning
 
-| Judging criterion | How we score |
-|---|---|
-| **Technological Implementation** | Full Slack AI-App stack (Assistant container, streaming `chat_stream` task/plan timeline, `set_status`, feedback) over a real multi-provider RAG investigation engine; multi-workspace OAuth with clean tenant isolation; (optional) live SSE tool-use streaming. |
-| **Design / UX** | The reasoning timeline turns opaque AI into a watchable diagnosis; suggested-action buttons make next steps one click; summon-then-auto-continue keeps channels quiet while a thread reads as an ordered Q&A (drop-if-busy + replier `@mention`). |
-| **Potential Impact** | Faster MTTR where incidents already live; the knowledge flywheel — every resolved case becomes a reusable runbook (the lifecycle drivers in §6.2 are what make it actually turn); honest "name the missing data" behavior builds trust. |
-| **Quality of Idea** | A human-in-the-loop, deliberately-invoked copilot (not an autopilot, not an ambient chatbot) with explicit soundness guarantees and a privacy-first posture — differentiated from alerting bots. |
+What differentiates FaultMaven-for-Slack from alerting bots and generic chat
+assistants:
 
-**Track:** *Slack Agent for Organizations* (multi-workspace OAuth).
-**Deliverables checklist:** ~3-min demo video, this architecture diagram (§3),
-a developer **sandbox URL granting `slackhack@salesforce.com` and
-`testing@devpost.com`**, and the Slack App ID if pursuing Marketplace.
-
-**Demo script (3 min):** (1) `@FaultMaven` a failing-service thread with a pasted
-stack trace → watch the reasoning timeline form hypotheses and request a log;
-(2) drag in a log file → hypothesis validates, root cause identified;
-(3) click **Generate runbook** → resolution summary + reusable runbook posted;
-(4) open the Assistant side panel for the same flow 1:1, and deep-link to the
-Dashboard for the case portfolio.
+- **A real investigation, not a Q&A bot.** A full Slack AI-App experience
+  (Assistant container, `chat_stream` reasoning timeline, `set_status`, feedback)
+  over a multi-provider RAG investigation engine — it forms hypotheses, requests
+  the specific evidence that confirms or rules each out, and drives to a verified
+  root cause.
+- **UX that makes AI watchable.** The reasoning timeline turns opaque AI into a
+  diagnosis you can follow; suggested-action buttons make the next step one click;
+  summon-then-auto-continue keeps channels quiet while a thread reads as an
+  ordered Q&A (drop-if-busy + replier `@mention`).
+- **Impact that compounds.** Faster resolution where incidents already live, plus
+  the knowledge flywheel — every resolved case can become a reusable runbook (the
+  lifecycle drivers in §6.2 are what make it actually turn).
+- **Trustworthy by construction.** A human-in-the-loop, deliberately-invoked
+  copilot (not an autopilot, not an ambient chatbot) with explicit soundness
+  guarantees and a privacy-first posture — it names the missing data rather than
+  fabricating an answer.
 
 ---
 
@@ -770,9 +769,8 @@ Dashboard for the case portfolio.
   ping-only posture and overlaps FaultMaven's own RAG over its curated KB.
   **Deferred** until the privacy trade-off is explicitly reviewed.
 
-Anchoring on **Slack AI capabilities** alone satisfies the challenge's
-"at least one technology" rule while keeping the design optimal for the business
-requirement.
+Anchoring on **Slack AI capabilities** keeps the design optimal for the business
+requirement without widening the privacy surface.
 
 ---
 
@@ -820,6 +818,6 @@ requirement.
 6. **P5 — Multi-tenant OAuth hardening + war-room entry.** Per-user account
    linking + refresh; workspace→org binding; war-room fallback; `not_in_channel`;
    the `@mention` catch-up read (the one history-scope feature, §5.2).
-7. **P6 — Submission polish.** Demo video, sandbox grants, architecture diagram,
-   README/setup.
+7. **P6 — Launch polish.** Architecture diagram, README/setup, product
+   walkthrough.
 ```

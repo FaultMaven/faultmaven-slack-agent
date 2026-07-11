@@ -1,4 +1,4 @@
-"""Interactive suggested-action buttons — encoding + submission (P2)."""
+"""Interactive suggested-action buttons — encoding + submission."""
 
 from __future__ import annotations
 

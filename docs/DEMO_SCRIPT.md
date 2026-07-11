@@ -1,14 +1,12 @@
-# 3-minute demo — script & shot-list
+# Product demo — script & shot-list
 
-The Devpost submission video for the Slack Agent Builder Challenge. Target **≤ 3:00**.
-The flagship flow: **an alert fires → FaultMaven investigates in the thread →
-root cause + verified fix → the fix becomes a runbook.** One capability shown
-excellently.
+A short (**≤ 3:00**) product demo of the flagship flow: **an alert fires →
+FaultMaven investigates in the thread → root cause + verified fix → the fix
+becomes a runbook.** One capability shown excellently.
 
-**Judging constraints baked in** (organizer guidance): lead with the *pain
-point* in the first 60 seconds, keep the demo front-and-center, tight and
-rehearsed, and publish a link you've verified in an incognito window ≥ 24 h
-before the deadline (**2026-07-13 5:00 PM PT**).
+**Best practices baked in:** lead with the *pain point* in the first 60 seconds,
+keep the demo front-and-center, keep it tight and rehearsed, and verify the
+final public link in an incognito window before sharing.
 
 ---
 
@@ -33,8 +31,8 @@ timing.
 
 ## The script (voiceover + on-screen)
 
-Times are targets. Voiceover (VO) is a guide — say it in your own voice; judges
-flag AI-boilerplate narration.
+Times are targets. Voiceover (VO) is a guide — say it in your own voice; viewers
+notice AI-boilerplate narration.
 
 ### 0:00 – 0:20 · Cold open — the pain
 > **VO:** "When production breaks, the war room is a Slack thread. But the actual
@@ -115,7 +113,6 @@ runbook, all in one place. End card: **FaultMaven for Slack** + the tagline.
 
 - [ ] Runtime **≤ 3:00**; the pain point lands in the **first 60 s**.
 - [ ] The demo is front-and-center (minimal slides; show the product).
-- [ ] 1080p, legible text, captions/subtitles on (many judges watch muted).
+- [ ] 1080p, legible text, captions/subtitles on (many viewers watch muted).
 - [ ] Uploaded to a **public** link; **verified in an incognito window**.
-- [ ] Published **≥ 24 h before** 2026-07-13 5:00 PM PT.
 - [ ] Title avoids generic AI naming; leads with **FaultMaven for Slack**.

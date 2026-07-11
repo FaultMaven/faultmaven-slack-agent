@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the FaultMaven-for-Slack architecture diagram (Devpost submission asset).
+"""Render the FaultMaven-for-Slack architecture diagram.
 
 Produces docs/architecture.png (and .svg). Hand-laid with matplotlib so the layout
 matches the shipped agent exactly — see docs/design.md §3. Re-run after arch changes:

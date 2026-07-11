@@ -5,8 +5,6 @@ right in the thread (or the AI side panel), grounded in your runbooks, telemetry
 and past fixes. Built on **Bolt for Python**'s Assistant container, backed by the
 FaultMaven core API.
 
-Built for the **Slack Agent Builder Challenge**.
-
 > Full architecture, feature design, backend contract, and roadmap:
 > [docs/design.md](docs/design.md).
 
@@ -79,7 +77,7 @@ Two manifests, two transports:
 
 - **Hosted / production** — [`manifest.json`](manifest.json): HTTP/Events +
   multi-workspace OAuth (`socket_mode_enabled: false`, request/redirect URLs on
-  `slack.faultmaven.ai`). This is the Marketplace-eligible submission app. Deploy
+  `slack.faultmaven.ai`). This is the Marketplace-eligible production app. Deploy
   guide: [docs/HOSTING.md](docs/HOSTING.md).
 - **Local dev** — [`manifest.dev.json`](manifest.dev.json): Socket Mode on, no
   public URL. Fastest path to a real test. Walkthrough:

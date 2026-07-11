@@ -1,6 +1,6 @@
 # Hosting the FaultMaven Slack Agent (HTTP/OAuth transport)
 
-This is the **submission / production** transport: a publicly-hosted HTTP server
+This is the **production** transport: a publicly-hosted HTTP server
 with multi-workspace OAuth, so the app installs into many workspaces and is
 Slack Marketplace-eligible. (Socket Mode — `SLACK_TRANSPORT=socket` — remains the
 local-dev path against a **separate** dev app; it can never satisfy the *Agents

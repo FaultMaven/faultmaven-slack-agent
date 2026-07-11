@@ -1,20 +1,19 @@
 # FaultMaven for Slack — product description
 
 Canonical product copy for the FaultMaven Slack agent. Reuse these across the
-Devpost submission, the App Directory listing, the repo README, and the website —
-same facts and positioning everywhere, each surface in its own voice
-(per the `brand-messaging` skill: consistent, aligned, corroborative — never the
-same sentence twice).
+App Directory listing, the repo README, and the website — same facts and
+positioning everywhere, each surface in its own voice (per the `brand-messaging`
+skill: consistent, aligned, corroborative — never the same sentence twice).
 
-**Voice note for Sterling:** the longer pieces are drafted for *you to voice and
-finalize* — judges flag AI boilerplate, so read them aloud and make them sound
-like you. Everything here is factually true against the shipped agent; the one
-place a real number would land is marked **⟨IMPACT⟩** — see the note at the
-bottom before you fill it.
+**Voice note:** the longer pieces are drafted to be *voiced and finalized* —
+read them aloud and make them sound human, since readers spot AI boilerplate.
+Everything here is factually true against the shipped agent; the one place a
+real number would land is marked **⟨IMPACT⟩** — see the note at the bottom
+before filling it.
 
 ---
 
-## 1. Tagline (one line — Devpost title/subtitle, hero)
+## 1. Tagline (one line — hero / title)
 
 > **Run the whole investigation in the thread where the incident already lives.**
 
@@ -39,10 +38,10 @@ This is the shipped `manifest.json` `description` — keep it in sync:
 > evidence you give it, draws on your runbooks and past fixes, and shows its work
 > at every step — you approve and execute, so it never acts on its own.
 
-## 4. Full description (Devpost "About the project" / long App Directory blurb)
+## 4. Full description (long App Directory blurb / website "about")
 
-*Draft for Sterling to voice. First paragraph leads with the pain point and
-answers what / who / why-it-matters, per the organizer's guidance.*
+*Draft to voice. First paragraph leads with the pain point and answers
+what / who / why-it-matters.*
 
 ---
 
@@ -121,8 +120,7 @@ Verifiable, on-message facts — pull from these, don't invent:
   auto-continue; one turn per thread (a second message before it replies is
   marked ⏭️ — resend after).
 - **Privacy posture:** strict summon-only; acts only on threads it owns; no
-  `message.channels` firehose. An enterprise-trust strength — relevant to the
-  "Agent for Organizations" framing.
+  `message.channels` firehose. An enterprise-trust strength.
 - **Behavior guarantees:** goal-driven, methodical, evidence-based, self-learning
   (the four traits). Will not render a premature/fabricated resolution while the
   case is still investigating.
@@ -148,19 +146,19 @@ Slack agent "FaultMaven Copilot."
 
 ## ⟨IMPACT⟩ — the one number to add
 
-The organizer's rubric asks the first paragraph to carry a **specific impact
-number**, and judges reward it. I deliberately did **not** invent one — FaultMaven
-is built on a no-incorrect-conclusion guarantee, and a made-up "cuts MTTR 40%"
-would undercut exactly the credibility the product sells on.
+A **specific impact number** in the first paragraph makes the opener land. One
+was deliberately **not** invented — FaultMaven is built on a no-incorrect-conclusion
+guarantee, and a made-up "cuts MTTR 40%" would undercut exactly the credibility
+the product sells on.
 
-If you have a **real** figure from your own use, it's the single
-highest-leverage edit here. Good candidates, in order of impact:
+A **real** figure from actual use is the single highest-leverage edit here. Good
+candidates, in order of impact:
 1. A before/after time from a real investigation you ran through the agent
    ("root-caused a p99 regression in one thread in ~8 minutes").
 2. A knowledge-flywheel number (runbooks in the KB the agent draws on; cases
    turned into runbooks).
 3. A concrete scope number that's true today (surfaces, providers, KB size).
 
-Drop it where the ⟨IMPACT⟩ marker sits and delete the marker. If you don't have
-a defensible number yet, the paragraph stands on its own without one — an
-honest, specific pain-point beats a fabricated statistic with these judges.
+Drop it where the ⟨IMPACT⟩ marker sits and delete the marker. If there's no
+defensible number yet, the paragraph stands on its own without one — an honest,
+specific pain-point beats a fabricated statistic.

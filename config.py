@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     )
 
     # --- Transport ---------------------------------------------------------
-    # "http"   → HTTP/Events + multi-workspace OAuth (the hosted, submission
+    # "http"   → HTTP/Events + multi-workspace OAuth (the hosted, production
     #            transport; installs into many workspaces, Marketplace-eligible).
     # "socket" → Socket Mode against a single dev app (local development only;
     #            no public URL, not multi-workspace).

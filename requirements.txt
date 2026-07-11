@@ -2,8 +2,8 @@
 
 # Slack Bolt for Python — Assistant/AI-App container, event routing, signature
 # verification, retry de-dup. Drives both transports: Socket Mode (local dev)
-# and the HTTP/Events + multi-workspace OAuth transport (hosted, the submission
-# target — docs/design.md §10, §16 P5).
+# and the HTTP/Events + multi-workspace OAuth transport (hosted, the production
+# transport — docs/design.md §10, §16 P5).
 slack-bolt==1.28.0
 slack-sdk==3.42.0
 
