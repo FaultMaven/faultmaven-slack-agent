@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
+
 from faultmaven.client import TurnResult
 from rendering import build_turn_blocks, clean_mention
 
 
 def _sections(blocks) -> list[str]:
     return [b["text"]["text"] for b in blocks if b["type"] == "section"]
+
+
+def _buttons(blocks) -> list[dict]:
+    out: list[dict] = []
+    for b in blocks:
+        if b["type"] == "actions":
+            out.extend(b["elements"])
+    return out
 
 
 def _context_texts(blocks) -> list[str]:
@@ -128,3 +138,93 @@ def test_context_shows_state_and_turn():
     ctx = _context_texts(build_turn_blocks(result))
     assert any("inquiry" in t for t in ctx)
     assert any("Turn 3" in t for t in ctx)
+
+
+# -- DECIDE suggestions: clickable + legible ---------------------------------
+def test_payload_only_decide_becomes_button_carrying_payload():
+    # File-classification clarifications carry a `payload` but NO `intent`. They
+    # must be clickable (a click submits the payload verbatim), not degrade to a
+    # cryptic "Decision: Documentation" text bullet.
+    result = TurnResult(
+        agent_response="I couldn't confidently classify the file you uploaded.",
+        case_state="investigating",
+        suggested_actions=[
+            {"type": "DECIDE", "label": "Documentation",
+             "payload": "Treat the file as documentation or notes and analyze it.",
+             "body": "Treat as documentation or notes."},
+            {"type": "DECIDE", "label": "Something else",
+             "payload": "Treat the file as unstructured text and try to analyze it.",
+             "body": "Treat as unstructured text."},
+            {"type": "RUN", "payload": "kubectl get pods"},
+        ],
+    )
+    blocks = build_turn_blocks(result)
+    buttons = _buttons(blocks)
+
+    labels = [b["text"]["text"] for b in buttons]
+    assert "Documentation" in labels and "Something else" in labels
+    for b in buttons:
+        value = json.loads(b["value"])
+        assert value["q"].startswith("Treat the file as")  # payload, not label
+        assert "it" not in value  # no intent → query-only submission
+        assert b["style"] == "primary"
+
+    # The fuller `body` rides in a description line so the choice reads with its
+    # meaning (Copilot renders `label — body`); the old bare-label bullet dropped it.
+    joined = "\n".join(_sections(blocks))
+    assert "Treat as documentation or notes." in joined
+    assert "Treat as unstructured text." in joined
+    assert "Decision: Documentation" not in joined  # confusing prefix is gone
+
+    # RUN stays text, never a button.
+    assert "kubectl get pods" in joined
+    assert all("kubectl" not in b["text"]["text"] for b in buttons)
+
+
+def test_intent_bearing_decide_button_still_carries_intent():
+    # A state-machine gate keeps replaying its intent verbatim (user_confirmed).
+    result = TurnResult(
+        agent_response="Looks resolved.",
+        case_state="investigating",
+        suggested_actions=[{
+            "type": "DECIDE", "label": "Yes, mark resolved",
+            "payload": "Mark this case resolved.",
+            "intent": {"type": "status_transition", "to_state": "resolved"},
+        }],
+    )
+    buttons = _buttons(build_turn_blocks(result))
+    assert len(buttons) == 1
+    value = json.loads(buttons[0]["value"])
+    assert value["q"] == "Mark this case resolved."
+    assert value["it"] == "status_transition"
+    assert value["id"]["to_state"] == "resolved"
+    assert value["id"]["user_confirmed"] is True
+
+
+def test_bodyless_decide_button_has_no_redundant_description():
+    # A confirmation gate ("Close case") with no `body` needs no description line
+    # — the button label says it all; only body-bearing choices get a line.
+    result = TurnResult(
+        agent_response="Looks resolved.",
+        suggested_actions=[{
+            "type": "DECIDE", "label": "Close case",
+            "payload": "Close this case.",
+            "intent": {"type": "confirmation", "confirmation_value": True},
+        }],
+    )
+    blocks = build_turn_blocks(result)
+    assert len(_buttons(blocks)) == 1
+    assert "Suggested next steps" not in "\n".join(_sections(blocks))
+
+
+def test_unsubmittable_decide_stays_text_not_button():
+    # A bare label with neither payload nor intent has nothing to submit — it must
+    # not become a button (that would send the label as a stray query); it stays
+    # a visible text line (preserves test_no_evidence_means_no_needs_section).
+    result = TurnResult(
+        agent_response="done",
+        suggested_actions=[{"type": "DECIDE", "label": "close the case"}],
+    )
+    blocks = build_turn_blocks(result)
+    assert _buttons(blocks) == []
+    assert "close the case" in "\n".join(_sections(blocks))

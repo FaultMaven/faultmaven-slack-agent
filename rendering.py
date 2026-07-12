@@ -125,11 +125,16 @@ def _format_evidence(action: dict[str, Any]) -> str:
 
 
 def _format_action(action: dict[str, Any]) -> str:
-    """Render a non-clickable suggested action as an mrkdwn bullet, by type.
+    """Render a suggested action as an mrkdwn bullet, by type.
 
     RUN → a copy-run command in a code span (never rewritten as mrkdwn).
     FREE_SPEECH → a prompt to answer in your own words (a hint, not a command).
-    DECIDE here is the fallback for a DECIDE the button path couldn't encode.
+    DECIDE → the choice, described. Its terse ``label`` ("Documentation") is only
+    a chip; the fuller ``body`` ("Treat as documentation or notes.") is what makes
+    the choice legible, so it rides after an em dash — matching the Copilot, which
+    renders ``label — body``. A DECIDE with a submittable ``payload``/``intent``
+    also renders as a button (§_action_value); this line is its description, and
+    the sole rendering for a DECIDE the button path can't encode.
     """
 
     a_type = (action.get("type") or action.get("action_type") or "").upper()
@@ -144,8 +149,11 @@ def _format_action(action: dict[str, Any]) -> str:
             command = command[: _COMMAND_LIMIT - 1] + "…"
         return f"• *Run:* `{command}`"  # command stays literal in the code span
     label = to_mrkdwn(_action_label(action))
+    body = action.get("body")
     if a_type == "DECIDE":
-        return f"• :white_check_mark: *Decision:* {label}"
+        if body:
+            return f"• :white_check_mark: *{label}* — {to_mrkdwn(str(body))}"
+        return f"• :white_check_mark: *{label}*"
     # FREE_SPEECH (or any other non-clickable) — a "tell me in your own words" prompt.
     return f"• :speech_balloon: {label}"
 
@@ -153,13 +161,24 @@ def _format_action(action: dict[str, Any]) -> str:
 def _action_value(action: dict[str, Any]) -> str | None:
     """Encode a submittable button value, or None if the action isn't clickable.
 
-    **Only DECIDE is a button.** Clicking it sends the pre-composed decision to
-    the backend verbatim (its ``intent`` replayed, flagged ``user_confirmed``).
-    RUN (a command to copy-run locally), FREE_SPEECH (a prompt to answer in your
-    own words), and EVIDENCE are **not** submittable — making them clickable
-    would send fixed text the engine can't act on. ``evidence_need`` intents are
-    also non-submittable (NOT_IMPLEMENTED server-side); oversized values fall
-    back to text rather than truncate.
+    **Only DECIDE is a button**, and it is clickable whenever it carries
+    something to submit — a ``payload`` (the exact message a click sends) or an
+    ``intent`` (a routable gate). Two DECIDE shapes exist and *both* are buttons:
+
+    * **Intent-bearing** — state-machine gates (resolution/close confirmations,
+      disposition transitions). The ``intent`` is replayed verbatim, flagged
+      ``user_confirmed``, so the engine routes it deterministically.
+    * **Payload-only** — file-classification clarifications, runbook, and
+      regenerate-summary. These carry *no* ``intent`` (engine-owned intent is
+      attached only for gates); a click submits the ``payload`` text as a plain
+      query, exactly as the Copilot does. Requiring an intent here (the old rule)
+      stranded this whole family as un-clickable "Decision: …" bullets.
+
+    RUN (copy-run locally), FREE_SPEECH (answer in your own words), and EVIDENCE
+    are **not** submittable, and a bare DECIDE with neither payload nor intent has
+    nothing to send — all fall back to text. ``evidence_need`` intents are also
+    non-submittable (NOT_IMPLEMENTED server-side); oversized values fall back to
+    text rather than truncate.
     """
 
     a_type = (action.get("type") or action.get("action_type") or "").upper()
@@ -167,13 +186,17 @@ def _action_value(action: dict[str, Any]) -> str | None:
         return None
     intent = action.get("intent") or {}
     intent_type = intent.get("type")
-    if not intent_type or intent_type == "evidence_need":
+    if intent_type == "evidence_need":
         return None
-    value = {
-        "q": action.get("payload") or _action_label(action),
-        "it": intent_type,
-        "id": {**intent, "user_confirmed": True},
-    }
+    payload = action.get("payload")
+    # Nothing to submit → not a button (e.g. a label-only DECIDE); render as text.
+    if not payload and not intent_type:
+        return None
+    query = payload or _action_label(action)
+    value: dict[str, Any] = {"q": query}
+    if intent_type:
+        value["it"] = intent_type
+        value["id"] = {**intent, "user_confirmed": True}
     encoded = json.dumps(value)
     return encoded if len(encoded) <= _BUTTON_VALUE_LIMIT else None
 
@@ -241,6 +264,13 @@ def build_turn_blocks(
         button = _make_button(action) if len(buttons) < _MAX_BUTTONS else None
         if button is not None:
             buttons.append(button)
+            # A button face shows only the terse label ("Something else"); when
+            # the action carries a fuller ``body``, also describe it in the step
+            # list so the choice reads with its meaning, not as a bare chip. A
+            # body-less DECIDE (a confirmation gate — "Close case") needs no line;
+            # the button label says it all.
+            if action.get("body"):
+                text_actions.append(action)
         else:
             text_actions.append(action)
 
