@@ -22,6 +22,15 @@ _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 # Case states in which the investigation has concluded.
 _TERMINAL_STATES = {"resolved", "closed"}
 
+# Read-time cause-assurance labels (#572 / INV-28). The cause claim lives in the
+# LLM's free-text ``agent_response``, outside every engine truth surface; the
+# grade is the graph-derived truth. Only the held-back grades are labeled —
+# ``confirmed`` (counterfactually verified) needs no qualifier, so it is absent.
+_ASSURANCE_LABELS = {
+    "mechanistic": "Cause assurance: mechanistic — identified from evidence, not yet counterfactually confirmed",
+    "no_root": "Cause assurance: unvalidated — stated by the assistant, not validated in the causal analysis",
+}
+
 # action_id prefix for suggested-action buttons. Each button gets a unique
 # "<prefix>:<index>" id (Slack requires action_ids be unique within a message);
 # the interactions handler matches the prefix via SUGGESTED_ACTION_PATTERN.
@@ -305,6 +314,11 @@ def build_turn_blocks(
         context.append(
             {"type": "mrkdwn", "text": f"State: `{result.case_state}`"}
         )
+    assurance_label = _ASSURANCE_LABELS.get(result.cause_assurance or "")
+    if assurance_label:
+        if result.cause_overclaim:
+            assurance_label += " ⚠ (stated more certainly than the evidence supports)"
+        context.append({"type": "mrkdwn", "text": assurance_label})
     if result.turn_number is not None:
         context.append({"type": "mrkdwn", "text": f"Turn {result.turn_number}"})
     if evidence and not terminal:
