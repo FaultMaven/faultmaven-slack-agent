@@ -228,3 +228,53 @@ def test_unsubmittable_decide_stays_text_not_button():
     blocks = build_turn_blocks(result)
     assert _buttons(blocks) == []
     assert "close the case" in "\n".join(_sections(blocks))
+
+
+def test_assurance_grade_labeled_in_context():
+    # A held-back grade is surfaced beside the narration so the cause claim in
+    # agent_response is never forwarded without its read-time label (#572/INV-28).
+    result = TurnResult(
+        agent_response="The root cause is connection pool exhaustion.",
+        case_state="resolved",
+        cause_assurance="mechanistic",
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert any("mechanistic" in t for t in ctx)
+
+
+def test_assurance_label_suppressed_pre_terminal():
+    # An RCC minted mid-investigation must NOT repeat its qualifier on every
+    # non-terminal turn — the label rides only the terminal disposition.
+    result = TurnResult(
+        agent_response="A likely cause is connection pool exhaustion.",
+        case_state="investigating",
+        cause_assurance="no_root",
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert not any("assurance" in t.lower() for t in ctx)
+
+
+def test_confirmed_grade_needs_no_label():
+    # The clean top grade carries no qualifier — no assurance context element.
+    result = TurnResult(
+        agent_response="resolved", case_state="resolved", cause_assurance="confirmed"
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert not any("assurance" in t.lower() for t in ctx)
+
+
+def test_no_grade_adds_no_assurance_label():
+    result = TurnResult(agent_response="still investigating", case_state="investigating")
+    ctx = _context_texts(build_turn_blocks(result))
+    assert not any("assurance" in t.lower() for t in ctx)
+
+
+def test_overclaim_adds_caution_marker():
+    result = TurnResult(
+        agent_response="The root cause is definitely X.",
+        case_state="resolved",
+        cause_assurance="mechanistic",
+        cause_overclaim=True,
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert any("mechanistic" in t and "⚠" in t for t in ctx)

@@ -98,6 +98,13 @@ class TurnResult:
     progress_made: bool = False
     milestones_completed: list[str] = field(default_factory=list)
     suggested_actions: list[dict[str, Any]] = field(default_factory=list)
+    # Engine-derived assurance grade behind the case's identified cause
+    # (no_root | mechanistic | confirmed). Present whenever a cause has been
+    # stated. The narration in ``agent_response`` may voice that cause with
+    # more certainty than it holds; this is the #572/INV-28 read-time label the
+    # renderer places beside it so Slack never forwards the claim bare.
+    cause_assurance: str | None = None
+    cause_overclaim: bool | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -557,6 +564,12 @@ class FaultMavenClient:
             # displayable text, not TypeError deep inside a render/fallback
             # path where it would strand the thread's placeholder.
             response = json.dumps(response, default=str)
+        cause_assurance = body.get("cause_assurance")
+        if not isinstance(cause_assurance, str):
+            cause_assurance = None
+        cause_overclaim = body.get("cause_overclaim")
+        if not isinstance(cause_overclaim, bool):
+            cause_overclaim = None
         return TurnResult(
             agent_response=response,
             case_state=body.get("case_state"),
@@ -564,5 +577,7 @@ class FaultMavenClient:
             progress_made=bool(body.get("progress_made", False)),
             milestones_completed=_as_list(body.get("milestones_completed")),
             suggested_actions=_as_list(body.get("suggested_actions")),
+            cause_assurance=cause_assurance,
+            cause_overclaim=cause_overclaim,
             raw=body,
         )

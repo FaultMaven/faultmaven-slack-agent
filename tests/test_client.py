@@ -381,3 +381,30 @@ def test_parse_turn_defaults_for_empty_body():
     result = FaultMavenClient._parse_turn({})
     assert result.agent_response  # non-empty fallback string
     assert result.milestones_completed == [] and result.suggested_actions == []
+    # No cause stated → nothing to label.
+    assert result.cause_assurance is None and result.cause_overclaim is None
+
+
+def test_parse_turn_reads_cause_assurance():
+    """The read-time assurance grade rides the turn body so the renderer can
+    label the cause claim in agent_response (#572/INV-28)."""
+
+    result = FaultMavenClient._parse_turn(
+        {
+            "agent_response": "The root cause is a connection pool exhaustion.",
+            "case_state": "resolved",
+            "cause_assurance": "mechanistic",
+            "cause_overclaim": True,
+        }
+    )
+    assert result.cause_assurance == "mechanistic"
+    assert result.cause_overclaim is True
+
+
+def test_parse_turn_tolerates_non_scalar_cause_fields():
+    # Schema drift must degrade to None, never crash the render path.
+    result = FaultMavenClient._parse_turn(
+        {"agent_response": "a", "cause_assurance": {"x": 1}, "cause_overclaim": "yes"}
+    )
+    assert result.cause_assurance is None
+    assert result.cause_overclaim is None
