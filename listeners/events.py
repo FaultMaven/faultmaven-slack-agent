@@ -228,11 +228,14 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 # opening a blank case (mirrors the Assistant surface).
                 query = resolve_query(text or None, downloaded_files=bool(files))
                 if query is None:
-                    client.chat_update(
-                        channel=channel,
-                        ts=placeholder_ts,
-                        text=UNREADABLE_FILES_TEXT,
-                    )
+                    try:
+                        client.chat_update(
+                            channel=channel,
+                            ts=placeholder_ts,
+                            text=UNREADABLE_FILES_TEXT,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
+                        logger.warning("decline update failed in %s: %s", channel, exc)
                     return
                 run_turn_and_post(
                     client,

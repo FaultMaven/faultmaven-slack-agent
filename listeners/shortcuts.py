@@ -119,15 +119,18 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             # Files attached but none ingestible, and no text: don't open a blank
             # case — turn the placeholder into a how-to instead.
             if not alert_text.strip() and not files:
-                client.chat_update(
-                    channel=channel,
-                    ts=placeholder_ts,
-                    text=(
-                        ":information_source: I couldn't read the attached file(s) "
-                        "(too large, or I lack access). Paste the key text and "
-                        "@mention me."
-                    ),
-                )
+                try:
+                    client.chat_update(
+                        channel=channel,
+                        ts=placeholder_ts,
+                        text=(
+                            ":information_source: I couldn't read the attached "
+                            "file(s) (too large, or I lack access). Paste the key "
+                            "text and @mention me."
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
+                    logger.warning("decline update failed in %s: %s", channel, exc)
                 return
 
             # Best-effort permalink back to the alert, for case provenance.

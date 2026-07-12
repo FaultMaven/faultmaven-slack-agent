@@ -42,6 +42,11 @@ _BULLET = re.compile(r"(?m)^(\s*)[-*+]\s+")
 # the escape pass — with no label there is nothing to spoof (the rendered text
 # IS the destination), unlike <url|label> which stays neutralized.
 _AUTOLINK = re.compile(r"<(https?://[^\s<>|]+)>")
+# A Markdown link target we'll turn into a LIVE Slack <target|label> entity must
+# be a real URL. Without this a target like `!channel` / `@U…` / `#C…` becomes a
+# live broadcast / mention / channel-link under the bot's identity — re-opening
+# exactly the injection `escape_mrkdwn` closes. Anything else stays literal.
+_SAFE_LINK_TARGET = re.compile(r"(?i)(?:https?|mailto):")
 
 # Control-char sentinels that won't occur in real text (any that leak in from the
 # input are stripped up front, so a stash index can never be spoofed).
@@ -104,7 +109,16 @@ def to_mrkdwn(text: str) -> str:
             body = after[newline + 1 :]
             text = text[:dangling] + _hold("```\n" + body.rstrip("\n") + "\n```")
     text = _INLINE_CODE.sub(lambda m: _hold("`" + m.group(1) + "`"), text)
-    text = _LINK.sub(lambda m: _hold(f"<{m.group(2)}|{m.group(1)}>"), text)
+
+    def _link(m: "re.Match[str]") -> str:
+        # Only build a live entity for a real URL target; a non-URL target
+        # (``!channel``, ``@U…``, ``#C…``) is left as the already-escaped
+        # literal ``[label](target)`` — harmless text, never a live ping.
+        if _SAFE_LINK_TARGET.match(m.group(2)):
+            return _hold(f"<{m.group(2)}|{m.group(1)}>")
+        return m.group(0)
+
+    text = _LINK.sub(_link, text)
 
     # 2. Headings BEFORE emphasis: strip inner * so a bold heading isn't
     #    double-wrapped, and mark the line bold via sentinels (Slack has no #).

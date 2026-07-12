@@ -54,11 +54,13 @@ TURN_ERROR_TEXT = (
     "@mention me."
 )
 # The turn may have completed backend-side — do NOT advise a retry (a resent
-# message would run a duplicate turn against state the user never saw).
+# message would run a duplicate turn against state the user never saw). Worded
+# to hold whether or not a case/turn had yet been recorded (a create-case
+# timeout reaches here too), so it never asserts a commit that didn't happen.
 TURN_TIMEOUT_TEXT = (
-    ":hourglass: I gave up waiting for that turn — the analysis may still have "
-    "landed on the case. Give it a moment before re-sending the same message "
-    "or evidence."
+    ":hourglass: I gave up waiting on the backend — that turn may still be "
+    "completing on the case. Give it a moment before re-sending the same "
+    "message or evidence."
 )
 # Stale mapping evicted; unlike TURN_ERROR_TEXT, a retry WILL work (fresh case).
 CASE_GONE_TEXT = (
@@ -85,12 +87,19 @@ def turn_error_text(exc: Exception) -> str:
     transient transport/5xx failures deserve the retry advice.
     """
 
-    if _shutting_down.is_set():
-        return RESTARTING_TEXT
+    # "Indeterminate — the backend may have committed this turn" is checked
+    # BEFORE the shutdown override: a commit-then-fail during drain must still
+    # warn against a blind re-send, not tell the user to resend in a minute. A
+    # gateway 502/504 is this same class arriving as a status (the upstream was
+    # forwarded and timed out), not just a client-side read timeout.
     if isinstance(exc, CaseNotFoundError):
         return CASE_GONE_TEXT
     if isinstance(exc, FaultMavenTimeoutError):
         return TURN_TIMEOUT_TEXT
+    if isinstance(exc, FaultMavenAPIError) and exc.status_code in (502, 504):
+        return TURN_TIMEOUT_TEXT
+    if _shutting_down.is_set():
+        return RESTARTING_TEXT
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         if exc.status_code == 429:
             return TURN_ERROR_TEXT  # backend backpressure IS transient
@@ -462,7 +471,17 @@ def run_turn(
         unlink_stale_case(store, team_id, channel_id, thread_ts, case_id)
         raise
 
-    store.mark_seeded(team_id, channel_id, thread_ts)
+    # The turn is committed. A store-write failure here (a closed DB during a
+    # shutdown/drain race, a lock, a full disk) must NOT sink the reply and
+    # mislabel it a turn error — the only cost of a missed seed is that the
+    # one-time catch-up context is re-sent next turn.
+    try:
+        store.mark_seeded(team_id, channel_id, thread_ts)
+    except Exception as exc:  # noqa: BLE001 — never lose a committed turn to a store write
+        logger.warning(
+            "mark_seeded failed for thread %s (committed turn kept): %s",
+            thread_ts, exc,
+        )
     return result
 
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +37,13 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _as_list(value: Any) -> list:
+    """A list from a tolerated field, or ``[]`` — never ``list(scalar)`` (which
+    would ``TypeError`` on schema drift past a committed-turn boundary)."""
+
+    return list(value) if isinstance(value, list) else []
 
 
 class FaultMavenError(Exception):
@@ -111,6 +119,11 @@ class FaultMavenClient:
         self._token_is_preset = bool(token)
         self._dev_login_username = dev_login_username
         self._timeout = timeout
+        # The gate is per-thread but this client is shared, so concurrent turns
+        # on different Slack threads race token acquisition/reauth. Serialize
+        # the read-modify-write of ``self._token`` so one thread can't blank a
+        # token another is about to send (empty bearer → spurious 401).
+        self._token_lock = threading.Lock()
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
 
     # -- lifecycle ----------------------------------------------------------
@@ -186,13 +199,39 @@ class FaultMavenClient:
 
     # -- auth ---------------------------------------------------------------
     def _ensure_token(self) -> None:
-        if self._token:
-            return
-        if not self._dev_login_username:
-            raise FaultMavenError(
-                "no FAULTMAVEN_API_TOKEN configured and dev-login disabled"
-            )
-        self._token = self._dev_login(self._dev_login_username)
+        """Acquire a token if we don't have one (idempotent, thread-safe)."""
+
+        self._current_token()
+
+    def _current_token(self) -> str:
+        """The bearer token, acquiring one via dev-login if absent.
+
+        Guarded so concurrent turn threads can't interleave the acquire and
+        blank each other's token.
+        """
+
+        with self._token_lock:
+            if not self._token:
+                if not self._dev_login_username:
+                    raise FaultMavenError(
+                        "no FAULTMAVEN_API_TOKEN configured and dev-login disabled"
+                    )
+                self._token = self._dev_login(self._dev_login_username)
+            return self._token
+
+    def _reauth(self, stale: str) -> str:
+        """Re-login after a 401, unless another thread already refreshed.
+
+        Compare-and-swap on the ``stale`` token so two threads racing the same
+        expiry perform exactly one dev-login, and neither transiently blanks a
+        token the other is about to send.
+        """
+
+        with self._token_lock:
+            if self._token and self._token != stale:
+                return self._token  # another thread already refreshed
+            self._token = self._dev_login(self._dev_login_username)
+            return self._token
 
     def _dev_login(self, username: str) -> str:
         try:
@@ -216,8 +255,12 @@ class FaultMavenClient:
             raise FaultMavenError("dev-login returned no access_token")
         return token
 
+    @staticmethod
+    def _auth_header(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        return self._auth_header(self._token)
 
     def _post(
         self,
@@ -234,9 +277,10 @@ class FaultMavenClient:
         retry, so turns keep working without a restart.
         """
 
-        self._ensure_token()
+        token = self._current_token()
         resp = self._http.post(
-            url, json=json, data=data, files=files, headers=self._headers()
+            url, json=json, data=data, files=files,
+            headers=self._auth_header(token),
         )
         if resp.status_code == 401:
             if self._token_is_preset or not self._dev_login_username:
@@ -249,10 +293,10 @@ class FaultMavenClient:
                 )
                 return resp
             logger.info("FaultMaven token rejected (401); re-authenticating")
-            self._token = ""
-            self._ensure_token()
+            token = self._reauth(token)
             resp = self._http.post(
-                url, json=json, data=data, files=files, headers=self._headers()
+                url, json=json, data=data, files=files,
+                headers=self._auth_header(token),
             )
         return resp
 
@@ -379,6 +423,16 @@ class FaultMavenClient:
                 f"submit_turn timed out after {self._timeout}s; the turn may "
                 "still complete on the backend"
             ) from exc
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as exc:
+            # The request body was already on the wire when the connection
+            # dropped, so the backend may have committed this turn — same
+            # "indeterminate, don't blind-resend" class as a read timeout (a
+            # ConnectError, which never reached the backend, falls through to
+            # the retryable branch below).
+            raise FaultMavenTimeoutError(
+                f"submit_turn lost the connection after sending ({exc}); the "
+                "turn may still complete on the backend"
+            ) from exc
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"submit_turn failed: {exc}") from exc
         # A 404 means "case deleted" only on the turn POST itself. A 404 from
@@ -387,9 +441,27 @@ class FaultMavenClient:
         # eviction.
         self._raise_for_status(resp, "submit_turn", not_found_is_case=not polled)
 
-        return self._parse_turn(resp.json())
+        # Status was 2xx here — the turn committed. Parsing must NEVER raise
+        # past this point (a JSONDecodeError from a 200 non-JSON body, or a
+        # scalar where a list is expected, would surface as a "try again" on a
+        # committed turn); degrade to an empty body the tolerant parser renders.
+        return self._parse_turn(self._json_or_empty(resp))
 
     # -- helpers ------------------------------------------------------------
+    @staticmethod
+    def _json_or_empty(resp: httpx.Response) -> dict[str, Any]:
+        """The body as a dict, or ``{}`` for a non-JSON / non-object body.
+
+        Used only after a 2xx (the turn committed): a committed turn must always
+        render *something*, never raise a parse error into a retry-advising path.
+        """
+
+        try:
+            body = resp.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
     def _poll(
         self, location: str, *, deadline: float | None = None
     ) -> httpx.Response:
@@ -406,6 +478,7 @@ class FaultMavenClient:
         if deadline is None:
             deadline = time.monotonic() + self._timeout
 
+        token = self._current_token()
         delay = 1.5
         reauthed = False
         while time.monotonic() < deadline:
@@ -414,7 +487,7 @@ class FaultMavenClient:
             remaining = max(1.0, deadline - time.monotonic())
             resp = self._http.get(
                 location,
-                headers=self._headers(),
+                headers=self._auth_header(token),
                 timeout=min(self._timeout, remaining),
             )
             if (
@@ -427,8 +500,7 @@ class FaultMavenClient:
                 # async turn; re-login once, same as _post. The endpoint is
                 # known-ready — retry immediately, don't burn budget sleeping.
                 logger.info("token rejected (401) mid-poll; re-authenticating")
-                self._token = ""
-                self._ensure_token()
+                token = self._reauth(token)
                 reauthed = True
                 delay = 0.0
                 continue
@@ -457,7 +529,7 @@ class FaultMavenClient:
             case_state=body.get("case_state"),
             turn_number=body.get("turn_number"),
             progress_made=bool(body.get("progress_made", False)),
-            milestones_completed=list(body.get("milestones_completed") or []),
-            suggested_actions=list(body.get("suggested_actions") or []),
+            milestones_completed=_as_list(body.get("milestones_completed")),
+            suggested_actions=_as_list(body.get("suggested_actions")),
             raw=body,
         )

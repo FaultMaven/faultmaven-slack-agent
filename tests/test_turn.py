@@ -4,8 +4,30 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
+import listeners._turn as turn_mod
+from faultmaven import FaultMavenAPIError, FaultMavenTimeoutError
 from faultmaven.client import TurnResult
-from listeners._turn import Dedup, run_turn
+from listeners._turn import (
+    RESTARTING_TEXT,
+    TURN_ERROR_TEXT,
+    TURN_TIMEOUT_TEXT,
+    Dedup,
+    run_turn,
+    turn_error_text,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_shutdown_flag():
+    """`_shutting_down` is a process-global; another test's lifespan-shutdown
+    (e.g. the TestClient in test_transport) can leave it set. Reset around each
+    test so turn_error_text's branch selection is deterministic here."""
+
+    turn_mod._shutting_down.clear()
+    yield
+    turn_mod._shutting_down.clear()
 
 
 class FakeFM:
@@ -75,6 +97,49 @@ def test_existing_thread_reuses_case():
     run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text="two")
     assert len(fm.creates) == 1
     assert fm.turns[0][0] == fm.turns[1][0] == "case1"
+
+
+def test_committed_turn_survives_a_mark_seeded_failure():
+    """A store-write failure AFTER submit_turn commits must not sink the reply
+    and mislabel it a turn error — the committed result is still returned."""
+
+    class BoomSeedStore(FakeStore):
+        def mark_seeded(self, t, c, th):
+            raise RuntimeError("db closed mid-shutdown")
+
+    fm, store = FakeFM(), BoomSeedStore()
+    result = run_turn(
+        fm, store, team_id="T", channel_id="C", thread_ts="t1", text="hi"
+    )
+    assert result.agent_response == "r"  # committed reply returned regardless
+
+
+# -- turn_error_text: committed-turn / retry-advice discipline ----------------
+def test_gateway_timeout_status_is_indeterminate_not_retry():
+    """A 502/504 means an upstream was forwarded then timed out — the turn may
+    have committed, so it must warn against re-send, not say 'try again'."""
+
+    assert turn_error_text(FaultMavenAPIError("x", status_code=502)) == TURN_TIMEOUT_TEXT
+    assert turn_error_text(FaultMavenAPIError("x", status_code=504)) == TURN_TIMEOUT_TEXT
+
+
+def test_plain_5xx_still_advises_retry():
+    # 500/503 (rejected, not forwarded-and-timed-out) are safe to retry.
+    assert turn_error_text(FaultMavenAPIError("x", status_code=500)) == TURN_ERROR_TEXT
+    assert turn_error_text(FaultMavenAPIError("x", status_code=503)) == TURN_ERROR_TEXT
+
+
+def test_indeterminate_failure_during_shutdown_still_warns_not_restart():
+    """The shutdown override must NOT shadow a possibly-committed turn: a
+    timeout or 502/504 during drain must still warn against a blind re-send."""
+
+    turn_mod.begin_shutdown()  # autouse fixture clears it again after
+    assert turn_error_text(FaultMavenTimeoutError("x")) == TURN_TIMEOUT_TEXT
+    assert (
+        turn_error_text(FaultMavenAPIError("x", status_code=504)) == TURN_TIMEOUT_TEXT
+    )
+    # a generic teardown-induced failure during shutdown DOES say restarting
+    assert turn_error_text(RuntimeError("store closed")) == RESTARTING_TEXT
 
 
 # -- Dedup --------------------------------------------------------------------

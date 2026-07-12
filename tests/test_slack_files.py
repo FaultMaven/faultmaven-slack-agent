@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import httpx
 
-from slack_files import download_message_files
+from slack_files import _safe_name, download_message_files
 
 
 def _client(handler) -> httpx.Client:
@@ -187,6 +187,14 @@ def test_download_error_skips_that_file_but_keeps_others():
         http_client=_client(handler),
     )
     assert out == [("good.log", b"good", "text/plain")]
+
+
+def test_safe_name_strips_paths_and_rejects_dot_only_names():
+    assert _safe_name("../../etc/passwd") == "passwd"  # separators stripped
+    assert _safe_name("..") == "attachment"  # whole-name dots → not a path token
+    assert _safe_name(".") == "attachment"
+    assert _safe_name("...") == "attachment"
+    assert _safe_name("app.log") == "app.log"  # a real dotted name survives
 
 
 def test_respects_max_files_cap():

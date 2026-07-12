@@ -83,3 +83,22 @@ def test_plain_arithmetic_is_not_mangled():
 def test_empty_and_none_safe():
     assert to_mrkdwn("") == ""
     assert to_mrkdwn(None) is None  # type: ignore[arg-type]
+
+
+def test_link_target_must_be_a_url_no_entity_injection():
+    """A Markdown link whose target is NOT a URL must not become a live Slack
+    entity — else `[x](!channel)` broadcasts to the whole channel under the
+    bot's identity (the injection escape_mrkdwn exists to prevent)."""
+
+    for target in ("!channel", "!everyone", "!subteam^S012ABC", "@U012ABCDE", "#C012ABCDE"):
+        out = to_mrkdwn(f"[x]({target})")
+        # no live broadcast/mention/channel entity leaked through the builder
+        assert "<!" not in out
+        assert "<@" not in out
+        assert "<#" not in out
+
+
+def test_legitimate_url_links_still_render_live():
+    assert to_mrkdwn("[docs](https://example.com)") == "<https://example.com|docs>"
+    assert to_mrkdwn("[here](http://x/y)") == "<http://x/y|here>"
+    assert to_mrkdwn("[mail](mailto:a@b.com)") == "<mailto:a@b.com|mail>"
