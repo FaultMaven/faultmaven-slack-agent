@@ -142,19 +142,20 @@ def test_context_shows_state_and_turn():
 
 # -- DECIDE suggestions: clickable + legible ---------------------------------
 def test_payload_only_decide_becomes_button_carrying_payload():
-    # File-classification clarifications carry a `payload` but NO `intent`. They
-    # must be clickable (a click submits the payload verbatim), not degrade to a
-    # cryptic "Decision: Documentation" text bullet.
+    # Runbook / regenerate-summary DECIDEs carry a `payload` but NO `intent`
+    # (the engine matches those payloads verbatim on terminal turns). They
+    # must be clickable (a click submits the payload verbatim), not degrade to
+    # a cryptic "Decision: …" text bullet.
     result = TurnResult(
-        agent_response="I couldn't confidently classify the file you uploaded.",
-        case_state="investigating",
+        agent_response="Case closed.",
+        case_state="resolved",
         suggested_actions=[
-            {"type": "DECIDE", "label": "Documentation",
-             "payload": "Treat the file as documentation or notes and analyze it.",
-             "body": "Treat as documentation or notes."},
-            {"type": "DECIDE", "label": "Something else",
-             "payload": "Treat the file as unstructured text and try to analyze it.",
-             "body": "Treat as unstructured text."},
+            {"type": "DECIDE", "label": "Regenerate summary",
+             "payload": "Regenerate the case summary.",
+             "body": "Rebuild the closure summary from the case record."},
+            {"type": "DECIDE", "label": "Draft a runbook",
+             "payload": "Draft a runbook from this case.",
+             "body": "Turn this resolution into a reusable runbook."},
             {"type": "RUN", "payload": "kubectl get pods"},
         ],
     )
@@ -162,23 +163,61 @@ def test_payload_only_decide_becomes_button_carrying_payload():
     buttons = _buttons(blocks)
 
     labels = [b["text"]["text"] for b in buttons]
-    assert "Documentation" in labels and "Something else" in labels
+    assert "Regenerate summary" in labels and "Draft a runbook" in labels
     for b in buttons:
         value = json.loads(b["value"])
-        assert value["q"].startswith("Treat the file as")  # payload, not label
+        assert value["q"] in (
+            "Regenerate the case summary.",
+            "Draft a runbook from this case.",
+        )  # payload, not label
         assert "it" not in value  # no intent → query-only submission
         assert b["style"] == "primary"
 
     # The fuller `body` rides in a description line so the choice reads with its
     # meaning (Copilot renders `label — body`); the old bare-label bullet dropped it.
     joined = "\n".join(_sections(blocks))
-    assert "Treat as documentation or notes." in joined
-    assert "Treat as unstructured text." in joined
-    assert "Decision: Documentation" not in joined  # confusing prefix is gone
+    assert "Rebuild the closure summary from the case record." in joined
+    assert "Turn this resolution into a reusable runbook." in joined
+    assert "Decision: Regenerate summary" not in joined  # confusing prefix is gone
 
     # RUN stays text, never a button.
     assert "kubectl get pods" in joined
     assert all("kubectl" not in b["text"]["text"] for b in buttons)
+
+
+def test_classification_clarification_button_round_trips_reclassification_intent():
+    # File-classification clarifications are intent-bearing (issue #27): the
+    # backend attaches a `file_reclassification` intent (file_id + DataType) and
+    # a click must replay it so the engine re-labels the file mechanically —
+    # never submit the payload as a bare query the LLM could act on literally
+    # (the old behavior deep-analyzed the file instead of reclassifying it).
+    result = TurnResult(
+        agent_response="I couldn't confidently classify the file you uploaded.",
+        case_state="investigating",
+        suggested_actions=[
+            {"type": "DECIDE", "label": "Application logs",
+             "payload": 'Treat the previously uploaded file ("x.log") as application logs.',
+             "body": "Treat as application logs.",
+             "intent": {"type": "file_reclassification",
+                        "file_id": "file_de0e86e511be",
+                        "data_type": "logs_and_errors"}},
+            {"type": "DECIDE", "label": "Something else",
+             "payload": 'Treat the previously uploaded file ("x.log") as unstructured text.',
+             "body": "Treat as unstructured text.",
+             "intent": {"type": "file_reclassification",
+                        "file_id": "file_de0e86e511be",
+                        "data_type": "unstructured_text"}},
+        ],
+    )
+    buttons = _buttons(build_turn_blocks(result))
+    assert len(buttons) == 2
+    for b in buttons:
+        value = json.loads(b["value"])
+        assert value["it"] == "file_reclassification"
+        assert value["id"]["file_id"] == "file_de0e86e511be"
+        assert value["id"]["data_type"] in ("logs_and_errors", "unstructured_text")
+        assert value["id"]["user_confirmed"] is True
+        assert value["q"].startswith("Treat the previously uploaded file")
 
 
 def test_intent_bearing_decide_button_still_carries_intent():

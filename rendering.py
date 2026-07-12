@@ -172,16 +172,21 @@ def _action_value(action: dict[str, Any]) -> str | None:
 
     **Only DECIDE is a button**, and it is clickable whenever it carries
     something to submit — a ``payload`` (the exact message a click sends) or an
-    ``intent`` (a routable gate). Two DECIDE shapes exist and *both* are buttons:
+    ``intent`` (a routable operation). Two DECIDE shapes exist and *both* are
+    buttons:
 
     * **Intent-bearing** — state-machine gates (resolution/close confirmations,
-      disposition transitions). The ``intent`` is replayed verbatim, flagged
-      ``user_confirmed``, so the engine routes it deterministically.
-    * **Payload-only** — file-classification clarifications, runbook, and
-      regenerate-summary. These carry *no* ``intent`` (engine-owned intent is
-      attached only for gates); a click submits the ``payload`` text as a plain
-      query, exactly as the Copilot does. Requiring an intent here (the old rule)
-      stranded this whole family as un-clickable "Decision: …" bullets.
+      disposition transitions) and file-classification clarifications
+      (``file_reclassification``, carrying the target file_id + DataType). The
+      ``intent`` is replayed verbatim, flagged ``user_confirmed``, so the
+      engine routes it deterministically — a clarification click re-labels the
+      file server-side instead of being read as a free-text analysis request
+      (issue #27).
+    * **Payload-only** — runbook and regenerate-summary. These carry *no*
+      ``intent``; a click submits the ``payload`` text as a plain query,
+      exactly as the Copilot does — the engine matches those payloads verbatim
+      on terminal turns. Requiring an intent here (the old rule) stranded this
+      family as un-clickable "Decision: …" bullets.
 
     RUN (copy-run locally), FREE_SPEECH (answer in your own words), and EVIDENCE
     are **not** submittable, and a bare DECIDE with neither payload nor intent has
