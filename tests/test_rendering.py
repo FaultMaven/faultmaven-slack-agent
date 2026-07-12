@@ -230,7 +230,7 @@ def test_unsubmittable_decide_stays_text_not_button():
     assert "close the case" in "\n".join(_sections(blocks))
 
 
-def test_assurance_grade_labeled_in_context(monkeypatch):
+def test_assurance_grade_labeled_in_context():
     # A held-back grade is surfaced beside the narration so the cause claim in
     # agent_response is never forwarded without its read-time label (#572/INV-28).
     result = TurnResult(
@@ -240,6 +240,18 @@ def test_assurance_grade_labeled_in_context(monkeypatch):
     )
     ctx = _context_texts(build_turn_blocks(result))
     assert any("mechanistic" in t for t in ctx)
+
+
+def test_assurance_label_suppressed_pre_terminal():
+    # An RCC minted mid-investigation must NOT repeat its qualifier on every
+    # non-terminal turn — the label rides only the terminal disposition.
+    result = TurnResult(
+        agent_response="A likely cause is connection pool exhaustion.",
+        case_state="investigating",
+        cause_assurance="no_root",
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert not any("assurance" in t.lower() for t in ctx)
 
 
 def test_confirmed_grade_needs_no_label():

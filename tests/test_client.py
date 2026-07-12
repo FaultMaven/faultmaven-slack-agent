@@ -385,7 +385,7 @@ def test_parse_turn_defaults_for_empty_body():
     assert result.cause_assurance is None and result.cause_overclaim is None
 
 
-def test_parse_turn_reads_cause_assurance(monkeypatch):
+def test_parse_turn_reads_cause_assurance():
     """The read-time assurance grade rides the turn body so the renderer can
     label the cause claim in agent_response (#572/INV-28)."""
 

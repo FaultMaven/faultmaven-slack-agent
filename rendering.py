@@ -314,8 +314,13 @@ def build_turn_blocks(
         context.append(
             {"type": "mrkdwn", "text": f"State: `{result.case_state}`"}
         )
+    # Only label the cause on a terminal turn — the point where the conclusion is
+    # a settled disposition the user acts on (mirrors the copilot, which labels
+    # only the terminal Root Cause row). An RCC can be minted mid-investigation
+    # (an early LLM-authored cause grades no_root); labeling it on every
+    # subsequent turn would repeat the same qualifier as noise.
     assurance_label = _ASSURANCE_LABELS.get(result.cause_assurance or "")
-    if assurance_label:
+    if assurance_label and terminal:
         if result.cause_overclaim:
             assurance_label += " ⚠ (stated more certainly than the evidence supports)"
         context.append({"type": "mrkdwn", "text": assurance_label})
