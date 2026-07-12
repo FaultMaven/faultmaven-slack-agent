@@ -7,11 +7,17 @@ exercise the real request/response shaping without a live server.
 from __future__ import annotations
 
 import json
+import threading
 
 import httpx
 import pytest
 
-from faultmaven.client import FaultMavenClient, FaultMavenError, TurnResult
+from faultmaven.client import (
+    FaultMavenClient,
+    FaultMavenError,
+    FaultMavenTimeoutError,
+    TurnResult,
+)
 
 
 def make_client(handler, *, token: str = "", dev: str = "") -> FaultMavenClient:
@@ -95,6 +101,83 @@ def test_submit_turn_requires_at_least_one_input():
     client = make_client(lambda req: httpx.Response(200, json={}), token="tok")
     with pytest.raises(FaultMavenError, match="at least one"):
         client.submit_turn("c1")
+
+
+def test_submit_turn_connection_lost_after_send_is_indeterminate():
+    """A dropped connection AFTER the request is on the wire (the backend may
+    have committed the turn) must raise the timeout/indeterminate class, not a
+    generic error that would advise a blind re-send."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("peer closed connection", request=request)
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(FaultMavenTimeoutError):
+        client.submit_turn("c1", query="x")
+
+
+def test_submit_turn_connect_error_stays_retryable():
+    """A ConnectError never reached the backend, so it is NOT indeterminate —
+    it must remain a plain FaultMavenError (retry is safe)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(FaultMavenError) as exc_info:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc_info.value, FaultMavenTimeoutError)
+
+
+def test_submit_turn_write_error_stays_retryable():
+    """A WriteError is a request-WRITE-phase failure — the body never fully
+    landed, so the turn did NOT commit and a retry is safe (and needed). It must
+    NOT be the indeterminate class, or the user would be told not to re-send a
+    turn that never ran."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.WriteError("broken pipe", request=request)
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(FaultMavenError) as exc_info:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc_info.value, FaultMavenTimeoutError)
+
+
+def test_submit_turn_gateway_timeout_is_indeterminate():
+    """A gateway 502/504 (upstream forwarded then timed out) may have committed
+    the turn — the client maps it to the timeout/indeterminate class so the UI
+    layer never has to inspect a status code to recognize 'maybe committed'."""
+
+    for code in (502, 504):
+        client = make_client(
+            lambda req, c=code: httpx.Response(c, text="gateway"), token="tok"
+        )
+        with pytest.raises(FaultMavenTimeoutError):
+            client.submit_turn("c1", query="x")
+
+
+def test_submit_turn_200_non_json_body_degrades_not_raises():
+    """A committed (200) turn whose body isn't JSON (e.g. a proxy HTML page)
+    must render a fallback, never raise a parse error into a 'try again' path."""
+
+    client = make_client(
+        lambda req: httpx.Response(200, text="<html>proxy</html>"), token="tok"
+    )
+    result = client.submit_turn("c1", query="x")
+    assert isinstance(result, TurnResult)
+    assert result.agent_response  # non-empty fallback, no exception
+
+
+def test_parse_turn_tolerates_scalar_list_fields():
+    """Schema drift shipping a scalar where a list is expected must not
+    TypeError on a committed turn (list(5) would)."""
+
+    result = FaultMavenClient._parse_turn(
+        {"agent_response": "a", "milestones_completed": 5, "suggested_actions": True}
+    )
+    assert result.milestones_completed == []
+    assert result.suggested_actions == []
 
 
 # -- health -------------------------------------------------------------------
@@ -184,6 +267,75 @@ def test_401_triggers_single_reauth_and_retry():
     client = make_client(handler, dev="admin")
     assert client.create_case(title=None) == "c9"
     assert state["posts"] == 2  # one 401, one successful retry
+
+
+def test_reauth_converges_on_one_token_without_blanking():
+    """Racing 401s may each re-login (a bounded PARALLEL herd — the login runs
+    outside the lock, deliberately not serialized behind it, so a hung dev-login
+    can't pile threads up N×timeout). What must hold: they converge on ONE token
+    via CAS, and the token is never transiently blanked, so no thread sends the
+    empty bearer."""
+
+    lock = threading.Lock()
+    logins = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/dev-login"):
+            with lock:
+                logins["n"] += 1
+                n = logins["n"]
+            return httpx.Response(200, json={"access_token": f"t{n}"})
+        return httpx.Response(200, json={})
+
+    client = make_client(handler, dev="admin")
+    client._token = "stale"
+
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def go() -> None:
+        barrier.wait()
+        results.append(client._reauth("stale"))
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(set(results)) == 1  # both racers converge on the same token
+    assert client._token == results[0]  # and it's the one that got stored
+    assert client._token not in ("", "stale")  # never blanked; stale replaced
+
+
+def test_current_token_converges_without_blanking_under_concurrency():
+    lock = threading.Lock()
+    logins = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with lock:
+            logins["n"] += 1
+            n = logins["n"]
+        return httpx.Response(200, json={"access_token": f"t{n}"})
+
+    client = make_client(handler, dev="admin")
+    barrier = threading.Barrier(8)
+    tokens: list[str] = []
+
+    def go() -> None:
+        barrier.wait()
+        tokens.append(client._current_token())
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(set(tokens)) == 1  # all converge on one stored token
+    assert client._token == tokens[0]
+    assert client._token != ""
+    assert 1 <= logins["n"] <= 8  # bounded herd — never serialized, never unbounded
 
 
 def test_dev_login_404_raises_clear_error():

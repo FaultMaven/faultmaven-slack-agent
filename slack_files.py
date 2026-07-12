@@ -98,7 +98,13 @@ def _safe_name(raw: str | None) -> str:
 
     name = os.path.basename((raw or "").replace("\\", "/")).strip()
     name = "".join(ch for ch in name if ch.isprintable() and ch not in '/\x00')
-    return name[:255] or "attachment"
+    name = name[:255]
+    # basename() already strips separators (no ``../x`` is constructible), but a
+    # whole name of only dots (``.``/``..``) survives it — reject those outright
+    # so the returned name can never be a relative-path token.
+    if not name or set(name) <= {"."}:
+        return "attachment"
+    return name
 
 
 def _is_slack_login_page(content: bytes) -> bool:

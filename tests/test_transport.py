@@ -10,6 +10,8 @@ Covers the P5 transport surface (docs/design.md §10, §16):
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.oauth.installation_store.models.installation import Installation
@@ -195,6 +197,41 @@ def test_unsigned_event_is_rejected(http_client):
         "/slack/events", json={"type": "url_verification", "challenge": "x"}
     )
     assert resp.status_code == 401  # signature verification, not a 500
+
+
+def test_fm_startup_runs_off_the_lifespan_thread(monkeypatch, tmp_path):
+    """The FM token bootstrap must run on a background daemon, NOT inline in the
+    lifespan: uvicorn does not serve /health until lifespan startup returns, so a
+    slow backend here would block the liveness probe and trip a CrashLoop."""
+
+    monkeypatch.setenv("SLACK_TRANSPORT", "http")
+    monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
+    monkeypatch.setenv("SLACK_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "signsign")
+    monkeypatch.setenv("SLACK_DATABASE_URL", f"sqlite:///{tmp_path / 'oauth.db'}")
+    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "cases.db"))
+    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
+    config.get_settings.cache_clear()
+
+    recorded: dict[str, str] = {}
+    started = threading.Event()
+
+    def fake_startup(self) -> None:  # noqa: ANN001 — bound method stub
+        recorded["thread"] = threading.current_thread().name
+        started.set()
+
+    from faultmaven.client import FaultMavenClient
+
+    monkeypatch.setattr(FaultMavenClient, "startup", fake_startup)
+
+    from web import create_fastapi_app
+
+    with TestClient(create_fastapi_app()) as client:
+        assert started.wait(5), "token bootstrap never ran"
+        # Ran on the named daemon, not the lifespan/event-loop thread.
+        assert recorded["thread"] == "fm-token-bootstrap"
+        assert client.get("/health").status_code == 200
+    config.get_settings.cache_clear()
 
 
 # --- transport selection in build_app ---------------------------------------

@@ -23,6 +23,7 @@ investigation is already off the loop.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -59,16 +60,24 @@ def create_fastapi_app() -> FastAPI:
     """Build the ASGI app: Bolt handler on /slack/*, plus /health.
 
     Returned (rather than module-global) so tests can construct it against a
-    patched environment, and so uvicorn imports it via ``web:asgi`` below.
-    Object construction does no network I/O — the FM token bootstrap runs in the
-    lifespan startup below, after uvicorn binds the port.
+    patched environment. Object construction does no network I/O — the FM token
+    bootstrap runs in the lifespan startup below, off the critical path.
     """
 
     bolt_app, store, fm, _settings = build_app()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        fm.startup()  # best-effort token bootstrap, after the port is bound
+        # Bootstrap the FM token on a background thread, NOT inline: uvicorn does
+        # not begin serving (bind the listening socket's accept loop) until this
+        # lifespan startup returns, so a slow/hanging backend here would block
+        # /health up to the 120s client timeout and trip the k8s liveness
+        # SIGKILL — the very failure /health is designed to avoid. The bootstrap
+        # is best-effort (the first turn re-acquires lazily), so firing it and
+        # returning immediately loses nothing.
+        threading.Thread(
+            target=fm.startup, name="fm-token-bootstrap", daemon=True
+        ).start()
         logger.info("FaultMaven Slack Agent started (HTTP/OAuth)")
         try:
             yield
