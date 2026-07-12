@@ -131,7 +131,11 @@ class FaultMavenClient:
         """Best-effort token bootstrap — never fatal.
 
         If a token can't be obtained now (backend down, or not in local auth
-        mode), we log and move on; the first turn re-attempts lazily.
+        mode), we log and move on; the first turn re-attempts lazily. Runs on a
+        background daemon (see web.py), so it must swallow EVERYTHING: e.g. if
+        shutdown closes the shared httpx client mid-login the request raises a
+        bare ``RuntimeError`` (not a FaultMavenError), which would otherwise
+        surface as an uncaught traceback in the daemon.
         """
 
         if self._token:
@@ -139,7 +143,7 @@ class FaultMavenClient:
         try:
             self._ensure_token()
             logger.info("Bootstrapped FaultMaven token via dev-login")
-        except FaultMavenError as exc:
+        except Exception as exc:  # noqa: BLE001 — best-effort bootstrap, never fatal
             logger.warning("FaultMaven auth deferred: %s", exc)
 
     def close(self) -> None:
@@ -206,31 +210,44 @@ class FaultMavenClient:
     def _current_token(self) -> str:
         """The bearer token, acquiring one via dev-login if absent.
 
-        Guarded so concurrent turn threads can't interleave the acquire and
-        blank each other's token.
+        The lock is NOT held across ``_dev_login`` (a network call bounded only
+        by the request timeout): holding it would serialize every cold-start
+        turn behind one another during an auth outage (N×timeout pile-up). The
+        login runs lock-free and the result is compare-and-set — so racing
+        threads may each log in (bounded, parallel) but the token is never
+        blanked, so no thread sends the empty bearer the lock-free-but-blanking
+        original produced.
         """
 
+        token = self._token
+        if token:
+            return token
+        if not self._dev_login_username:
+            raise FaultMavenError(
+                "no FAULTMAVEN_API_TOKEN configured and dev-login disabled"
+            )
+        fresh = self._dev_login(self._dev_login_username)  # outside the lock
         with self._token_lock:
             if not self._token:
-                if not self._dev_login_username:
-                    raise FaultMavenError(
-                        "no FAULTMAVEN_API_TOKEN configured and dev-login disabled"
-                    )
-                self._token = self._dev_login(self._dev_login_username)
+                self._token = fresh
             return self._token
 
     def _reauth(self, stale: str) -> str:
         """Re-login after a 401, unless another thread already refreshed.
 
-        Compare-and-swap on the ``stale`` token so two threads racing the same
-        expiry perform exactly one dev-login, and neither transiently blanks a
-        token the other is about to send.
+        Same discipline as :meth:`_current_token`: ``_dev_login`` runs outside
+        the lock (no serial pile-up), and the result is compare-and-swap on the
+        ``stale`` token so a token another thread already refreshed wins and the
+        token is never transiently blanked.
         """
 
+        current = self._token
+        if current and current != stale:
+            return current  # another thread already refreshed
+        fresh = self._dev_login(self._dev_login_username)  # outside the lock
         with self._token_lock:
-            if self._token and self._token != stale:
-                return self._token  # another thread already refreshed
-            self._token = self._dev_login(self._dev_login_username)
+            if self._token == stale or not self._token:
+                self._token = fresh
             return self._token
 
     def _dev_login(self, username: str) -> str:
@@ -423,12 +440,14 @@ class FaultMavenClient:
                 f"submit_turn timed out after {self._timeout}s; the turn may "
                 "still complete on the backend"
             ) from exc
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as exc:
-            # The request body was already on the wire when the connection
-            # dropped, so the backend may have committed this turn — same
-            # "indeterminate, don't blind-resend" class as a read timeout (a
-            # ConnectError, which never reached the backend, falls through to
-            # the retryable branch below).
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            # The full request body was already sent and we failed while reading
+            # the RESPONSE, so the backend may have committed this turn — same
+            # "indeterminate, don't blind-resend" class as a read timeout. NOTE:
+            # a write-phase failure (WriteError) means the body never fully
+            # landed → the turn did NOT commit → it belongs in the retryable
+            # branch below (with ConnectError), NOT here, or a mid-upload reset
+            # would tell the user not to retry a turn that never ran.
             raise FaultMavenTimeoutError(
                 f"submit_turn lost the connection after sending ({exc}); the "
                 "turn may still complete on the backend"
@@ -438,8 +457,22 @@ class FaultMavenClient:
         # A 404 means "case deleted" only on the turn POST itself. A 404 from
         # the polled Location URL is the STATUS resource expiring/moving — the
         # case may be alive, so it must not trigger the caller's mapping
-        # eviction.
-        self._raise_for_status(resp, "submit_turn", not_found_is_case=not polled)
+        # eviction. A gateway 502/504 means an upstream was forwarded then timed
+        # out — the same indeterminate/maybe-committed class as a read timeout,
+        # so it is raised as FaultMavenTimeoutError HERE (in the client, for both
+        # the POST and poll paths) rather than re-derived from a status code in
+        # the UI layer.
+        try:
+            self._raise_for_status(
+                resp, "submit_turn", not_found_is_case=not polled
+            )
+        except FaultMavenAPIError as exc:
+            if exc.status_code in (502, 504):
+                raise FaultMavenTimeoutError(
+                    f"submit_turn hit a gateway timeout (HTTP {exc.status_code}); "
+                    "the turn may still complete on the backend"
+                ) from exc
+            raise
 
         # Status was 2xx here — the turn committed. Parsing must NEVER raise
         # past this point (a JSONDecodeError from a 200 non-JSON body, or a

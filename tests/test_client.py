@@ -129,6 +129,34 @@ def test_submit_turn_connect_error_stays_retryable():
     assert not isinstance(exc_info.value, FaultMavenTimeoutError)
 
 
+def test_submit_turn_write_error_stays_retryable():
+    """A WriteError is a request-WRITE-phase failure — the body never fully
+    landed, so the turn did NOT commit and a retry is safe (and needed). It must
+    NOT be the indeterminate class, or the user would be told not to re-send a
+    turn that never ran."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.WriteError("broken pipe", request=request)
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(FaultMavenError) as exc_info:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc_info.value, FaultMavenTimeoutError)
+
+
+def test_submit_turn_gateway_timeout_is_indeterminate():
+    """A gateway 502/504 (upstream forwarded then timed out) may have committed
+    the turn — the client maps it to the timeout/indeterminate class so the UI
+    layer never has to inspect a status code to recognize 'maybe committed'."""
+
+    for code in (502, 504):
+        client = make_client(
+            lambda req, c=code: httpx.Response(c, text="gateway"), token="tok"
+        )
+        with pytest.raises(FaultMavenTimeoutError):
+            client.submit_turn("c1", query="x")
+
+
 def test_submit_turn_200_non_json_body_degrades_not_raises():
     """A committed (200) turn whose body isn't JSON (e.g. a proxy HTML page)
     must render a fallback, never raise a parse error into a 'try again' path."""
@@ -241,17 +269,22 @@ def test_401_triggers_single_reauth_and_retry():
     assert state["posts"] == 2  # one 401, one successful retry
 
 
-def test_reauth_is_compare_and_swap_single_login():
-    """Two turn threads racing the same token expiry must perform exactly one
-    dev-login (CAS on the stale token), and both get the same fresh token — so
-    neither transiently blanks a token the other is about to send."""
+def test_reauth_converges_on_one_token_without_blanking():
+    """Racing 401s may each re-login (a bounded PARALLEL herd — the login runs
+    outside the lock, deliberately not serialized behind it, so a hung dev-login
+    can't pile threads up N×timeout). What must hold: they converge on ONE token
+    via CAS, and the token is never transiently blanked, so no thread sends the
+    empty bearer."""
 
+    lock = threading.Lock()
     logins = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/dev-login"):
-            logins["n"] += 1
-            return httpx.Response(200, json={"access_token": f"t{logins['n']}"})
+            with lock:
+                logins["n"] += 1
+                n = logins["n"]
+            return httpx.Response(200, json={"access_token": f"t{n}"})
         return httpx.Response(200, json={})
 
     client = make_client(handler, dev="admin")
@@ -270,16 +303,20 @@ def test_reauth_is_compare_and_swap_single_login():
     for t in threads:
         t.join()
 
-    assert logins["n"] == 1  # CAS → only one re-login despite two racers
-    assert results == ["t1", "t1"]  # both threads see the same fresh token
+    assert len(set(results)) == 1  # both racers converge on the same token
+    assert client._token == results[0]  # and it's the one that got stored
+    assert client._token not in ("", "stale")  # never blanked; stale replaced
 
 
-def test_current_token_single_login_under_concurrency():
+def test_current_token_converges_without_blanking_under_concurrency():
+    lock = threading.Lock()
     logins = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        logins["n"] += 1
-        return httpx.Response(200, json={"access_token": f"t{logins['n']}"})
+        with lock:
+            logins["n"] += 1
+            n = logins["n"]
+        return httpx.Response(200, json={"access_token": f"t{n}"})
 
     client = make_client(handler, dev="admin")
     barrier = threading.Barrier(8)
@@ -295,8 +332,10 @@ def test_current_token_single_login_under_concurrency():
     for t in threads:
         t.join()
 
-    assert logins["n"] == 1  # acquired once under the lock, shared by all
-    assert set(tokens) == {"t1"}
+    assert len(set(tokens)) == 1  # all converge on one stored token
+    assert client._token == tokens[0]
+    assert client._token != ""
+    assert 1 <= logins["n"] <= 8  # bounded herd — never serialized, never unbounded
 
 
 def test_dev_login_404_raises_clear_error():

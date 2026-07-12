@@ -89,17 +89,18 @@ def turn_error_text(exc: Exception) -> str:
 
     # "Indeterminate — the backend may have committed this turn" is checked
     # BEFORE the shutdown override: a commit-then-fail during drain must still
-    # warn against a blind re-send, not tell the user to resend in a minute. A
-    # gateway 502/504 is this same class arriving as a status (the upstream was
-    # forwarded and timed out), not just a client-side read timeout.
-    if isinstance(exc, CaseNotFoundError):
-        return CASE_GONE_TEXT
+    # warn against a blind re-send, not tell the user to resend in a minute. This
+    # is a single class — the client already maps a client-side read timeout AND
+    # a gateway 502/504 to FaultMavenTimeoutError, so this layer never inspects a
+    # status code to recognize it. Everything else (a genuine 404, a 4xx, a
+    # teardown-induced error) prefers the shutdown message during drain, matching
+    # the original ordering.
     if isinstance(exc, FaultMavenTimeoutError):
-        return TURN_TIMEOUT_TEXT
-    if isinstance(exc, FaultMavenAPIError) and exc.status_code in (502, 504):
         return TURN_TIMEOUT_TEXT
     if _shutting_down.is_set():
         return RESTARTING_TEXT
+    if isinstance(exc, CaseNotFoundError):
+        return CASE_GONE_TEXT
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         if exc.status_code == 429:
             return TURN_ERROR_TEXT  # backend backpressure IS transient

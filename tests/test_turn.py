@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import threading
 
-import pytest
-
 import listeners._turn as turn_mod
 from faultmaven import FaultMavenAPIError, FaultMavenTimeoutError
 from faultmaven.client import TurnResult
@@ -18,16 +16,7 @@ from listeners._turn import (
     turn_error_text,
 )
 
-
-@pytest.fixture(autouse=True)
-def _clear_shutdown_flag():
-    """`_shutting_down` is a process-global; another test's lifespan-shutdown
-    (e.g. the TestClient in test_transport) can leave it set. Reset around each
-    test so turn_error_text's branch selection is deterministic here."""
-
-    turn_mod._shutting_down.clear()
-    yield
-    turn_mod._shutting_down.clear()
+# _shutting_down is reset around every test by the autouse fixture in conftest.
 
 
 class FakeFM:
@@ -115,31 +104,41 @@ def test_committed_turn_survives_a_mark_seeded_failure():
 
 
 # -- turn_error_text: committed-turn / retry-advice discipline ----------------
-def test_gateway_timeout_status_is_indeterminate_not_retry():
-    """A 502/504 means an upstream was forwarded then timed out — the turn may
-    have committed, so it must warn against re-send, not say 'try again'."""
+def test_timeout_class_is_indeterminate_not_retry():
+    """The client maps BOTH a client-side read timeout AND a gateway 502/504 to
+    FaultMavenTimeoutError, so this layer recognizes 'maybe committed' from that
+    single type without inspecting any status code."""
 
-    assert turn_error_text(FaultMavenAPIError("x", status_code=502)) == TURN_TIMEOUT_TEXT
-    assert turn_error_text(FaultMavenAPIError("x", status_code=504)) == TURN_TIMEOUT_TEXT
+    assert turn_error_text(FaultMavenTimeoutError("x")) == TURN_TIMEOUT_TEXT
 
 
-def test_plain_5xx_still_advises_retry():
-    # 500/503 (rejected, not forwarded-and-timed-out) are safe to retry.
-    assert turn_error_text(FaultMavenAPIError("x", status_code=500)) == TURN_ERROR_TEXT
-    assert turn_error_text(FaultMavenAPIError("x", status_code=503)) == TURN_ERROR_TEXT
+def test_plain_5xx_advises_retry():
+    # A raw 5xx APIError reaching here (e.g. from create_case, which is always
+    # retry-safe — it commits no turn) gets the plain retry advice; the turn
+    # path's gateway 502/504 is already converted to a timeout upstream.
+    for code in (500, 502, 503, 504):
+        assert (
+            turn_error_text(FaultMavenAPIError("x", status_code=code))
+            == TURN_ERROR_TEXT
+        )
 
 
 def test_indeterminate_failure_during_shutdown_still_warns_not_restart():
     """The shutdown override must NOT shadow a possibly-committed turn: a
-    timeout or 502/504 during drain must still warn against a blind re-send."""
+    timeout (the single indeterminate class) during drain must still warn
+    against a blind re-send rather than say 'restarting, resend in a minute'."""
 
     turn_mod.begin_shutdown()  # autouse fixture clears it again after
     assert turn_error_text(FaultMavenTimeoutError("x")) == TURN_TIMEOUT_TEXT
-    assert (
-        turn_error_text(FaultMavenAPIError("x", status_code=504)) == TURN_TIMEOUT_TEXT
-    )
-    # a generic teardown-induced failure during shutdown DOES say restarting
+    # a genuine 404 or a generic teardown error during shutdown DOES say
+    # restarting (shutdown wins over those, matching the original ordering)
     assert turn_error_text(RuntimeError("store closed")) == RESTARTING_TEXT
+    from faultmaven import CaseNotFoundError
+
+    assert (
+        turn_error_text(CaseNotFoundError("gone", status_code=404))
+        == RESTARTING_TEXT
+    )
 
 
 # -- Dedup --------------------------------------------------------------------
