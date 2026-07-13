@@ -25,6 +25,7 @@ from ._turn import (
     deliver_turn_result,
     offload_turn,
     resolve_query,
+    skipped_files_note,
     run_turn,
     try_begin_turn,
     turn_error_text,
@@ -92,12 +93,15 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
 
         def turn_work() -> None:
             try:
-                # No-ops (returns [], None) when there are no files. Pasted
-                # snippets come back as text so the backend sees paste
-                # provenance, not a fake "Untitled" file upload.
-                files, pasted_text = download_message_content(
+                # No-ops when there are no files. Pasted snippets come back
+                # as text so the backend sees paste provenance, not a fake
+                # "Untitled" file upload; attachments beyond the one-file-
+                # per-turn limit come back as names to tell the user about.
+                files, pasted_text, skipped = download_message_content(
                     client.token, payload
                 )
+                if skipped:
+                    post(skipped_files_note(skipped))
 
                 query = resolve_query(
                     payload.get("text"),

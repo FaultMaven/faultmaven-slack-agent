@@ -232,11 +232,12 @@ def test_snippet_paste_separated_from_real_files():
     )
     real = _file(name="app.log", mode="hosted")
 
-    files, pasted = download_message_content(
+    files, pasted, skipped = download_message_content(
         "xoxb-tok", {"files": [snippet, real]}, http_client=_client(handler)
     )
     assert files == [("app.log", b"log line", "text/plain")]
     assert pasted == "kubectl get pods\nkube-proxy 1/1 Running"
+    assert skipped == []
 
 
 def test_multiple_snippets_merge_into_one_paste():
@@ -247,11 +248,12 @@ def test_multiple_snippets_merge_into_one_paste():
         _file(name="Untitled", mode="snippet"),
         _file(name="Untitled", mode="snippet"),
     ]
-    files, pasted = download_message_content(
+    files, pasted, skipped = download_message_content(
         "xoxb-tok", {"files": snippets}, http_client=_client(handler)
     )
     assert files == []
     assert pasted == "chunk\n\nchunk"
+    assert skipped == []
 
 
 def test_non_text_snippet_stays_on_the_file_path():
@@ -264,13 +266,44 @@ def test_non_text_snippet_stays_on_the_file_path():
         )
 
     odd = _file(name="Untitled", mode="snippet", mimetype="image/png")
-    files, pasted = download_message_content(
+    files, pasted, skipped = download_message_content(
         "xoxb-tok", {"files": [odd]}, http_client=_client(handler)
     )
-    assert pasted is None
+    assert pasted is None and skipped == []
     assert len(files) == 1 and files[0][1] == b"\x89PNG"
 
 
 def test_no_files_returns_empty_and_none():
-    files, pasted = download_message_content("xoxb-tok", {"files": []})
-    assert files == [] and pasted is None
+    files, pasted, skipped = download_message_content("xoxb-tok", {"files": []})
+    assert files == [] and pasted is None and skipped == []
+
+
+def test_one_file_per_turn_extra_attachments_skipped_by_name():
+    """The backend's turn contract is one file per turn: the first real file
+    is ingested; further attachments aren't even downloaded — their names
+    come back so the caller can tell the user to send them separately."""
+
+    downloads: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        downloads.append(str(request.url))
+        return httpx.Response(200, content=b"data", headers={"content-type": "text/plain"})
+
+    first = _file(name="app.log")
+    second = _file(
+        name="db.log",
+        url_private_download="https://files.slack.com/db.log?d=1",
+        url_private="https://files.slack.com/db.log",
+    )
+    snippet = _file(name="Untitled", mode="snippet")
+
+    files, pasted, skipped = download_message_content(
+        "xoxb-tok",
+        {"files": [first, second, snippet]},
+        http_client=_client(handler),
+    )
+    assert [f[0] for f in files] == ["app.log"]
+    assert skipped == ["db.log"]
+    assert pasted == "data"  # snippets are pastes, exempt from the one-file rule
+    # The skipped file was never downloaded (no wasted transfer).
+    assert not any("db.log" in u for u in downloads)

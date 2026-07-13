@@ -79,6 +79,23 @@ UNREADABLE_FILES_TEXT = (
 )
 
 
+def skipped_files_note(skipped: list[str]) -> str:
+    """User-facing note for attachments beyond the one-file-per-turn limit.
+
+    The backend ingests one file per turn; extra attachments on a single
+    Slack message are not downloaded (see ``download_message_content``).
+    Say so instead of dropping them silently — the fix is in the user's
+    hands (send each in its own message).
+    """
+
+    names = ", ".join(f"`{n}`" for n in skipped)
+    return (
+        f":information_source: I can take one file per message — I kept the "
+        f"first and skipped {names}. Send each in its own message and I'll "
+        "ingest them."
+    )
+
+
 def turn_error_text(exc: Exception) -> str:
     """The user-facing message for a failed turn, by failure class.
 

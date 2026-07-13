@@ -33,7 +33,19 @@ from ._turn import (
     resolve_query,
     run_gated,
     run_turn_and_post,
+    skipped_files_note,
 )
+
+
+def _post_note(
+    client: WebClient, channel: str, thread_ts: str, text: str
+) -> None:
+    """Best-effort threaded info note (e.g. skipped-attachments); never raises."""
+
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception:  # noqa: BLE001 — a notice must never cost the turn
+        pass
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -172,8 +184,13 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 )
 
             # Pasted snippets come back as text so the backend sees paste
-            # provenance, not a fake "Untitled" file upload.
-            files, snippet_text = download_message_content(client.token, event)
+            # provenance, not a fake "Untitled" file upload; attachments
+            # beyond the one-file-per-turn limit come back as names.
+            files, snippet_text, skipped = download_message_content(
+                client.token, event
+            )
+            if skipped:
+                _post_note(client, channel, thread_ts, skipped_files_note(skipped))
             run_turn_and_post(
                 client,
                 fm,
@@ -227,9 +244,13 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 files: list = []
                 snippet_text: str | None = None
                 if has_files:
-                    files, snippet_text = download_message_content(
+                    files, snippet_text, skipped = download_message_content(
                         client.token, event
                     )
+                    if skipped:
+                        _post_note(
+                            client, channel, thread_ts, skipped_files_note(skipped)
+                        )
                 # File(s) present but unreadable and no text → decline instead of
                 # opening a blank case (mirrors the Assistant surface).
                 query = resolve_query(
@@ -300,7 +321,13 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             files: list = []
             snippet_text: str | None = None
             if has_files:
-                files, snippet_text = download_message_content(client.token, event)
+                files, snippet_text, skipped = download_message_content(
+                    client.token, event
+                )
+                if skipped:
+                    _post_note(
+                        client, channel, thread_ts, skipped_files_note(skipped)
+                    )
             # File(s) attached but none ingestible, and no text: say so instead
             # of submitting a phantom-evidence turn the engine can only be
             # confused by (mirrors the DM-summons and Assistant declines).

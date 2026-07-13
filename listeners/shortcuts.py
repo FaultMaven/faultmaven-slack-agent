@@ -20,7 +20,13 @@ from slack_files import download_message_content
 from slack_text import message_to_text
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
+from ._turn import (
+    Dedup,
+    post_placeholder,
+    run_gated,
+    run_turn_and_post,
+    skipped_files_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +126,18 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             files: list = []
             snippet_text: str | None = None
             if has_files:
-                files, snippet_text = download_message_content(
+                files, snippet_text, skipped = download_message_content(
                     client.token, message
                 )
+                if skipped:
+                    try:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=skipped_files_note(skipped),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — notice is best-effort
+                        logger.warning("skip note failed in %s: %s", channel, exc)
 
             # Files attached but none ingestible, and no text: don't open a blank
             # case — turn the placeholder into a how-to instead.

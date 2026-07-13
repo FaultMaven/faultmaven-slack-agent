@@ -61,44 +61,67 @@ def download_message_content(
     max_files: int = MAX_FILES,
     max_bytes: int = MAX_FILE_BYTES,
     http_client: httpx.Client | None = None,
-) -> tuple[list[SlackFile], str | None]:
+) -> tuple[list[SlackFile], str | None, list[str]]:
     """Download a message's attachments, separating pasted snippets from files.
 
-    Returns ``(files, pasted_text)``: real file uploads keep the
-    ``(name, bytes, ctype)`` shape for multipart forwarding; text snippets
-    (see :func:`_is_snippet`) are decoded and merged into one text blob so
-    callers forward them as ``pasted_content`` — the backend then sees true
-    paste provenance instead of a fake "Untitled" file upload, classifies
-    with paste rules, and any clarification speaks of "the text you pasted"
-    with command-output/logs choices (issue #27 follow-up).
+    Returns ``(files, pasted_text, skipped_names)``:
 
-    Bounds and failure tolerance are shared with
-    :func:`download_message_files`; snippets count against the same
-    ``max_files`` cap.
+    - ``files`` — **at most one** real file upload, as ``(name, bytes,
+      ctype)`` for multipart forwarding. The backend's turn contract is one
+      file per turn (the Copilot sends exactly one; the engine's
+      clarification flow assumes it), so the first attachment that downloads
+      cleanly wins.
+    - ``pasted_text`` — text snippets (see :func:`_is_snippet`) decoded and
+      merged into one blob for ``pasted_content``, so the backend sees true
+      paste provenance instead of a fake "Untitled" file upload (issue #27
+      follow-up). Pastes are not files: they don't count against the
+      one-file rule (up to ``max_files`` snippets merge).
+    - ``skipped_names`` — further real attachments that were NOT ingested
+      (never downloaded), so the caller can tell the user to send each in
+      its own message rather than dropping them silently.
     """
 
-    candidates = message.get("files") or []
+    candidates = [m for m in (message.get("files") or []) if isinstance(m, dict)]
     if not candidates or not token:
-        return [], None
+        return [], None, []
 
+    owns_client = http_client is None
+    client = http_client or httpx.Client(
+        timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
+    )
+    headers = {"Authorization": f"Bearer {token}"}
     files: list[SlackFile] = []
     pasted_chunks: list[str] = []
+    skipped: list[str] = []
+    try:
+        for meta in candidates:
+            if _is_snippet(meta):
+                if len(pasted_chunks) >= max_files:
+                    continue
+                got = _download_one(client, headers, meta, max_bytes)
+                if got is not None:
+                    pasted_chunks.append(got[1].decode("utf-8", errors="replace"))
+            elif files:
+                # One-file-per-turn: don't spend the download; just record
+                # the name for the caller's "send it separately" note.
+                skipped.append(
+                    _safe_name(meta.get("name") or meta.get("title") or meta.get("id"))
+                )
+            else:
+                got = _download_one(client, headers, meta, max_bytes)
+                if got is not None:
+                    files.append(got)
+    finally:
+        if owns_client:
+            client.close()
 
-    def _sort(got: SlackFile, meta: dict) -> None:
-        if _is_snippet(meta):
-            pasted_chunks.append(got[1].decode("utf-8", errors="replace"))
-        else:
-            files.append(got)
-
-    _download_all(
-        token,
-        candidates,
-        max_files=max_files,
-        max_bytes=max_bytes,
-        http_client=http_client,
-        sink=_sort,
-    )
-    return files, ("\n\n".join(pasted_chunks) or None)
+    if not files and not pasted_chunks:
+        logger.warning(
+            "Message had %d file(s) but none were ingested "
+            "(size/permission/scope/empty?)",
+            len(candidates),
+        )
+    return files, ("\n\n".join(pasted_chunks) or None), skipped
 
 
 def download_message_files(
