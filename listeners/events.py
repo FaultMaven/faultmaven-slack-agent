@@ -21,7 +21,7 @@ from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
 from rendering import clean_mention
-from slack_files import download_message_files
+from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
@@ -171,7 +171,9 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     client, channel, thread_ts, exclude_ts=event.get("ts")
                 )
 
-            files = download_message_files(client.token, event)
+            # Pasted snippets come back as text so the backend sees paste
+            # provenance, not a fake "Untitled" file upload.
+            files, snippet_text = download_message_content(client.token, event)
             run_turn_and_post(
                 client,
                 fm,
@@ -180,6 +182,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=text,
+                pasted_content=snippet_text,
                 prior_context=prior_context,
                 files=files or None,
                 placeholder_ts=placeholder_ts,
@@ -221,12 +224,17 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 placeholder_ts = post_placeholder(client, channel, thread_ts)
                 if placeholder_ts is None:
                     return
-                files = (
-                    download_message_files(client.token, event) if has_files else []
-                )
+                files: list = []
+                snippet_text: str | None = None
+                if has_files:
+                    files, snippet_text = download_message_content(
+                        client.token, event
+                    )
                 # File(s) present but unreadable and no text → decline instead of
                 # opening a blank case (mirrors the Assistant surface).
-                query = resolve_query(text or None, downloaded_files=bool(files))
+                query = resolve_query(
+                    text or None, downloaded_files=bool(files or snippet_text)
+                )
                 if query is None:
                     try:
                         client.chat_update(
@@ -245,6 +253,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     thread_ts=thread_ts,
                     team_id=team_id,
                     text=query,
+                    pasted_content=snippet_text,
                     files=files or None,
                     placeholder_ts=placeholder_ts,
                     intro_note=_DM_INTRO,
@@ -288,11 +297,14 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             return
 
         def work() -> None:
-            files = download_message_files(client.token, event) if has_files else []
+            files: list = []
+            snippet_text: str | None = None
+            if has_files:
+                files, snippet_text = download_message_content(client.token, event)
             # File(s) attached but none ingestible, and no text: say so instead
             # of submitting a phantom-evidence turn the engine can only be
             # confused by (mirrors the DM-summons and Assistant declines).
-            if not text and not files:
+            if not text and not files and not snippet_text:
                 try:
                     client.chat_postMessage(
                         channel=channel,
@@ -317,6 +329,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=text or "Please continue the investigation with this evidence.",
+                pasted_content=snippet_text,
                 files=files or None,
                 prior_context=prior_context,
                 mention_user=event.get("user"),
