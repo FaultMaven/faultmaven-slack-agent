@@ -16,7 +16,7 @@ from slack_bolt import Assistant, BoltContext, Say, SetStatus
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
-from slack_files import download_message_files
+from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
@@ -25,6 +25,7 @@ from ._turn import (
     deliver_turn_result,
     offload_turn,
     resolve_query,
+    skipped_files_note,
     run_turn,
     try_begin_turn,
     turn_error_text,
@@ -92,12 +93,19 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
 
         def turn_work() -> None:
             try:
-                # download_message_files no-ops (returns []) when there are no
-                # files.
-                files = download_message_files(client.token, payload)
+                # No-ops when there are no files. Pasted snippets come back
+                # as text so the backend sees paste provenance, not a fake
+                # "Untitled" file upload; attachments beyond the one-file-
+                # per-turn limit come back as names to tell the user about.
+                files, pasted_text, skipped = download_message_content(
+                    client.token, payload
+                )
+                if skipped:
+                    post(skipped_files_note(skipped))
 
                 query = resolve_query(
-                    payload.get("text"), downloaded_files=bool(files)
+                    payload.get("text"),
+                    downloaded_files=bool(files or pasted_text),
                 )
                 if query is None:
                     # No text and nothing ingestible — don't open a blank case;
@@ -119,6 +127,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     channel_id=channel,
                     thread_ts=thread_ts,
                     text=query,
+                    pasted_content=pasted_text,
                     files=files or None,
                 )
             except Exception as exc:  # noqa: BLE001

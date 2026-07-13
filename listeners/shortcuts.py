@@ -16,11 +16,17 @@ from slack_bolt import Ack, App, BoltContext
 from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
-from slack_files import download_message_files
+from slack_files import download_message_content
 from slack_text import message_to_text
 from store import CaseStore
 
-from ._turn import Dedup, post_placeholder, run_gated, run_turn_and_post
+from ._turn import (
+    Dedup,
+    post_placeholder,
+    run_gated,
+    run_turn_and_post,
+    skipped_files_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +119,29 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 _respond_ephemeral(response_url, _CANNOT_POST_TEXT)
                 return
 
-            # Download attached files (logs, screenshots) to forward as evidence.
-            files = download_message_files(client.token, message) if has_files else []
+            # Download attached files (logs, screenshots) to forward as
+            # evidence; pasted snippets come back as text and merge into the
+            # pasted evidence, so the backend sees paste provenance instead
+            # of a fake "Untitled" file upload.
+            files: list = []
+            snippet_text: str | None = None
+            if has_files:
+                files, snippet_text, skipped = download_message_content(
+                    client.token, message
+                )
+                if skipped:
+                    try:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=skipped_files_note(skipped),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — notice is best-effort
+                        logger.warning("skip note failed in %s: %s", channel, exc)
 
             # Files attached but none ingestible, and no text: don't open a blank
             # case — turn the placeholder into a how-to instead.
-            if not alert_text.strip() and not files:
+            if not alert_text.strip() and not files and not snippet_text:
                 try:
                     client.chat_update(
                         channel=channel,
@@ -145,6 +168,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             except Exception as exc:  # noqa: BLE001 — provenance is best-effort
                 logger.debug("permalink fetch failed: %s", exc)
 
+            pasted = "\n\n".join(p for p in (alert_text, snippet_text) if p)
             run_turn_and_post(
                 client,
                 fm,
@@ -153,7 +177,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=_SEED_QUERY,
-                pasted_content=alert_text or None,
+                pasted_content=pasted or None,
                 source_url=source_url,
                 files=files or None,
                 placeholder_ts=placeholder_ts,

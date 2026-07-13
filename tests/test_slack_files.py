@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import httpx
 
-from slack_files import _safe_name, download_message_files
+from slack_files import (
+    _safe_name,
+    download_message_content,
+    download_message_files,
+)
 
 
 def _client(handler) -> httpx.Client:
@@ -204,3 +208,102 @@ def test_respects_max_files_cap():
     files = [_file(name=f"f{i}.log", url_private_download=f"https://files.slack.com/f{i}") for i in range(10)]
     out = download_message_files("tok", {"files": files}, http_client=_client(handler), max_files=3)
     assert len(out) == 3
+
+
+# -- snippet partition (download_message_content) ------------------------------
+def test_snippet_paste_separated_from_real_files():
+    """A pasted snippet ("Untitled", mode=snippet) is a PASTE, not a file the
+    user picked — it comes back as text so the caller forwards it as
+    pasted_content and the backend classifies with paste provenance
+    (issue #27 follow-up: 'Untitled' clarification nonsense)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"kubectl get pods\nkube-proxy 1/1 Running" if "untitled" in str(
+            request.url
+        ) else b"log line"
+        return httpx.Response(200, content=body, headers={"content-type": "text/plain"})
+
+    snippet = _file(
+        name="Untitled",
+        mode="snippet",
+        url_private_download="https://files.slack.com/untitled?d=1",
+        url_private="https://files.slack.com/untitled",
+        size=40,
+    )
+    real = _file(name="app.log", mode="hosted")
+
+    files, pasted, skipped = download_message_content(
+        "xoxb-tok", {"files": [snippet, real]}, http_client=_client(handler)
+    )
+    assert files == [("app.log", b"log line", "text/plain")]
+    assert pasted == "kubectl get pods\nkube-proxy 1/1 Running"
+    assert skipped == []
+
+
+def test_multiple_snippets_merge_into_one_paste():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"chunk", headers={"content-type": "text/plain"})
+
+    snippets = [
+        _file(name="Untitled", mode="snippet"),
+        _file(name="Untitled", mode="snippet"),
+    ]
+    files, pasted, skipped = download_message_content(
+        "xoxb-tok", {"files": snippets}, http_client=_client(handler)
+    )
+    assert files == []
+    assert pasted == "chunk\n\nchunk"
+    assert skipped == []
+
+
+def test_non_text_snippet_stays_on_the_file_path():
+    """The mimetype guard keeps exotic non-text snippets as files, where raw
+    bytes survive intact."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=b"\x89PNG", headers={"content-type": "image/png"}
+        )
+
+    odd = _file(name="Untitled", mode="snippet", mimetype="image/png")
+    files, pasted, skipped = download_message_content(
+        "xoxb-tok", {"files": [odd]}, http_client=_client(handler)
+    )
+    assert pasted is None and skipped == []
+    assert len(files) == 1 and files[0][1] == b"\x89PNG"
+
+
+def test_no_files_returns_empty_and_none():
+    files, pasted, skipped = download_message_content("xoxb-tok", {"files": []})
+    assert files == [] and pasted is None and skipped == []
+
+
+def test_one_file_per_turn_extra_attachments_skipped_by_name():
+    """The backend's turn contract is one file per turn: the first real file
+    is ingested; further attachments aren't even downloaded — their names
+    come back so the caller can tell the user to send them separately."""
+
+    downloads: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        downloads.append(str(request.url))
+        return httpx.Response(200, content=b"data", headers={"content-type": "text/plain"})
+
+    first = _file(name="app.log")
+    second = _file(
+        name="db.log",
+        url_private_download="https://files.slack.com/db.log?d=1",
+        url_private="https://files.slack.com/db.log",
+    )
+    snippet = _file(name="Untitled", mode="snippet")
+
+    files, pasted, skipped = download_message_content(
+        "xoxb-tok",
+        {"files": [first, second, snippet]},
+        http_client=_client(handler),
+    )
+    assert [f[0] for f in files] == ["app.log"]
+    assert skipped == ["db.log"]
+    assert pasted == "data"  # snippets are pastes, exempt from the one-file rule
+    # The skipped file was never downloaded (no wasted transfer).
+    assert not any("db.log" in u for u in downloads)

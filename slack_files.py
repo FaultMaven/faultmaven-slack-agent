@@ -38,6 +38,92 @@ DOWNLOAD_TIMEOUT = 20.0
 _STREAM_CHUNK = 64 * 1024
 
 
+def _is_snippet(meta: dict) -> bool:
+    """True for a Slack text snippet — text PASTED into the composer.
+
+    Slack turns a large paste into a file with ``mode: "snippet"`` and a
+    synthetic name ("Untitled"). It is a paste, not a file the user picked:
+    the name carries no extension signal, and the backend classifies pastes
+    and file uploads differently (paste → content-only rules; upload →
+    extension trust). The mimetype guard keeps any exotic non-text snippet
+    on the file path, where raw bytes survive intact.
+    """
+
+    return meta.get("mode") == "snippet" and (
+        meta.get("mimetype") or ""
+    ).lower().startswith("text/")
+
+
+def download_message_content(
+    token: str,
+    message: dict,
+    *,
+    max_files: int = MAX_FILES,
+    max_bytes: int = MAX_FILE_BYTES,
+    http_client: httpx.Client | None = None,
+) -> tuple[list[SlackFile], str | None, list[str]]:
+    """Download a message's attachments, separating pasted snippets from files.
+
+    Returns ``(files, pasted_text, skipped_names)``:
+
+    - ``files`` — **at most one** real file upload, as ``(name, bytes,
+      ctype)`` for multipart forwarding. The backend's turn contract is one
+      file per turn (the Copilot sends exactly one; the engine's
+      clarification flow assumes it), so the first attachment that downloads
+      cleanly wins.
+    - ``pasted_text`` — text snippets (see :func:`_is_snippet`) decoded and
+      merged into one blob for ``pasted_content``, so the backend sees true
+      paste provenance instead of a fake "Untitled" file upload (issue #27
+      follow-up). Pastes are not files: they don't count against the
+      one-file rule (up to ``max_files`` snippets merge).
+    - ``skipped_names`` — further real attachments that were NOT ingested
+      (never downloaded), so the caller can tell the user to send each in
+      its own message rather than dropping them silently.
+    """
+
+    candidates = [m for m in (message.get("files") or []) if isinstance(m, dict)]
+    if not candidates or not token:
+        return [], None, []
+
+    owns_client = http_client is None
+    client = http_client or httpx.Client(
+        timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    files: list[SlackFile] = []
+    pasted_chunks: list[str] = []
+    skipped: list[str] = []
+    try:
+        for meta in candidates:
+            if _is_snippet(meta):
+                if len(pasted_chunks) >= max_files:
+                    continue
+                got = _download_one(client, headers, meta, max_bytes)
+                if got is not None:
+                    pasted_chunks.append(got[1].decode("utf-8", errors="replace"))
+            elif files:
+                # One-file-per-turn: don't spend the download; just record
+                # the name for the caller's "send it separately" note.
+                skipped.append(
+                    _safe_name(meta.get("name") or meta.get("title") or meta.get("id"))
+                )
+            else:
+                got = _download_one(client, headers, meta, max_bytes)
+                if got is not None:
+                    files.append(got)
+    finally:
+        if owns_client:
+            client.close()
+
+    if not files and not pasted_chunks:
+        logger.warning(
+            "Message had %d file(s) but none were ingested "
+            "(size/permission/scope/empty?)",
+            len(candidates),
+        )
+    return files, ("\n\n".join(pasted_chunks) or None), skipped
+
+
 def download_message_files(
     token: str,
     message: dict,
@@ -58,6 +144,34 @@ def download_message_files(
     if not candidates or not token:
         return []
 
+    out: list[SlackFile] = []
+    _download_all(
+        token,
+        candidates,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        http_client=http_client,
+        sink=lambda got, meta: out.append(got),
+    )
+    return out
+
+
+def _download_all(
+    token: str,
+    candidates: list,
+    *,
+    max_files: int,
+    max_bytes: int,
+    http_client: httpx.Client | None,
+    sink,
+) -> None:
+    """Shared bounded download loop; each success is handed to ``sink``.
+
+    Warns (once) when a message had candidates but nothing was ingested —
+    size, permission, scope, or empty-body skips are per-file logged by
+    :func:`_download_one`.
+    """
+
     owns_client = http_client is None
     # follow_redirects: Slack file URLs legitimately 3xx to a CDN host; without
     # this httpx (unlike requests) would treat the redirect as the response.
@@ -65,27 +179,27 @@ def download_message_files(
         timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
     )
     headers = {"Authorization": f"Bearer {token}"}
-    out: list[SlackFile] = []
+    downloaded = 0
     try:
         for meta in candidates:
-            if len(out) >= max_files:
+            if downloaded >= max_files:
                 break
             if not isinstance(meta, dict):
                 continue
             got = _download_one(client, headers, meta, max_bytes)
             if got is not None:
-                out.append(got)
+                downloaded += 1
+                sink(got, meta)
     finally:
         if owns_client:
             client.close()
 
-    if not out:
+    if not downloaded:
         logger.warning(
             "Message had %d file(s) but none were ingested "
             "(size/permission/scope/empty?)",
             len(candidates),
         )
-    return out
 
 
 def _safe_name(raw: str | None) -> str:
