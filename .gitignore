@@ -30,3 +30,4 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+docs/demo-assets/
