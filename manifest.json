@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "FaultMaven",
-    "description": "AI troubleshooting copilot that works a problem like a seasoned engineer — methodical, evidence-based, and sharper with every case.",
+    "description": "AI troubleshooting copilot that runs the investigation, not just answers.",
     "long_description": "FaultMaven is an AI troubleshooting copilot that works a problem the way a seasoned engineer does — and never forgets what it learns.\n\nHand it an error, a log, or a config and it doesn't just answer — it runs the investigation: triages the symptom, forms hypotheses, asks for the specific evidence that will confirm or eliminate each one, and keeps going until the root cause is found and the fix is verified.\n\nHow it works a case:\n• Goal-driven — every turn moves the case toward a solution, not just a reply\n• Methodical — triage, hypotheses, targeted evidence requests, verified fix; no jumping to conclusions\n• Evidence-based — it reads your logs, errors, and configs, draws on your runbooks and past fixes, and shows the evidence behind every step\n• Self-learning — when a case is resolved, it can capture the fix as a runbook, turning the experience into knowledge the next investigation starts from\n\nYou stay in command: it suggests, you approve and execute. And it only joins where you invite it — @mention it in a channel thread, run \"Ask FaultMaven\" on any alert or error message, or start a direct conversation. Once it's in a thread, just reply to keep the investigation going; each problem gets its own thread, so separate investigations stay separate.",
     "background_color": "#1a1a2e"
   },

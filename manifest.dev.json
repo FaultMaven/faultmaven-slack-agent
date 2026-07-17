@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "FaultMaven (Dev)",
-    "description": "Local-development build of the FaultMaven troubleshooting copilot (Socket Mode).",
+    "description": "AI troubleshooting copilot that runs the investigation, not just answers.",
     "long_description": "Socket Mode development variant of FaultMaven. Create a SEPARATE Slack app from this manifest for local testing (SLACK_TRANSPORT=socket) — you cannot Socket-connect to the same app that the hosted HTTP/OAuth build serves. The production manifest is manifest.json.",
     "background_color": "#1a1a2e"
   },
