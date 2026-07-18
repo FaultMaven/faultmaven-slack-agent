@@ -102,6 +102,6 @@ Kit rendering, **interactive suggested-action buttons**, the Home tab, and
 transport). A **preflight doctor** (`scripts/preflight.py`) verifies the wiring
 before a live test.
 
-**Next:** per-user FaultMaven account linking (workspace→org binding), a
+**Next:** per-user FaultMaven account linking (workspace→Team binding), a
 token-streaming reasoning timeline, and terminal-state reports — see the roadmap
 in [docs/design.md](docs/design.md) §16.

@@ -88,11 +88,11 @@ externalized. Horizontal scale is a follow-up, not required for the beta.
 
 ## Deferred (documented, not silently dropped)
 
-- **Per-user FaultMaven account linking (PKCE) + workspace→org binding**
+- **Per-user FaultMaven account linking (PKCE) + workspace→Team binding**
   (design.md §10.2/10.3). Blocked on open backend asks (§15.2/15.3): no
-  workspace→org binding API and no first-class service-identity token type exist
+  workspace→Team binding API and no first-class service-identity token type exist
   yet. For the beta, every workspace's turns run under one cloud FM service token;
-  the case always lives in that one org. No fabricated tenant isolation.
+  the case always lives in that one Org. No fabricated tenant isolation.
 - **Multi-replica / HA** — gated on externalizing the case store.
 
 ## Local development (Socket Mode)

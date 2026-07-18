@@ -157,9 +157,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             return
 
         channel = event["channel"]
-        # context.team_id (the app's install team) keys the thread's case and gate
-        # uniformly across surfaces — event["team"] is the *sender's* team and can
-        # differ in Slack Connect, which would fork the case/gate.
+        # context.team_id (the app's install team = the Slack workspace, which
+        # binds to a FaultMaven Team — not itself a FaultMaven Team) keys the
+        # thread's case and gate uniformly across surfaces — event["team"] is the
+        # *sender's* team and can differ in Slack Connect, forking the case/gate.
         team_id = context.team_id or ""
         # A mention may be top-level (use its ts) or already inside a thread.
         thread_ts = event.get("thread_ts") or event["ts"]
