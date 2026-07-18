@@ -6,7 +6,9 @@ Bolt must look up on every inbound request to authorize the right workspace, and
 each ``/slack/install`` mints a short-lived state value the redirect must
 validate against CSRF. Both live in a SQL database so they survive restarts and
 are shared across replicas — keyed by ``team_id``/``enterprise_id``, never
-cross-read between workspaces (§10.3 tenant isolation).
+cross-read between workspaces (§10.3 tenant isolation). Here ``team_id`` is
+**Slack's** workspace identifier (a FaultMaven Team binds to it), not a
+FaultMaven Team; see the naming-collision note in ``docs/design.md`` §10.
 
 One ``SLACK_DATABASE_URL`` drives both stores: a repo-anchored SQLite file for
 local development and tests, a Postgres URL in the cluster. The SQLAlchemy stores

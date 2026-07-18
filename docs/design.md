@@ -31,9 +31,9 @@ Two goals drive every decision, and they are **complementary, not in tension**:
 | Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives that make the agent feel native; the skeleton uses none of them. |
 | Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` (+ auto-continue) + the **Ask** message shortcut | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
 | Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
-| Case scoping & lifecycle | **Thread-scoped collaborative cases under the org**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
+| Case scoping & lifecycle | **Thread-scoped collaborative cases shared to the workspace's Team**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
-| Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ FaultMaven organization; per-user FaultMaven account linking. |
+| Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ a FaultMaven **Team** (within the customer's Organization); per-user FaultMaven account linking. |
 | Privacy posture | **Subscribe-and-gate** — `message.channels`/`message.groups` for in-thread continuity, but act only on already-owned threads (never ambient) | Same enterprise-trust "no firehose" guarantee as strict mention-only, with the in-thread UX; ownership gate does the filtering. |
 | Backend integration | **FaultMaven REST** (`/cases`, `/cases/{id}/turns`, `/reports`, `/knowledge`) | Carries the case state machine, evidence pipeline, and milestones. |
 
@@ -49,7 +49,7 @@ not exist.** The real contract is: **create a case**
 | State | Surfaces / features |
 |---|---|
 | **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport. |
-| **Designed, not yet built** | per-user FaultMaven account linking + workspace→org binding (§10.2/10.3 — blocked on backend asks §15.2/15.3; beta runs all workspaces under one cloud FM service token) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
+| **Designed, not yet built** | per-user FaultMaven account linking + workspace→Team binding (§10.2/10.3 — blocked on backend asks §15.2/15.3; beta runs all workspaces under one cloud FM service token) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
 | **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
 ---
@@ -84,7 +84,8 @@ uniquely great at.
 - A first-class AI-App experience: suggested prompts, live status, streamed
   reasoning, hypotheses, and actionable next steps.
 - Multi-workspace cloud deployment with clean tenant isolation
-  (workspace ↔ org).
+  (the customer's **Organization** is the tenant/isolation boundary; each Slack
+  workspace maps to a **Team** within it).
 - Honor FaultMaven's two soundness guarantees in every rendered turn (§9.3):
   **never present an incorrect conclusion; never collapse under pressure** —
   when data is inadequate, keep engaging and *name the missing data*.
@@ -370,7 +371,8 @@ enforcing strict turn-taking, entirely agent-side:
 
 **Multi-author** is handled as metadata, not a turn-model change: a turn is
 attributed to the pinging Slack user (used for the `@mention`); the *case* is a
-team artifact under the org (§6.1). Content drives the diagnosis, not authorship.
+collaborative artifact shared to the workspace's Team (§6.1). Content drives the
+diagnosis, not authorship.
 
 ### 5.4 Evidence input — consume Slack's native inputs, don't build an uploader
 
@@ -410,17 +412,19 @@ problem-solving unit.
 Stop mapping Slack onto "an individual's private cases." In a war room a case is
 a **team artifact**:
 
-- The isolation boundary is the **workspace → FaultMaven org** (the multi-tenant
-  model, §10). That is the real tenancy line.
-- A case is **scoped to its thread/channel**, attributed to its participants
-  (initiator + pingers) via metadata / account-linking — not owned by one person.
+- The tenancy/isolation boundary is the customer's **FaultMaven Organization**
+  (RLS keys on `org_id`, the multi-tenant model, §10); the Slack workspace maps
+  to a **Team** (the sharing unit) within that Org. That is the real tenancy line.
+- A case is **scoped to its thread/channel** and **shared to the workspace's
+  Team**, attributed to its participants (initiator + pingers) via metadata /
+  account-linking — not owned by one person.
 - Case *browsing* is the Dashboard's job (deep-linked from Slack), scoped
   per-channel/workspace there — not a global "my cases" pile reimplemented in
   Slack (§4.5).
 
 So "all Slack users collapse to one user" stops being a bug once the meaningful
-owner is the *team/channel under the org*; per-user identity is attribution
-metadata, not the ownership axis.
+sharing scope is the workspace's *Team* (within the Org); per-user identity is
+attribution metadata, not the ownership axis.
 
 ### 6.2 The thread is the scope; the agent supplies the lifecycle drivers
 
@@ -617,9 +621,18 @@ pressure**. The rendering layer enforces this:
 
 ## 10. Auth & multi-tenancy (Cloud OAuth, multi-workspace)
 
-Two OAuth flows, each doing a distinct job. Mapping: **Slack workspace ↔
-FaultMaven organization** (the tenant boundary); **Slack user ↔ FaultMaven user**
-(attribution metadata, per §6.1 — not the case-ownership axis).
+Two OAuth flows, each doing a distinct job. Mapping (per **ADR-013**): **Slack
+workspace ↔ a FaultMaven Team** (the sharing unit); the customer's **FaultMaven
+Organization** is the tenant/isolation boundary that *groups* Teams; **Slack user
+↔ FaultMaven user** (attribution metadata, per §6.1 — not the case-ownership
+axis). A single-workspace customer collapses Org and Team 1:1; a multi-workspace
+(Slack Grid) customer is **one Organization** containing several Teams (one per
+workspace).
+
+> **Naming collision — Slack `team_id` ≠ FaultMaven Team.** Slack's own
+> `team_id` (and Bolt's `context.team_id`) identifies the **Slack workspace**, not
+> a FaultMaven Team. Throughout this repo, `team_id` always means the Slack
+> workspace; the FaultMaven Team it binds to is written out as "Team".
 
 ### 10.1 Slack app installation (workspace-level)
 
@@ -627,9 +640,10 @@ FaultMaven organization** (the tenant boundary); **Slack user ↔ FaultMaven use
   `OAuthSettings` with a **Postgres-backed `InstallationStore`** and
   `OAuthStateStore` (the template's `FileInstallationStore` is dev-only).
 - Yields the per-team bot token (`xoxb`), `team_id`, installer identity.
-- During install, the installing **org admin links the workspace to a FaultMaven
-  organization** (a one-time FaultMaven OAuth/admin step), establishing
-  `team_id → faultmaven_org_id`.
+- During install, the installing **admin links the workspace to a FaultMaven
+  Team** (within the customer's Organization; a one-time FaultMaven OAuth/admin
+  step), establishing `team_id → faultmaven_team_id` (and thereby the owning
+  `org_id`).
 
 ### 10.2 FaultMaven account linking (per user)
 
@@ -649,8 +663,9 @@ Reuses the Copilot's proven PKCE flow (`client_id=faultmaven-copilot`, scopes
 **War-room fallback (avoid collapse-under-pressure for UX):** in a shared
 incident thread, requiring every participant to link before the agent responds
 would stall the room. So unlinked users' turns run under a **workspace service
-identity** (the team→org binding), attributed to the Slack user in metadata. The
-*case* always lives in the bound org — never cross-tenant.
+identity** (the workspace→Team binding, resolving to the owning Org), attributed
+to the Slack user in metadata. The *case* always lives in the bound Org — never
+cross-tenant.
 
 > **Gate destructive/global actions on a personal token.** The service identity
 > is fine for read + investigate turns, but mutations with blast radius beyond
@@ -659,12 +674,12 @@ identity** (the team→org binding), attributed to the Slack user in metadata. T
 
 ### 10.3 Tenant isolation
 
-- Every FaultMaven call carries a token scoped to the bound org; `org_id` is
+- Every FaultMaven call carries a token scoped to the bound Org; `org_id` is
   derived from the token server-side (never passed by us).
-- Our stores (installations, tokens, thread→case map) are keyed by `team_id`;
-  no cross-team reads.
-- This rides FaultMaven's existing multi-tenant RLS model
-  (workspace = org = tenant boundary).
+- Our stores (installations, tokens, thread→case map) are keyed by `team_id`
+  (the Slack workspace); no cross-workspace reads.
+- This rides FaultMaven's existing multi-tenant RLS model (the **Organization**
+  is the RLS tenant boundary; the workspace resolves to a **Team** within it).
 
 ---
 
@@ -780,9 +795,9 @@ requirement without widening the privacy surface.
    (or a documented way to drive the SSE `…/execute` path through the case state
    machine) would let us stream real tokens + tool calls into `chat_stream`
    instead of synthesizing the timeline post-hoc. Confirms §9.1 v2.
-2. **Workspace→org binding API.** What is the cleanest FaultMaven call to bind a
-   Slack `team_id` to an org at install time (admin OAuth vs. service token vs.
-   provisioning endpoint)?
+2. **Workspace→Team binding API.** What is the cleanest FaultMaven call to bind a
+   Slack `team_id` (the workspace) to a FaultMaven **Team** (and its owning Org)
+   at install time (admin OAuth vs. service token vs. provisioning endpoint)?
 3. **Service identity for the war-room fallback.** Is there a first-class
    service-account token type (§10.2), or do we mint a per-workspace technical
    user?
@@ -816,7 +831,7 @@ requirement without widening the privacy surface.
    fresh-on-revival (§6.2); terminal-state report generation; deep-link to the
    Dashboard for the case portfolio (no in-Slack case list, §4.5).
 6. **P5 — Multi-tenant OAuth hardening + war-room entry.** Per-user account
-   linking + refresh; workspace→org binding; war-room fallback; `not_in_channel`;
+   linking + refresh; workspace→Team binding; war-room fallback; `not_in_channel`;
    the `@mention` catch-up read (the one history-scope feature, §5.2).
 7. **P6 — Launch polish.** Architecture diagram, README/setup, product
    walkthrough.
