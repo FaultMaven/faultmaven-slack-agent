@@ -38,6 +38,7 @@ faultmaven-slack-agent/
 ├── store.py              # thread→case map (SQLite)
 ├── rendering.py          # TurnResult → Block Kit
 ├── slack_text.py         # Slack message (blocks/attachments) → readable text
+├── slack_mrkdwn.py       # Markdown → Slack mrkdwn conversion
 ├── slack_files.py        # download a message's attached files → evidence bytes
 ├── faultmaven/
 │   └── client.py         # FaultMaven API client (create case, multipart turns, health)
@@ -46,9 +47,14 @@ faultmaven-slack-agent/
 │   ├── events.py         # app_mention + thread-reply auto-continue (war-room)
 │   ├── shortcuts.py      # "Ask FaultMaven" message-shortcut opener
 │   ├── actions.py        # suggested-action button clicks
+│   ├── home.py           # App Home tab
 │   └── _turn.py          # shared pipeline: gate (drop-if-busy) → turn → post
-├── scripts/preflight.py  # preflight doctor (env + Slack + backend checks)
-├── manifest.json         # Slack app manifest (scopes, events, assistant_view, shortcut)
+├── scripts/
+│   ├── preflight.py      # preflight doctor (env + Slack + backend checks)
+│   └── push_manifest.py  # push manifest.json to a Slack app via the App Manifest API
+├── manifest.json         # Slack app manifest — hosted/OAuth (scopes, events, assistant_view, shortcut)
+├── manifest.dev.json     # Slack app manifest — local dev (Socket Mode)
+├── PRIVACY.md            # privacy policy (Marketplace requirement)
 ├── docs/design.md        # authoritative design
 └── docs/LIVE_TEST.md     # install + smoke runbook (real workspace)
 ```
@@ -65,7 +71,7 @@ python app.py                   # connects via Socket Mode — no public URL nee
 ```
 
 If `FAULTMAVEN_API_TOKEN` is empty, the agent bootstraps a token via
-`/auth/dev-login` (local `AUTH_MODE` only) using `FAULTMAVEN_DEV_LOGIN_USERNAME`.
+`/api/v1/auth/dev-login` (local `AUTH_MODE` only) using `FAULTMAVEN_DEV_LOGIN_USERNAME`.
 
 **Testing in a real workspace?** Follow the step-by-step runbook in
 [docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,
@@ -77,8 +83,8 @@ Two manifests, two transports:
 
 - **Hosted / production** — [`manifest.json`](manifest.json): HTTP/Events +
   multi-workspace OAuth (`socket_mode_enabled: false`, request/redirect URLs on
-  `slack.faultmaven.ai`). This is the Marketplace-eligible production app. Deploy
-  guide: [docs/HOSTING.md](docs/HOSTING.md).
+  `slack.faultmaven.ai`). This is the Marketplace-ready transport; deploy it
+  yourself following [docs/HOSTING.md](docs/HOSTING.md).
 - **Local dev** — [`manifest.dev.json`](manifest.dev.json): Socket Mode on, no
   public URL. Fastest path to a real test. Walkthrough:
   [docs/LIVE_TEST.md](docs/LIVE_TEST.md).
@@ -105,3 +111,11 @@ before a live test.
 **Next:** per-user FaultMaven account linking (workspace→Team binding), a
 token-streaming reasoning timeline, and terminal-state reports — see the roadmap
 in [docs/design.md](docs/design.md) §16.
+
+## Privacy
+
+What the agent reads, forwards, and stores is documented in [PRIVACY.md](PRIVACY.md).
+
+## License
+
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
