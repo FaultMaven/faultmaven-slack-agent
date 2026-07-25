@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from pathlib import Path
 
 from slack_bolt import App
 from slack_bolt.oauth.oauth_settings import OAuthSettings
@@ -33,6 +34,7 @@ from slack_sdk.http_retry.builtin_handlers import (
 )
 
 from config import DEFAULT_BOT_SCOPES, Settings, get_settings
+from credentials import CredentialStore
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
@@ -62,13 +64,27 @@ def make_fault_client(settings: Settings) -> FaultMavenClient:
 
     Shared by the runtime (:func:`build_app`) and the preflight doctor so the
     client wiring has one definition and can't drift between them.
+
+    The credential store is created when a refresh credential is configured OR
+    one has already been persisted — so a dev-login/preset-token deployment
+    writes no extra file, while an operator who clears the one-time
+    FAULTMAVEN_REFRESH_TOKEN seed after bootstrap keeps working off the store.
     """
 
+    use_refresh_grant = bool(settings.faultmaven_refresh_token) or Path(
+        settings.credential_store_path
+    ).exists()
+    credential_store = (
+        CredentialStore(settings.credential_store_path) if use_refresh_grant else None
+    )
     return FaultMavenClient(
         settings.faultmaven_api_url,
         token=settings.faultmaven_api_token,
         dev_login_username=settings.faultmaven_dev_login_username,
         timeout=settings.faultmaven_request_timeout,
+        refresh_token=settings.faultmaven_refresh_token,
+        credential_store=credential_store,
+        oauth_client_id=settings.faultmaven_oauth_client_id,
     )
 
 

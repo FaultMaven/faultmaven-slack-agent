@@ -50,8 +50,11 @@ the infra repo.
 | `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. |
 | `SLACK_OAUTH_REDIRECT_URI` | config | pinned to `https://slack.faultmaven.ai/slack/oauth_redirect` |
 | `FAULTMAVEN_API_URL=https://api.faultmaven.ai` | config | cluster backend |
-| `FAULTMAVEN_API_TOKEN` | secret | cloud FM service bearer (the beta identity all workspaces run under) |
+| `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
+| `FAULTMAVEN_REFRESH_TOKEN` | secret | **required against an `oauth`-mode backend** — provisioned refresh credential (ADR-012 D10). A one-time seed: the grant rotates and the live token then lives in `CREDENTIAL_STORE_PATH`. See [Service account credentials](#service-account-credentials-oauth-mode-backends) |
+| `FAULTMAVEN_OAUTH_CLIENT_ID` | config | client id presented on the refresh grant (default `faultmaven-slack-agent`) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
+| `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
 
 Missing http-mode credentials fail fast at boot with a named error
 (`config.Settings._validate_transport_requirements`), never as an opaque runtime
@@ -64,6 +67,38 @@ error on the first Slack event.
   Deployment **must** mount a PersistentVolume for it (or the infra repo may
   externalize it onto the same Postgres). Without persistence, a restart wipes the
   map and every in-progress investigation is orphaned into a fresh empty case.
+- **rotated FaultMaven credential** → SQLite at `CREDENTIAL_STORE_PATH`, on the
+  same PersistentVolume. Each renewal revokes the token it presented, so a
+  restart that cannot read this file cannot authenticate at all — recovery
+  needs an operator (below).
+
+## Service account credentials (oauth-mode backends)
+
+Against a backend running `AUTH_MODE=oauth` (cloud), dev-login is not served —
+it returns 404. The agent instead holds a provisioned **refresh token** and mints
+its own access tokens (ADR-012 D10).
+
+**Bootstrap.** On the backend, mint a credential and put it in the agent's
+Secret as `FAULTMAVEN_REFRESH_TOKEN`:
+
+```bash
+kubectl exec -it deploy/faultmaven-api -- \
+    python scripts/auth/provision_service_account.py -u slack-agent --token-only
+```
+
+**Renewal is automatic and rotating.** Every renewal returns a new refresh token
+and revokes the presented one. The agent persists the new token before using it,
+serializes renewals so two never race, and — because the window is wall-clock —
+also renews on an idle timer so a quiet workspace can't age its credential out.
+
+**Lockout and recovery.** If the credential is rejected (expired past the
+server's window, or revoked because a rotation was lost), the agent logs a
+credential error naming the fix and stops trying. Recovery: re-run the
+provisioning command above and update the Secret. Re-provisioning does not
+revoke a credential still in use, so it is safe to run against a healthy agent.
+
+**Blast radius.** A failure here degrades Slack only; the dashboard and Copilot
+authenticate through WorkOS/PKCE.
 
 ## Single-replica (for now)
 

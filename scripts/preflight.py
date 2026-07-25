@@ -37,7 +37,11 @@ from slack_sdk.errors import SlackApiError  # noqa: E402
 # config/client pull no Slack handlers, so importing them here is cheap.
 from app import make_fault_client  # noqa: E402 — shared client factory
 from config import Settings, get_settings  # noqa: E402
-from faultmaven import FaultMavenClient, FaultMavenError  # noqa: E402
+from faultmaven import (  # noqa: E402
+    FaultMavenClient,
+    FaultMavenCredentialError,
+    FaultMavenError,
+)
 
 GREEN, RED, YELLOW, DIM, RESET = (
     "\033[32m",
@@ -187,10 +191,16 @@ def check_backend(fm: FaultMavenClient) -> bool:
 def check_backend_auth(fm: FaultMavenClient, settings: Settings) -> bool:
     print("\nFaultMaven auth")
     try:
-        # verify_auth() obtains a token (dev-login or preset) AND confirms the
-        # backend accepts it — so a stale/wrong preset token fails here rather
-        # than 401-ing on the first real Slack turn.
+        # verify_auth() obtains a token (refresh grant, preset, or dev-login)
+        # AND confirms the backend accepts it — so a stale credential fails here
+        # rather than 401-ing on the first real Slack turn.
         fm.verify_auth()
+    except FaultMavenCredentialError as exc:
+        return _fail(
+            f"refresh credential rejected: {exc}",
+            "re-run the backend's scripts/auth/provision_service_account.py and "
+            "set the new FAULTMAVEN_REFRESH_TOKEN.",
+        )
     except FaultMavenError as exc:
         if "401" in str(exc):
             return _fail(
@@ -203,10 +213,16 @@ def check_backend_auth(fm: FaultMavenClient, settings: Settings) -> bool:
             return _warn(f"could not confirm the token: {exc}")
         return _fail(
             f"could not obtain a bearer token: {exc}",
-            "set FAULTMAVEN_API_TOKEN for this backend, or run a backend in "
-            "local AUTH_MODE so dev-login works.",
+            "set FAULTMAVEN_REFRESH_TOKEN (oauth-mode backend) or "
+            "FAULTMAVEN_API_TOKEN, or run a backend in local AUTH_MODE so "
+            "dev-login works.",
         )
-    how = "preset token" if settings.faultmaven_api_token else "dev-login bootstrap"
+    if settings.faultmaven_refresh_token:
+        how = "refresh grant"
+    elif settings.faultmaven_api_token:
+        how = "preset token"
+    else:
+        how = "dev-login bootstrap"
     return _ok("bearer token accepted", f"via {how}")
 
 
