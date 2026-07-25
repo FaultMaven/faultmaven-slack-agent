@@ -28,6 +28,7 @@ from faultmaven import (
     CaseNotFoundError,
     FaultMavenAPIError,
     FaultMavenClient,
+    FaultMavenCredentialError,
     FaultMavenTimeoutError,
     TurnResult,
 )
@@ -66,6 +67,13 @@ TURN_TIMEOUT_TEXT = (
 CASE_GONE_TEXT = (
     ":warning: This investigation's case no longer exists on the backend, so "
     "I've unlinked it — your next message here starts a fresh investigation."
+)
+# The agent's own credential is dead (ADR-012 D10). Nothing the user does fixes
+# it, and retrying just reproduces it — point at the operator without leaking
+# what the credential is or why it failed.
+CREDENTIAL_ERROR_TEXT = (
+    ":warning: I can't sign in to FaultMaven right now, so I can't work on "
+    "this. This needs an admin to restore my access — retrying won't help."
 )
 # The failure came from our own teardown, not the turn: say so.
 RESTARTING_TEXT = (
@@ -114,6 +122,11 @@ def turn_error_text(exc: Exception) -> str:
     # the original ordering.
     if isinstance(exc, FaultMavenTimeoutError):
         return TURN_TIMEOUT_TEXT
+    # Also checked before the shutdown override: a dead credential outlives the
+    # restart the shutdown message promises, so "resend in a minute" would be a
+    # false promise.
+    if isinstance(exc, FaultMavenCredentialError):
+        return CREDENTIAL_ERROR_TEXT
     if _shutting_down.is_set():
         return RESTARTING_TEXT
     if isinstance(exc, CaseNotFoundError):

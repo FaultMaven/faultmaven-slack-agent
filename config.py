@@ -100,6 +100,20 @@ class Settings(BaseSettings):
     faultmaven_dev_login_username: str = Field(
         default="admin", validation_alias="FAULTMAVEN_DEV_LOGIN_USERNAME"
     )
+    # Provisioned refresh-token credential (ADR-012 D10). Required against an
+    # AUTH_MODE=oauth backend, where dev-login 404s. Mint one with the backend's
+    # scripts/auth/provision_service_account.py. This is a one-time SEED: the
+    # grant rotates, and the rotated token lives in ``credential_store_path``
+    # from then on. Takes precedence over dev-login when set.
+    faultmaven_refresh_token: str = Field(
+        default="", validation_alias="FAULTMAVEN_REFRESH_TOKEN"
+    )
+    # OAuth client_id presented on the refresh grant. Identifies the agent in
+    # the backend's auth logs.
+    faultmaven_oauth_client_id: str = Field(
+        default="faultmaven-slack-agent",
+        validation_alias="FAULTMAVEN_OAUTH_CLIENT_ID",
+    )
     # Upper bound for one turn (incl. 202+poll). Runs behind the Slack ack, so
     # it can comfortably exceed Slack's 3s budget.
     faultmaven_request_timeout: float = Field(
@@ -111,6 +125,12 @@ class Settings(BaseSettings):
     # FaultMaven case is this Slack thread").
     case_store_path: str = Field(
         default="data/cases.db", validation_alias="CASE_STORE_PATH"
+    )
+    # SQLite file holding the rotated FaultMaven refresh credential. MUST be on
+    # durable storage: the rotation revokes the previous token, so losing this
+    # file locks the agent out until an operator re-provisions.
+    credential_store_path: str = Field(
+        default="data/credentials.db", validation_alias="CREDENTIAL_STORE_PATH"
     )
 
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
@@ -202,14 +222,14 @@ class Settings(BaseSettings):
             )
         return level
 
-    @field_validator("case_store_path")
+    @field_validator("case_store_path", "credential_store_path")
     @classmethod
     def _anchor_store_path(cls, value: str) -> str:
-        # The thread→case map is the source of truth for which case a thread
-        # belongs to. Anchor a relative path to the repo (this file's parent),
-        # not the cwd — starting the agent from a different directory would
-        # otherwise silently fork an empty store and every active thread would
-        # lose its investigation.
+        # These stores are sources of truth (which case a thread belongs to;
+        # the live refresh credential). Anchor a relative path to the repo
+        # (this file's parent), not the cwd — starting the agent from a
+        # different directory would otherwise silently fork an empty store,
+        # orphaning every active thread and losing the rotated credential.
         path = Path(value).expanduser()
         if not path.is_absolute():
             path = Path(__file__).resolve().parent / path

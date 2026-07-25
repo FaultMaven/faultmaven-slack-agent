@@ -70,8 +70,13 @@ python scripts/preflight.py     # verify env + Slack tokens + backend before con
 python app.py                   # connects via Socket Mode — no public URL needed
 ```
 
-If `FAULTMAVEN_API_TOKEN` is empty, the agent bootstraps a token via
-`/api/v1/auth/dev-login` (local `AUTH_MODE` only) using `FAULTMAVEN_DEV_LOGIN_USERNAME`.
+How the agent authenticates to the FaultMaven backend, in precedence order:
+
+| Credential | When |
+|---|---|
+| `FAULTMAVEN_REFRESH_TOKEN` | Backend runs `AUTH_MODE=oauth` (cloud), where dev-login is not served. Provisioned on the backend with `scripts/auth/provision_service_account.py`; the agent renews and rotates it automatically. See [docs/HOSTING.md](docs/HOSTING.md#service-account-credentials-oauth-mode-backends). |
+| `FAULTMAVEN_API_TOKEN` | A static bearer you supply. Cannot be renewed. |
+| `FAULTMAVEN_DEV_LOGIN_USERNAME` | Neither of the above set — bootstraps via `/api/v1/auth/dev-login` (local `AUTH_MODE` only). |
 
 **Testing in a real workspace?** Follow the step-by-step runbook in
 [docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,
