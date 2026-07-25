@@ -2,13 +2,17 @@
 
 Under ``AUTH_MODE=oauth`` dev-login 404s, so the agent authenticates with a
 provisioned refresh token and mints its own access tokens. The grant *rotates*:
-each renewal revokes the token it was handed, which turns three ordinary-looking
-details into correctness requirements, all pinned here:
+each renewal revokes the token it was handed, so at every moment exactly one
+credential is live and losing it costs an operator round-trip. That turns a set
+of ordinary-looking details into correctness requirements, all pinned here:
 
-* the rotated token is persisted BEFORE it is relied on (a crash in between is a
-  lockout — the old token is already dead);
-* renewals are single-flight (two concurrent renewals revoke each other);
-* a rejected credential is reported as an operator action, not retried.
+* the rotated token is persisted before it is relied on — and, if that write
+  fails, kept in memory and re-written later rather than discarded (dropping it
+  would make a transient disk error a permanent lockout);
+* renewals are single-flight, and shutdown waits for one in flight;
+* a rejected credential is retried against the store (another process may have
+  rotated it) and the configured seed before a lockout is declared;
+* renewal is reachable from every request path, not just ``_post``.
 
 Uses httpx.MockTransport, so the real request shaping is exercised without a
 live backend.
@@ -145,19 +149,6 @@ def test_rotated_token_is_persisted():
 
     assert store.puts == ["rt-next"]
     assert client._refresh_token == "rt-next"
-
-
-def test_unpersistable_rotation_fails_instead_of_proceeding():
-    """Write-before-use: if the rotated token can't be stored, the agent is
-    already locked out for the next restart — say so rather than run on a
-    credential that is about to be lost."""
-    store = FakeStore(token="stored-rt", fail_on_put=True)
-    client = make_client(lambda r: token_response(), store=store)
-
-    with pytest.raises(FaultMavenCredentialError, match="could not be persisted"):
-        client._current_token()
-
-    assert client._token == ""
 
 
 def test_persisted_credential_wins_over_the_configured_seed():
@@ -431,8 +422,12 @@ def test_keepalive_renews_even_with_a_live_access_token():
 
 
 def test_persist_failure_does_not_burn_the_configured_seed():
-    """A storage failure is not a rejected credential. Retrying with the
-    operator's fresh seed would consume it against the same broken disk."""
+    """A storage failure is not a rejected credential.
+
+    Only a backend rejection may try an alternative credential; a failed write
+    must not spend the operator's fresh seed on a retry that would hit the same
+    broken volume.
+    """
     presented: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -442,7 +437,170 @@ def test_persist_failure_does_not_burn_the_configured_seed():
     store = FakeStore(token="stored-rt", fail_on_put=True)
     client = make_client(handler, refresh_token="fresh-seed", store=store)
 
-    with pytest.raises(FaultMavenCredentialError, match="could not be persisted"):
-        client._current_token()
+    client._current_token()
 
     assert presented == ["stored-rt"]
+
+
+# -- a write failure must not become a lockout --------------------------------
+def test_persist_failure_keeps_the_rotated_token_in_play():
+    """The rotated token is the only live one — the presented one is already
+    revoked. Discarding it on a write error turns a momentarily full volume into
+    a permanent lockout that recovering the disk cannot undo."""
+    store = FakeStore(token="stored-rt", fail_on_put=True)
+    client = make_client(lambda r: token_response(refresh="rt-next"), store=store)
+
+    assert client._current_token() == "at-1"
+    assert client._refresh_token == "rt-next"
+    assert client._credential_unpersisted is True
+
+
+def test_a_pending_write_is_retried_and_heals():
+    """Once the volume recovers, the credential lands on disk without a restart."""
+    store = FakeStore(token="stored-rt", fail_on_put=True)
+    client = make_client(lambda r: token_response(refresh="rt-next"), store=store)
+    client._current_token()
+
+    store.fail_on_put = False  # disk recovers
+    client._retry_pending_persist()
+
+    assert store.puts == ["rt-next"]
+    assert client._credential_unpersisted is False
+
+
+# -- out-of-band rotation -----------------------------------------------------
+def test_rejected_credential_falls_back_to_the_store():
+    """Another process may have rotated it — preflight authenticates, which
+    under the refresh grant consumes a rotation. A valid token sitting in the
+    store must not be ignored while the agent declares itself locked out."""
+    presented: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = json.loads(request.content)["refresh_token"]
+        presented.append(token)
+        if token == "stale-rt":
+            return httpx.Response(401, json={"detail": "invalid_grant"})
+        return token_response()
+
+    store = FakeStore(token="stale-rt")
+    client = make_client(handler, refresh_token="", store=store)
+    store.token = "rotated-by-preflight"  # another process moved it on
+
+    assert client._current_token() == "at-1"
+    assert presented == ["stale-rt", "rotated-by-preflight"]
+
+
+def test_store_then_seed_are_both_tried_before_declaring_lockout():
+    presented: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = json.loads(request.content)["refresh_token"]
+        presented.append(token)
+        if token == "good-seed":
+            return token_response()
+        return httpx.Response(401, json={"detail": "invalid_grant"})
+
+    store = FakeStore(token="dead-a")
+    client = make_client(handler, refresh_token="good-seed", store=store)
+    store.token = "dead-b"
+
+    assert client._current_token() == "at-1"
+    assert presented == ["dead-a", "dead-b", "good-seed"]
+
+
+def test_lockout_is_still_reported_when_nothing_works():
+    store = FakeStore(token="dead-a")
+    client = make_client(
+        lambda r: httpx.Response(401, json={"detail": "invalid_grant"}),
+        refresh_token="dead-b",
+        store=store,
+    )
+
+    with pytest.raises(FaultMavenCredentialError):
+        client._current_token()
+
+
+# -- renewal is reachable from every path -------------------------------------
+def test_mid_poll_401_renews_under_the_refresh_grant():
+    """A 15-minute access token can expire inside a ≤120s poll. The dev-login
+    gate on this branch made it unreachable in the natural oauth config."""
+    calls = {"token": 0, "poll": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/oauth/token"):
+            calls["token"] += 1
+            return token_response(access=f"at-{calls['token']}")
+        calls["poll"] += 1
+        if calls["poll"] == 1:
+            return httpx.Response(401, json={"detail": "expired"})
+        return httpx.Response(200, json={"agent_response": "done"})
+
+    client = make_client(handler, dev_login_username="")
+    resp = client._poll("/api/v1/cases/c1/turns/1")
+
+    assert resp.status_code == 200
+    assert calls["token"] == 2
+
+
+# -- shutdown -----------------------------------------------------------------
+def test_close_waits_for_an_in_flight_renewal():
+    """Closing the http client or the store under a renewal loses the rotated
+    token — and the presented one is already revoked."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        release.wait(timeout=5)
+        return token_response()
+
+    store = FakeStore(token="rt-0")
+    client = make_client(handler, store=store)
+
+    renewal = threading.Thread(target=client._current_token)
+    renewal.start()
+    started.wait(timeout=5)
+
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    closer.join(timeout=0.5)
+    assert closer.is_alive(), "close() returned while a renewal was in flight"
+
+    release.set()
+    renewal.join(timeout=5)
+    closer.join(timeout=5)
+    assert store.puts == ["rt-2"]
+    assert store.closed is True
+
+
+# -- diagnostics --------------------------------------------------------------
+def test_auth_mode_reports_the_refresh_grant_without_a_configured_seed():
+    """The steady state after bootstrap: credential in the store, seed cleared.
+    Settings alone can't tell that from having no credential at all."""
+    client = make_client(
+        lambda r: token_response(), refresh_token="", store=FakeStore(token="rt-0")
+    )
+
+    assert client.auth_mode == "refresh grant"
+
+
+def test_explicit_preset_token_is_not_shadowed_by_a_leftover_store(
+    monkeypatch, tmp_path
+):
+    """A credentials.db left behind by an earlier deployment must not silently
+    take over from an explicitly configured FAULTMAVEN_API_TOKEN."""
+    from app import make_fault_client
+
+    path = tmp_path / "credentials.db"
+    leftover = CredentialStore(str(path))
+    leftover.put("leftover-rt")
+    leftover.close()
+
+    settings = _agent_settings(monkeypatch, tmp_path, FAULTMAVEN_API_TOKEN="preset-tok")
+    client = make_fault_client(settings)
+
+    assert client._credential_store is None
+    assert client._refresh_token == ""
+    assert client._token == "preset-tok"
+    assert client.auth_mode == "preset token"
+    client.close()

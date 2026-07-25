@@ -95,6 +95,15 @@ Every check prints a ✓ or a ✗ with the exact fix. Get a clean **read-only** 
 before step 5; run **`--full`** once to confirm the case/turn contract against
 *this* backend (it proves the whole pipeline, not just connectivity).
 
+> ⚠️ **Not read-only against an `oauth`-mode backend.** Authenticating there
+> means exercising the refresh grant, which **rotates the credential** — the
+> token preflight presents is revoked and a new one is written to
+> `CREDENTIAL_STORE_PATH`. Run it from the same machine and store the agent
+> uses, or with the agent stopped. Running it elsewhere (a laptop, an ad-hoc
+> pod) rotates the shared credential out from under the live agent; the agent
+> recovers by re-reading its store, so it will not recover from a rotation that
+> landed on a different disk.
+
 ## 5. Run the agent
 
 ```bash

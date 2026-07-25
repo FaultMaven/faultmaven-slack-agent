@@ -204,6 +204,10 @@ class FaultMavenClient:
         self._refresh_token = stored or refresh_token
         self._oauth_client_id = oauth_client_id
         self._access_expires_at = 0.0
+        # True when the live credential is newer than what's on disk (a write
+        # failed). The keepalive retries the write, so a transient volume
+        # problem heals instead of becoming a restart-time lockout.
+        self._credential_unpersisted = False
         # When the credential we hold was obtained, for the keepalive's fallback
         # cadence when a token's expiry can't be read.
         self._credential_obtained_at = time.monotonic()
@@ -265,9 +269,44 @@ class FaultMavenClient:
         if keepalive is not None:
             # Bounded: the thread only ever waits on the stop event.
             keepalive.join(timeout=5.0)
-        self._http.close()
-        if self._credential_store is not None:
-            self._credential_store.close()
+
+        # Wait out an in-flight renewal before tearing down what it is using.
+        # Closing the http client or the SQLite connection underneath one would
+        # lose the rotated token — the presented one is already revoked, so that
+        # is a lockout. A renewal is one request, bounded by the request
+        # timeout; the keepalive join is not (it can be mid-request when the
+        # stop event is set), which is why this waits separately.
+        acquired = self._renew_lock.acquire(timeout=self._timeout + 5.0)
+        try:
+            if not acquired:
+                logger.warning(
+                    "Closing the FaultMaven client with a renewal still in "
+                    "flight; a rotated credential may be lost"
+                )
+            self._http.close()
+            if self._credential_store is not None:
+                self._credential_store.close()
+        finally:
+            if acquired:
+                self._renew_lock.release()
+
+    @property
+    def auth_mode(self) -> str:
+        """How this client authenticates, for diagnostics.
+
+        Read off the client's own state rather than re-derived from settings:
+        the steady state after bootstrap is a persisted credential with the
+        one-time seed cleared, which settings alone cannot distinguish from
+        having no credential at all.
+        """
+
+        if self._refresh_token:
+            return "refresh grant"
+        if self._token_is_preset:
+            return "preset token"
+        if self._dev_login_username:
+            return "dev-login bootstrap"
+        return "no credential configured"
 
     def health(self) -> dict[str, Any]:
         """Probe the backend's top-level ``/health`` liveness endpoint.
@@ -377,20 +416,51 @@ class FaultMavenClient:
             try:
                 return self._exchange_refresh_token(self._refresh_token)
             except _CredentialRejected:
-                # The stored credential is dead. If the operator has since
-                # re-run provisioning and restarted us with a fresh seed that we
-                # have not tried yet, use it — otherwise this is a real lockout.
-                # Note this catches ONLY a backend rejection: a failure to
-                # persist a rotation must not burn the operator's fresh seed on
-                # a retry that would hit the same broken storage.
-                seed = self._bootstrap_refresh_token
-                if not seed or seed == self._refresh_token:
-                    raise
-                logger.warning(
-                    "Stored FaultMaven credential rejected; retrying with the "
-                    "configured FAULTMAVEN_REFRESH_TOKEN"
-                )
-                return self._exchange_refresh_token(seed)
+                # Rejected means the credential we hold is no longer the live
+                # one. Before declaring a lockout, try the two ways a newer one
+                # can exist. (Only a backend rejection reaches here — a failed
+                # persist no longer raises at all.)
+                for candidate, source in self._alternative_credentials():
+                    logger.warning(
+                        "FaultMaven credential rejected; retrying with the %s",
+                        source,
+                    )
+                    try:
+                        return self._exchange_refresh_token(candidate)
+                    except _CredentialRejected:
+                        continue
+                raise
+
+    def _alternative_credentials(self) -> list[tuple[str, str]]:
+        """Credentials worth trying after the one we hold was rejected.
+
+        1. Whatever is on disk now. Another process may have rotated it —
+           ``scripts/preflight.py`` authenticates, which under the refresh grant
+           consumes a rotation. Without this, a valid token sitting in the store
+           would be ignored and the running agent would stay locked out.
+        2. The configured seed, for the documented recovery: the operator
+           re-runs provisioning and restarts us while the store still holds the
+           dead token.
+        """
+
+        tried = {self._refresh_token}
+        alternatives: list[tuple[str, str]] = []
+
+        if self._credential_store is not None:
+            try:
+                stored = self._credential_store.get()
+            except Exception as exc:  # noqa: BLE001 — unreadable store is not fatal here
+                logger.warning("Could not re-read the credential store: %s", exc)
+                stored = None
+            if stored and stored not in tried:
+                tried.add(stored)
+                alternatives.append((stored, "credential now in the store"))
+
+        seed = self._bootstrap_refresh_token
+        if seed and seed not in tried:
+            alternatives.append((seed, "configured FAULTMAVEN_REFRESH_TOKEN"))
+
+        return alternatives
 
     def _exchange_refresh_token(self, refresh_token: str) -> str:
         """POST the refresh grant, persist the rotated token, return access.
@@ -440,18 +510,25 @@ class FaultMavenClient:
         if not rotated:
             raise FaultMavenError("token refresh returned no refresh_token")
 
-        # Persist BEFORE use. A failure here means we cannot guarantee the next
-        # start can authenticate, so surface it rather than proceeding on a
-        # credential we may have just lost.
+        # Persist BEFORE use — but never at the cost of the token itself. The
+        # rotated credential is the only live one (the presented token is
+        # already revoked server-side), so discarding it on a write error would
+        # turn a momentarily full or read-only volume into a permanent lockout
+        # that recovering the disk cannot undo. Keep it, say so loudly, and
+        # retry the write later: the process stays usable, and a restart before
+        # the write succeeds is the only casualty.
         if self._credential_store is not None:
             try:
                 self._credential_store.put(rotated)
-            except Exception as exc:  # noqa: BLE001 — must not be swallowed
-                raise FaultMavenCredentialError(
-                    f"rotated FaultMaven refresh token could not be persisted "
-                    f"({exc}); the previous credential is already revoked. "
-                    "Re-run the backend provisioning step to re-issue one."
-                ) from exc
+                self._credential_unpersisted = False
+            except Exception as exc:  # noqa: BLE001 — degraded, not fatal
+                self._credential_unpersisted = True
+                logger.error(
+                    "Rotated FaultMaven refresh token could NOT be persisted "
+                    "(%s). The agent keeps working, but a restart before this "
+                    "write succeeds needs re-provisioning. Check the volume.",
+                    exc,
+                )
 
         expires_in = body.get("expires_in")
         lifetime = float(expires_in) if isinstance(expires_in, (int, float)) else 900.0
@@ -487,12 +564,27 @@ class FaultMavenClient:
     def _keepalive_loop(self) -> None:
         while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
             try:
+                self._retry_pending_persist()
                 if self._refresh_credential_is_due():
                     # force: the access token's remaining life is irrelevant —
                     # this renewal exists to slide the refresh window.
                     self._renew(force=True)
             except Exception as exc:  # noqa: BLE001 — a daemon must not die
                 logger.warning("FaultMaven credential keepalive failed: %s", exc)
+
+    def _retry_pending_persist(self) -> None:
+        """Re-attempt a write that failed earlier, so the disk error can heal."""
+
+        if not self._credential_unpersisted or self._credential_store is None:
+            return
+        token = self._refresh_token
+        try:
+            self._credential_store.put(token)
+        except Exception as exc:  # noqa: BLE001 — still broken; try again later
+            logger.warning("FaultMaven credential still not persistable: %s", exc)
+            return
+        self._credential_unpersisted = False
+        logger.info("Rotated FaultMaven refresh token persisted after an earlier failure")
 
     def _refresh_credential_is_due(self) -> bool:
         """True when the refresh credential is close enough to expiry to renew."""
@@ -834,11 +926,14 @@ class FaultMavenClient:
             if (
                 resp.status_code == 401
                 and not reauthed
-                and self._dev_login_username
-                and not self._token_is_preset
+                and (
+                    self._refresh_token
+                    or (self._dev_login_username and not self._token_is_preset)
+                )
             ):
-                # A dev-login token (1h TTL) can expire mid-poll on a long
-                # async turn; re-login once, same as _post. The endpoint is
+                # A token can expire mid-poll on a long async turn — a 15-minute
+                # access token under the refresh grant as easily as a 1h
+                # dev-login one. Re-acquire once, same as _post. The endpoint is
                 # known-ready — retry immediately, don't burn budget sleeping.
                 logger.info("token rejected (401) mid-poll; re-authenticating")
                 token = self._reauth(token)

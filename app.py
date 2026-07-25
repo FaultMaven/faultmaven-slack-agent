@@ -65,15 +65,29 @@ def make_fault_client(settings: Settings) -> FaultMavenClient:
     Shared by the runtime (:func:`build_app`) and the preflight doctor so the
     client wiring has one definition and can't drift between them.
 
-    The credential store is created when a refresh credential is configured OR
-    one has already been persisted — so a dev-login/preset-token deployment
-    writes no extra file, while an operator who clears the one-time
-    FAULTMAVEN_REFRESH_TOKEN seed after bootstrap keeps working off the store.
+    The credential store is created when a refresh credential is configured, or
+    when one has already been persisted and nothing more explicit is set — so a
+    dev-login deployment writes no extra file, an operator who clears the
+    one-time FAULTMAVEN_REFRESH_TOKEN seed after bootstrap keeps working off the
+    store, and an explicitly configured FAULTMAVEN_API_TOKEN is never silently
+    shadowed by a credentials.db left behind from an earlier deployment.
     """
 
-    use_refresh_grant = bool(settings.faultmaven_refresh_token) or Path(
-        settings.credential_store_path
-    ).exists()
+    store_exists = Path(settings.credential_store_path).exists()
+    if settings.faultmaven_refresh_token:
+        use_refresh_grant = True
+    elif store_exists and settings.faultmaven_api_token:
+        # Explicit config wins over leftover state, but say so — otherwise the
+        # unused store looks like it is in play.
+        logger.warning(
+            "Ignoring the credential store at %s: FAULTMAVEN_API_TOKEN is set "
+            "explicitly. Unset it to use the stored refresh credential.",
+            settings.credential_store_path,
+        )
+        use_refresh_grant = False
+    else:
+        use_refresh_grant = store_exists
+
     credential_store = (
         CredentialStore(settings.credential_store_path) if use_refresh_grant else None
     )

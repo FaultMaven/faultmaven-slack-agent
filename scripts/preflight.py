@@ -188,7 +188,7 @@ def check_backend(fm: FaultMavenClient) -> bool:
     )
 
 
-def check_backend_auth(fm: FaultMavenClient, settings: Settings) -> bool:
+def check_backend_auth(fm: FaultMavenClient) -> bool:
     print("\nFaultMaven auth")
     try:
         # verify_auth() obtains a token (refresh grant, preset, or dev-login)
@@ -217,13 +217,7 @@ def check_backend_auth(fm: FaultMavenClient, settings: Settings) -> bool:
             "FAULTMAVEN_API_TOKEN, or run a backend in local AUTH_MODE so "
             "dev-login works.",
         )
-    if settings.faultmaven_refresh_token:
-        how = "refresh grant"
-    elif settings.faultmaven_api_token:
-        how = "preset token"
-    else:
-        how = "dev-login bootstrap"
-    return _ok("bearer token accepted", f"via {how}")
+    return _ok("bearer token accepted", f"via {fm.auth_mode}")
 
 
 def check_turn_contract(fm: FaultMavenClient) -> bool:
@@ -277,7 +271,7 @@ def main() -> int:
     fm = make_fault_client(settings)
     try:
         results.append(check_backend(fm))
-        results.append(check_backend_auth(fm, settings))
+        results.append(check_backend_auth(fm))
         if args.full:
             results.append(check_turn_contract(fm))
     finally:

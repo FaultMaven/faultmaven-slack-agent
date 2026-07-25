@@ -69,15 +69,6 @@ class CredentialStore:
             )
             self._conn.commit()
 
-    def clear(self) -> None:
-        """Drop the stored credential (used when it is known to be dead)."""
-
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM fm_credential WHERE id=?", (self._ROW_ID,)
-            )
-            self._conn.commit()
-
     def close(self) -> None:
         # Under the lock: shutdown must not close the connection out from under
         # a renewal still running on another thread.
