@@ -408,3 +408,41 @@ def test_client_factory_uses_an_existing_store_without_the_seed(monkeypatch, tmp
 
     assert client._refresh_token == "rotated-rt"
     client.close()
+
+
+# -- keepalive renews for real ------------------------------------------------
+def test_keepalive_renews_even_with_a_live_access_token():
+    """The keepalive slides the REFRESH window; the access token's remaining
+    life is irrelevant. Short-circuiting on a fresh access token would let an
+    idle agent's credential expire — the exact lockout this exists to prevent."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return token_response(access=f"at-{calls['n']}", refresh=f"rt-{calls['n']}")
+
+    client = make_client(handler)
+    client._current_token()  # a live access token, good for ~15 minutes
+    assert calls["n"] == 1
+
+    client._renew(force=True)
+
+    assert calls["n"] == 2
+
+
+def test_persist_failure_does_not_burn_the_configured_seed():
+    """A storage failure is not a rejected credential. Retrying with the
+    operator's fresh seed would consume it against the same broken disk."""
+    presented: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        presented.append(json.loads(request.content)["refresh_token"])
+        return token_response()
+
+    store = FakeStore(token="stored-rt", fail_on_put=True)
+    client = make_client(handler, refresh_token="fresh-seed", store=store)
+
+    with pytest.raises(FaultMavenCredentialError, match="could not be persisted"):
+        client._current_token()
+
+    assert presented == ["stored-rt"]

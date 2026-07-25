@@ -131,6 +131,17 @@ class FaultMavenCredentialError(FaultMavenError):
     """
 
 
+class _CredentialRejected(FaultMavenCredentialError):
+    """The backend itself rejected the refresh token.
+
+    Internal to the client: it separates "this credential is not accepted"
+    (where trying a freshly provisioned seed can help) from every other
+    credential failure, such as being unable to persist a rotation (where a
+    retry would hit the same broken storage and consume the seed for nothing).
+    Callers only ever see :class:`FaultMavenCredentialError`.
+    """
+
+
 class FaultMavenTimeoutError(FaultMavenError):
     """The client gave up waiting, but the backend may still complete the turn.
 
@@ -193,6 +204,9 @@ class FaultMavenClient:
         self._refresh_token = stored or refresh_token
         self._oauth_client_id = oauth_client_id
         self._access_expires_at = 0.0
+        # When the credential we hold was obtained, for the keepalive's fallback
+        # cadence when a token's expiry can't be read.
+        self._credential_obtained_at = time.monotonic()
         # Held ACROSS the renewal request, unlike the token lock below. Renewal
         # is single-use: two concurrent renewals with the same credential mean
         # the second presents a token the first already revoked. Serializing
@@ -329,7 +343,7 @@ class FaultMavenClient:
             return token
         return self._renew(stale_access=token)
 
-    def _renew(self, *, stale_access: str = "") -> str:
+    def _renew(self, *, stale_access: str = "", force: bool = False) -> str:
         """Exchange the refresh token for a new token pair. Single-flight.
 
         The lock is held across the request — the opposite discipline to
@@ -337,24 +351,38 @@ class FaultMavenClient:
         presenting a refresh token *consumes* it. Two threads renewing at once
         would each revoke the other's credential and the loser would be locked
         out until an operator intervened.
+
+        ``force`` renews even when the access token is still good. The keepalive
+        needs it: its job is to slide the *refresh* window, which has nothing to
+        do with how long the current access token has left.
         """
 
+        # Captured before the lock so we can tell "someone else rotated while we
+        # queued" (their token is now current, ours is revoked) from "we are the
+        # renewing thread".
+        intended = self._refresh_token
+
         with self._renew_lock:
-            # Another thread may have renewed while we waited for the lock.
-            current = self._token
-            if (
-                current
-                and current != stale_access
-                and time.monotonic() < self._access_expires_at
-            ):
-                return current
+            if self._refresh_token != intended and self._token:
+                return self._token
+            if not force:
+                current = self._token
+                if (
+                    current
+                    and current != stale_access
+                    and time.monotonic() < self._access_expires_at
+                ):
+                    return current
 
             try:
                 return self._exchange_refresh_token(self._refresh_token)
-            except FaultMavenCredentialError:
+            except _CredentialRejected:
                 # The stored credential is dead. If the operator has since
                 # re-run provisioning and restarted us with a fresh seed that we
                 # have not tried yet, use it — otherwise this is a real lockout.
+                # Note this catches ONLY a backend rejection: a failure to
+                # persist a rotation must not burn the operator's fresh seed on
+                # a retry that would hit the same broken storage.
                 seed = self._bootstrap_refresh_token
                 if not seed or seed == self._refresh_token:
                     raise
@@ -387,7 +415,7 @@ class FaultMavenClient:
             raise FaultMavenError(f"token refresh request failed: {exc}") from exc
 
         if resp.status_code in (400, 401):
-            raise FaultMavenCredentialError(
+            raise _CredentialRejected(
                 f"FaultMaven rejected the refresh credential (HTTP "
                 f"{resp.status_code}): {self._error_detail(resp)}. It has expired "
                 "or was revoked (a lost rotation, or two agents sharing one "
@@ -430,8 +458,9 @@ class FaultMavenClient:
         with self._token_lock:
             self._refresh_token = rotated
             self._token = access
-            self._access_expires_at = (
-                time.monotonic() + max(lifetime - _ACCESS_EXPIRY_SKEW_SECONDS, 0.0)
+            self._credential_obtained_at = time.monotonic()
+            self._access_expires_at = self._credential_obtained_at + max(
+                lifetime - _ACCESS_EXPIRY_SKEW_SECONDS, 0.0
             )
         logger.info("Renewed FaultMaven access token via the refresh grant")
         return access
@@ -459,7 +488,9 @@ class FaultMavenClient:
         while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
             try:
                 if self._refresh_credential_is_due():
-                    self._renew()
+                    # force: the access token's remaining life is irrelevant —
+                    # this renewal exists to slide the refresh window.
+                    self._renew(force=True)
             except Exception as exc:  # noqa: BLE001 — a daemon must not die
                 logger.warning("FaultMaven credential keepalive failed: %s", exc)
 
@@ -468,11 +499,11 @@ class FaultMavenClient:
 
         expires_at = _jwt_expiry(self._refresh_token)
         if expires_at is None:
-            # Expiry unreadable: fall back to a fixed cadence rather than
-            # assuming the credential is fine until it silently isn't.
-            return time.monotonic() >= (
-                self._access_expires_at + _REFRESH_BLIND_RENEW_SECONDS
-            )
+            # Expiry unreadable (not a JWT, or an opaque token): fall back to a
+            # fixed cadence rather than assuming the credential is fine until it
+            # silently isn't.
+            age = time.monotonic() - self._credential_obtained_at
+            return age >= _REFRESH_BLIND_RENEW_SECONDS
         return (expires_at - time.time()) <= _REFRESH_RENEW_MARGIN_SECONDS
 
     def _dev_login_token(self) -> str:
