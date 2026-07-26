@@ -416,15 +416,42 @@ a **team artifact**:
   (RLS keys on `org_id`, the multi-tenant model, §10); the Slack workspace maps
   to a **Team** (the sharing unit) within that Org. That is the real tenancy line.
 - A case is **scoped to its thread/channel** and **shared to the workspace's
-  Team**, attributed to its participants (initiator + pingers) via metadata /
-  account-linking — not owned by one person.
+  Team** — not owned by one person.
 - Case *browsing* is the Dashboard's job (deep-linked from Slack), scoped
   per-channel/workspace there — not a global "my cases" pile reimplemented in
   Slack (§4.5).
 
 So "all Slack users collapse to one user" stops being a bug once the meaningful
-sharing scope is the workspace's *Team* (within the Org); per-user identity is
-attribution metadata, not the ownership axis.
+sharing scope is the workspace's *Team* (within the Org).
+
+> **The API server's client is this agent, not the humans in Slack.** A `slack`
+> account is associated with a Slack **client**; an `individual` account is
+> whoever uses **Copilot** as their frontend. From the server's perspective the
+> two are the same shape — a client sends a request, the server responds. The
+> difference is entirely client-side: this agent talks to many humans through
+> Slack's servers, and the API server has no visibility into them.
+>
+> **Being a Slack user does not make you a FaultMaven principal.** A FaultMaven
+> account is a Copilot/dashboard identity; nothing about appearing in a Slack
+> workspace creates one. So for an **unlinked** user — every user today, and the
+> war-room fallback by design (§10.2) — the server's principal is this agent's
+> service account, and `case_messages.author_id` records exactly that: a complete
+> and accurate statement of which principal made the request, not a degraded
+> stand-in for a per-human identity that was never in the model.
+>
+> **Account linking (§10.2) does not change this; it sidesteps it.** A linked
+> user authenticates with *their own* FaultMaven bearer token, so the server sees
+> an ordinary `individual` principal and attributes the turn to them with no
+> Slack-specific mechanism at all. Linking is a human bringing an account they
+> already have — not a mapping from a Slack identity to a FaultMaven one.
+>
+> Who said what *inside* the Slack conversation is Slack's record, in the place
+> that conversation happened; the FaultMaven case is a derived artifact of it.
+>
+> ADR-012 D2 states the same thing from the backend side ("no per-user Slack
+> attribution"), and `author_external_ref` was dropped for this structural
+> reason — not as a deferral. ADR-013 widening *visibility* does not change it:
+> more readers of a transcript does not create an identity that never existed.
 
 ### 6.2 The thread is the scope; the agent supplies the lifecycle drivers
 
@@ -623,9 +650,10 @@ pressure**. The rendering layer enforces this:
 
 Two OAuth flows, each doing a distinct job. Mapping (per **ADR-013**): **Slack
 workspace ↔ a FaultMaven Team** (the sharing unit); the customer's **FaultMaven
-Organization** is the tenant/isolation boundary that *groups* Teams; **Slack user
-↔ FaultMaven user** (attribution metadata, per §6.1 — not the case-ownership
-axis). A single-workspace customer collapses Org and Team 1:1; a multi-workspace
+Organization** is the tenant/isolation boundary that *groups* Teams. There is
+**no Slack-user ↔ FaultMaven-user mapping** — individual Slack users hold no
+FaultMaven account (only Copilot users do), and the server's principal for every
+Slack turn is this agent's service account (§6.1). A single-workspace customer collapses Org and Team 1:1; a multi-workspace
 (Slack Grid) customer is **one Organization** containing several Teams (one per
 workspace).
 
@@ -666,6 +694,20 @@ would stall the room. So unlinked users' turns run under a **workspace service
 identity** (the workspace→Team binding, resolving to the owning Org), attributed
 to the Slack user in metadata. The *case* always lives in the bound Org — never
 cross-tenant.
+
+> **⚠️ Unsettled: "attributed to the Slack user in metadata."** The backend does
+> not do this, and ADR-012 D2 deliberately says it should not — `case_messages.
+> author_external_ref` was dropped for the structural reason in §6.1 above, not
+> deferred. Today the agent sends `query=text` with no speaker label at all, so a
+> FaultMaven reader of a multi-person thread cannot tell participants apart in
+> the transcript body.
+>
+> Note this is a question about **message content**, not principals: nothing here
+> would make a Slack user a FaultMaven identity, and `author_id` stays the service
+> account either way. It is worth settling only if transcript readability for
+> multi-person threads proves to matter in practice — the same conversation is
+> fully attributed in Slack, where it happened. Left as an open product call
+> rather than an implied requirement.
 
 > **Gate destructive/global actions on a personal token.** The service identity
 > is fine for read + investigate turns, but mutations with blast radius beyond
