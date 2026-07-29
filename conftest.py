@@ -21,3 +21,18 @@ def _reset_shutdown_flag():
     _turn._shutting_down.clear()
     yield
     _turn._shutting_down.clear()
+
+
+@pytest.fixture
+def no_poll_sleep(monkeypatch):
+    """Collapse ``_poll``'s inter-poll backoff so 202/poll tests run instantly.
+
+    The first sleep is 1.5s of real wall clock; a handful of poll-path tests
+    would add seconds to every suite run for timing nobody is asserting. Patches
+    only the client module's ``time.sleep``, so the deadline arithmetic (real
+    ``time.monotonic``) is untouched and a genuine runaway loop still terminates.
+    """
+
+    from faultmaven import client as _client
+
+    monkeypatch.setattr(_client.time, "sleep", lambda _s: None)

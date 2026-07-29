@@ -2,6 +2,8 @@
 
 from .client import (
     CaseNotFoundError,
+    CaseTerminalError,
+    CaseVersionConflictError,
     FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenCredentialError,
@@ -12,6 +14,8 @@ from .client import (
 
 __all__ = [
     "CaseNotFoundError",
+    "CaseTerminalError",
+    "CaseVersionConflictError",
     "FaultMavenAPIError",
     "FaultMavenClient",
     "FaultMavenCredentialError",

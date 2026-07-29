@@ -26,6 +26,8 @@ from slack_sdk.errors import SlackApiError
 
 from faultmaven import (
     CaseNotFoundError,
+    CaseTerminalError,
+    CaseVersionConflictError,
     FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenCredentialError,
@@ -65,8 +67,26 @@ TURN_TIMEOUT_TEXT = (
 )
 # Stale mapping evicted; unlike TURN_ERROR_TEXT, a retry WILL work (fresh case).
 CASE_GONE_TEXT = (
-    ":warning: This investigation's case no longer exists on the backend, so "
-    "I've unlinked it — your next message here starts a fresh investigation."
+    ":card_index_dividers: That investigation's case has been deleted, so "
+    "there's nothing left for me to look up — I've unlinked this thread. Your "
+    "next message here starts a fresh investigation. (This conversation stays "
+    "in Slack either way.)"
+)
+# The case concluded and is read-only, but it still EXISTS and is still online:
+# the backend answers text-only questions about it and refuses only evidence and
+# state changes. So this says what still works, rather than reading as a fault.
+CASE_CLOSED_TEXT = (
+    ":white_check_mark: This investigation is closed, so I can't take new "
+    "evidence or change its status. I can still answer questions about what we "
+    "found — for anything new, start a fresh thread and @mention me."
+)
+# The turn did NOT commit (another writer advanced the case first), so this is
+# the one 409 where re-sending is the right advice. Kept distinct from
+# CASE_CLOSED_TEXT: telling someone their live case is closed would be wrong,
+# and telling them a transient conflict is permanent would strand them.
+CASE_BUSY_TEXT = (
+    ":arrows_counterclockwise: The case moved on while I was working on that "
+    "turn, so I didn't apply it. Send it again and I'll pick it up."
 )
 # The agent's own credential is dead (ADR-012 D10). Nothing the user does fixes
 # it, and retrying just reproduces it — point at the operator without leaking
@@ -127,10 +147,24 @@ def turn_error_text(exc: Exception) -> str:
     # false promise.
     if isinstance(exc, FaultMavenCredentialError):
         return CREDENTIAL_ERROR_TEXT
+    # Above the shutdown override for the credential rule's reason: a concluded
+    # case is PERMANENT, so "resend it in a minute" is a promise the restart
+    # cannot keep — the resend fails identically, forever. That is exactly what
+    # separates it from CaseNotFoundError below, which evicts the mapping first,
+    # so *its* post-restart resend genuinely does work (on a fresh case).
+    if isinstance(exc, CaseTerminalError):
+        return CASE_CLOSED_TEXT
     if _shutting_down.is_set():
         return RESTARTING_TEXT
     if isinstance(exc, CaseNotFoundError):
         return CASE_GONE_TEXT
+    # Transient — the turn never committed — so this one stays BELOW the
+    # shutdown override, where "resend in a minute" is exactly right. It sits
+    # above the generic 4xx branch, whose "re-sending the same input won't help"
+    # is the opposite of the truth here. Neither 409 shows an HTTP status:
+    # neither is a malfunction.
+    if isinstance(exc, CaseVersionConflictError):
+        return CASE_BUSY_TEXT
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         if exc.status_code == 429:
             return TURN_ERROR_TEXT  # backend backpressure IS transient

@@ -13,6 +13,10 @@ import httpx
 import pytest
 
 from faultmaven.client import (
+    CaseNotFoundError,
+    CaseTerminalError,
+    CaseVersionConflictError,
+    FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenError,
     FaultMavenTimeoutError,
@@ -155,6 +159,134 @@ def test_submit_turn_gateway_timeout_is_indeterminate():
         )
         with pytest.raises(FaultMavenTimeoutError):
             client.submit_turn("c1", query="x")
+
+
+def test_submit_turn_409_terminal_case_is_its_own_class():
+    """The backend refuses evidence / status changes on a terminal (resolved or
+    closed) case with a bare 409. It must not surface as a generic API error —
+    the case is working as designed, not malfunctioning."""
+
+    client = make_client(
+        lambda req: httpx.Response(
+            409,
+            json={"detail": "Cannot submit evidence to a closed case."},
+        ),
+        token="tok",
+    )
+    with pytest.raises(CaseTerminalError) as exc:
+        client.submit_turn("c1", query="x", pasted_content="log")
+    assert exc.value.status_code == 409
+    # A terminal case still EXISTS — misclassifying it as gone would evict the
+    # thread→case mapping and strand the concluded investigation.
+    assert not isinstance(exc.value, CaseNotFoundError)
+
+
+def test_submit_turn_409_version_conflict_is_not_mistaken_for_terminal():
+    """Two unrelated conflicts share 409 on this endpoint and need OPPOSITE
+    advice: an OCC conflict did not commit and should be re-sent, a terminal
+    case never will. Only the OCC one carries x-error-code, so it is matched
+    positively — an unlabelled 409 is the terminal rejection."""
+
+    client = make_client(
+        lambda req: httpx.Response(
+            409,
+            json={"detail": "Case state changed while processing this turn."},
+            headers={
+                "x-error-code": "CASE_VERSION_CONFLICT",
+                "x-expected-version": "4",
+                "x-actual-version": "5",
+            },
+        ),
+        token="tok",
+    )
+    with pytest.raises(CaseVersionConflictError) as exc:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc.value, CaseTerminalError)
+
+
+def test_unlabelled_409_off_the_poll_path_is_not_claimed_terminal(no_poll_sleep):
+    """"This case is terminal" is a claim about the turn POST. An unexpected 409
+    from the polled STATUS resource says nothing about the case's lifecycle, so
+    it must stay a generic API error — telling a user with a live case that it
+    is closed would be worse than saying nothing. Mirrors the 404 discipline
+    (not_found_is_case=not polled)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "/status/1"})
+        return httpx.Response(409, json={"detail": "something else"})
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(FaultMavenAPIError) as exc:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc.value, CaseTerminalError)
+    assert exc.value.status_code == 409
+
+
+def test_labelled_version_conflict_is_honored_even_when_polled(no_poll_sleep):
+    """The header is authoritative wherever it appears: an async turn that hits
+    an OCC conflict during execution must still be re-sendable, not fall to the
+    generic 'won't help'."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "/status/1"})
+        return httpx.Response(
+            409,
+            json={"detail": "Case state changed while processing this turn."},
+            headers={"x-error-code": "CASE_VERSION_CONFLICT"},
+        )
+
+    client = make_client(handler, token="tok")
+    with pytest.raises(CaseVersionConflictError):
+        client.submit_turn("c1", query="x")
+
+
+def test_409_labelled_with_some_other_code_is_never_called_terminal():
+    """The terminal case is identified by the header being ABSENT, not by "isn't
+    the OCC code". Other middleware emits labelled 409s on this path — the
+    deduplication middleware sends DUPLICATE_REQUEST + Retry-After, and it skips
+    only multipart, so a text-only turn is in scope. Calling that terminal would
+    tell a user with a perfectly live case that their investigation is closed."""
+
+    client = make_client(
+        lambda req: httpx.Response(
+            409,
+            json={"message": "Duplicate request"},
+            headers={"x-error-code": "DUPLICATE_REQUEST", "Retry-After": "5"},
+        ),
+        token="tok",
+    )
+    with pytest.raises(FaultMavenAPIError) as exc:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc.value, CaseTerminalError)
+    assert not isinstance(exc.value, CaseVersionConflictError)
+    assert exc.value.status_code == 409
+
+
+def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
+    """The split must survive the backend rewording a message we don't own: a
+    version conflict whose detail says nothing about versions is still routed by
+    its header, and a terminal 409 phrased any way at all still routes by the
+    header's absence."""
+
+    conflict = make_client(
+        lambda req: httpx.Response(
+            409,
+            json={"detail": "unexpected wording"},
+            headers={"x-error-code": "CASE_VERSION_CONFLICT"},
+        ),
+        token="tok",
+    )
+    with pytest.raises(CaseVersionConflictError):
+        conflict.submit_turn("c1", query="x")
+
+    terminal = make_client(
+        lambda req: httpx.Response(409, json={"detail": "unexpected wording"}),
+        token="tok",
+    )
+    with pytest.raises(CaseTerminalError):
+        terminal.submit_turn("c1", query="x")
 
 
 def test_submit_turn_200_non_json_body_degrades_not_raises():

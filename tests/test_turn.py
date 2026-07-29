@@ -5,9 +5,16 @@ from __future__ import annotations
 import threading
 
 import listeners._turn as turn_mod
-from faultmaven import FaultMavenAPIError, FaultMavenTimeoutError
+from faultmaven import (
+    CaseTerminalError,
+    CaseVersionConflictError,
+    FaultMavenAPIError,
+    FaultMavenTimeoutError,
+)
 from faultmaven.client import TurnResult
 from listeners._turn import (
+    CASE_BUSY_TEXT,
+    CASE_CLOSED_TEXT,
     RESTARTING_TEXT,
     TURN_ERROR_TEXT,
     TURN_TIMEOUT_TEXT,
@@ -137,6 +144,74 @@ def test_indeterminate_failure_during_shutdown_still_warns_not_restart():
 
     assert (
         turn_error_text(CaseNotFoundError("gone", status_code=404))
+        == RESTARTING_TEXT
+    )
+
+
+def test_terminal_case_reads_as_concluded_not_as_a_failure():
+    """A concluded investigation refusing evidence is the product working. The
+    reply must not surface an HTTP status or the generic 4xx 'FaultMaven
+    rejected that turn', which reads as a malfunction, and must not tell the
+    user a retry is pointless without saying what still works."""
+
+    text = turn_error_text(CaseTerminalError("closed", status_code=409))
+    assert text == CASE_CLOSED_TEXT
+    assert "409" not in text
+    assert "rejected" not in text.lower()
+    assert "error" not in text.lower()
+
+
+def test_version_conflict_asks_for_a_resend_unlike_every_other_4xx():
+    """The one 4xx where re-sending IS the fix: the OCC conflict means the turn
+    never committed. It must not inherit the generic "re-sending the same input
+    won't help", nor be confused with a terminal case."""
+
+    text = turn_error_text(CaseVersionConflictError("stale", status_code=409))
+    assert text == CASE_BUSY_TEXT
+    assert text != CASE_CLOSED_TEXT
+    assert "won't help" not in text
+
+
+def test_generic_4xx_still_reports_its_status():
+    """The two 409 classes are special-cased BEFORE the generic 4xx branch;
+    guard that this didn't swallow the branch itself — an ordinary 4xx must
+    still surface its status and the 'don't re-send' advice."""
+
+    text = turn_error_text(FaultMavenAPIError("bad", status_code=422, detail="nope"))
+    assert "422" in text
+    assert "won't help" in text
+
+
+def test_terminal_case_outranks_the_shutdown_notice():
+    """A concluded case is PERMANENT, so it must pierce the drain message for
+    the same reason a dead credential does: "resend it in a minute" is a promise
+    the restart cannot keep — the resend fails identically, forever.
+
+    This is what separates it from CaseNotFoundError, which evicts the mapping
+    first, so that resend genuinely does work after the restart (on a fresh
+    case) and the restart notice is honest for it."""
+
+    turn_mod.begin_shutdown()  # autouse fixture clears it again after
+    assert (
+        turn_error_text(CaseTerminalError("closed", status_code=409))
+        == CASE_CLOSED_TEXT
+    )
+    from faultmaven import CaseNotFoundError
+
+    assert (
+        turn_error_text(CaseNotFoundError("gone", status_code=404))
+        == RESTARTING_TEXT
+    )
+
+
+def test_version_conflict_yields_to_the_shutdown_notice():
+    """The transient one stays BELOW the override: the turn never committed and
+    a restart doesn't change that, so during a drain "resend in a minute" is
+    both true and more useful than the conflict message."""
+
+    turn_mod.begin_shutdown()  # autouse fixture clears it again after
+    assert (
+        turn_error_text(CaseVersionConflictError("stale", status_code=409))
         == RESTARTING_TEXT
     )
 
