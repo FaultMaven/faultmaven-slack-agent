@@ -147,15 +147,22 @@ def turn_error_text(exc: Exception) -> str:
     # false promise.
     if isinstance(exc, FaultMavenCredentialError):
         return CREDENTIAL_ERROR_TEXT
+    # Above the shutdown override for the credential rule's reason: a concluded
+    # case is PERMANENT, so "resend it in a minute" is a promise the restart
+    # cannot keep — the resend fails identically, forever. That is exactly what
+    # separates it from CaseNotFoundError below, which evicts the mapping first,
+    # so *its* post-restart resend genuinely does work (on a fresh case).
+    if isinstance(exc, CaseTerminalError):
+        return CASE_CLOSED_TEXT
     if _shutting_down.is_set():
         return RESTARTING_TEXT
     if isinstance(exc, CaseNotFoundError):
         return CASE_GONE_TEXT
-    # Both are 409s and both must be caught BEFORE the generic 4xx branch, whose
-    # "re-sending won't help" is wrong for one and needlessly bleak for the
-    # other. Neither is a malfunction, so neither shows an HTTP status.
-    if isinstance(exc, CaseTerminalError):
-        return CASE_CLOSED_TEXT
+    # Transient — the turn never committed — so this one stays BELOW the
+    # shutdown override, where "resend in a minute" is exactly right. It sits
+    # above the generic 4xx branch, whose "re-sending the same input won't help"
+    # is the opposite of the truth here. Neither 409 shows an HTTP status:
+    # neither is a malfunction.
     if isinstance(exc, CaseVersionConflictError):
         return CASE_BUSY_TEXT
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:

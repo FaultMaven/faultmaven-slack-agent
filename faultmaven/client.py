@@ -906,24 +906,36 @@ class FaultMavenClient:
                     "the turn may still complete on the backend"
                 ) from exc
             if exc.status_code == 409:
-                # Two unrelated conflicts share this status on this endpoint, and
-                # they need opposite advice. Only the OCC conflict is labelled
-                # (``x-error-code``), so it is the one we match POSITIVELY: an
-                # unlabelled 409 is the terminal-case rejection. Matching the
-                # other way round — sniffing the prose of ``detail`` for "closed"
-                # — would break on any rewording of a message we don't own.
+                # Several unrelated conflicts share this status, and they need
+                # different advice. The two we recognize are the OCC version
+                # conflict (labelled) and the terminal-case rejection (the route
+                # raises it with no ``x-error-code``).
                 #
-                # The label is authoritative on either path, so it is honored
-                # whether or not we polled. The *unlabelled* fallback is not:
-                # like the 404 above, "terminal case" is a claim about the turn
-                # POST, and asserting it from an unexpected 409 on the status
-                # resource would tell a user with a live case that it is closed.
-                # Off the POST, an unlabelled 409 stays a generic API error.
-                if resp.headers.get("x-error-code") == _VERSION_CONFLICT_CODE:
+                # The terminal case is therefore identified by the header being
+                # ABSENT — not by "isn't the OCC code". Other middleware emits
+                # labelled 409s on this path (the deduplication middleware sends
+                # ``DUPLICATE_REQUEST`` + ``Retry-After``, and it skips only
+                # multipart, so a text-only turn is in scope); treating those as
+                # terminal would tell a user with a live case that their
+                # investigation is closed. Anything labelled but unrecognized
+                # falls through to the generic 4xx handling, which is the honest
+                # answer for a conflict we don't model.
+                #
+                # Matching the prose of ``detail`` for "closed" instead would
+                # break on any rewording of a message we don't own.
+                error_code = resp.headers.get("x-error-code")
+                if error_code == _VERSION_CONFLICT_CODE:
+                    # The label is authoritative wherever it appears, so it is
+                    # honored on the polled path too — an async turn that hits an
+                    # OCC conflict mid-execution must still be re-sendable.
                     raise CaseVersionConflictError(
                         str(exc), status_code=409, detail=exc.detail
                     ) from exc
-                if not polled:
+                # Unlabelled, and only off the POST itself: like the 404 above,
+                # "this case is terminal" is a claim about the turn submission.
+                # Asserting it from an unexpected 409 on the status resource
+                # would tell a user with a live case that it is closed.
+                if not error_code and not polled:
                     raise CaseTerminalError(
                         str(exc), status_code=409, detail=exc.detail
                     ) from exc

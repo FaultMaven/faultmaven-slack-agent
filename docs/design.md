@@ -505,12 +505,28 @@ the next message and answering it clearly.
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
 | **Archived** | — | Not implemented: the backend has no archive tier yet (**ADR-014**, Proposed). Lands with that ADR, alongside Copilot and the Dashboard. |
 
-The two `409`s are unrelated conflicts sharing one status and needing opposite
+These `409`s are unrelated conflicts sharing one status and needing opposite
 advice, so the client separates them at the boundary (`CaseTerminalError` vs
-`CaseVersionConflictError`). Only the version conflict is labelled by the
-backend, so *that* is matched positively and an unlabelled `409` is read as the
-terminal rejection — matching on the wording of `detail` would break the moment
-the backend rephrases a message we don't own.
+`CaseVersionConflictError`). The version conflict is the only one the backend
+labels, so *that* is matched positively by its `x-error-code`, and the terminal
+rejection is identified by the header being **absent** — not by "isn't the
+version-conflict code". Other middleware emits *labelled* `409`s on this path
+(the deduplication middleware sends `DUPLICATE_REQUEST` + `Retry-After`, and it
+skips only multipart, so a text-only turn is in scope); reading those as
+terminal would tell someone with a live case that their investigation is closed.
+A labelled but unrecognized `409` falls through to the generic 4xx reply, which
+is the honest answer for a conflict we don't model. Matching on the wording of
+`detail` instead would break the moment the backend rephrases a message we
+don't own.
+
+**Ordering against shutdown.** A terminal case is *permanent*, so its reply
+outranks the "I'm restarting — resend in a minute" drain notice: that promise
+can never be kept, since the resend fails identically forever. This is the same
+rule that hoists the dead-credential message, and it is what distinguishes the
+terminal case from a **deleted** one — deletion evicts the thread mapping first,
+so *that* resend genuinely does work after the restart. The version conflict,
+being transient, stays below the drain notice, where "resend in a minute" is
+exactly right.
 
 ---
 

@@ -182,16 +182,34 @@ def test_generic_4xx_still_reports_its_status():
     assert "won't help" in text
 
 
-def test_terminal_and_conflict_do_not_outrank_the_shutdown_notice():
-    """Both are ordinary same-turn outcomes, not the indeterminate/credential
-    classes that must pierce the drain message. During shutdown the restart
-    notice wins, matching CaseNotFoundError's ordering."""
+def test_terminal_case_outranks_the_shutdown_notice():
+    """A concluded case is PERMANENT, so it must pierce the drain message for
+    the same reason a dead credential does: "resend it in a minute" is a promise
+    the restart cannot keep — the resend fails identically, forever.
+
+    This is what separates it from CaseNotFoundError, which evicts the mapping
+    first, so that resend genuinely does work after the restart (on a fresh
+    case) and the restart notice is honest for it."""
 
     turn_mod.begin_shutdown()  # autouse fixture clears it again after
     assert (
         turn_error_text(CaseTerminalError("closed", status_code=409))
+        == CASE_CLOSED_TEXT
+    )
+    from faultmaven import CaseNotFoundError
+
+    assert (
+        turn_error_text(CaseNotFoundError("gone", status_code=404))
         == RESTARTING_TEXT
     )
+
+
+def test_version_conflict_yields_to_the_shutdown_notice():
+    """The transient one stays BELOW the override: the turn never committed and
+    a restart doesn't change that, so during a drain "resend in a minute" is
+    both true and more useful than the conflict message."""
+
+    turn_mod.begin_shutdown()  # autouse fixture clears it again after
     assert (
         turn_error_text(CaseVersionConflictError("stale", status_code=409))
         == RESTARTING_TEXT

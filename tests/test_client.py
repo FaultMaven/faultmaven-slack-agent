@@ -204,7 +204,7 @@ def test_submit_turn_409_version_conflict_is_not_mistaken_for_terminal():
     assert not isinstance(exc.value, CaseTerminalError)
 
 
-def test_unlabelled_409_off_the_poll_path_is_not_claimed_terminal():
+def test_unlabelled_409_off_the_poll_path_is_not_claimed_terminal(no_poll_sleep):
     """"This case is terminal" is a claim about the turn POST. An unexpected 409
     from the polled STATUS resource says nothing about the case's lifecycle, so
     it must stay a generic API error — telling a user with a live case that it
@@ -223,7 +223,7 @@ def test_unlabelled_409_off_the_poll_path_is_not_claimed_terminal():
     assert exc.value.status_code == 409
 
 
-def test_labelled_version_conflict_is_honored_even_when_polled():
+def test_labelled_version_conflict_is_honored_even_when_polled(no_poll_sleep):
     """The header is authoritative wherever it appears: an async turn that hits
     an OCC conflict during execution must still be re-sendable, not fall to the
     generic 'won't help'."""
@@ -240,6 +240,28 @@ def test_labelled_version_conflict_is_honored_even_when_polled():
     client = make_client(handler, token="tok")
     with pytest.raises(CaseVersionConflictError):
         client.submit_turn("c1", query="x")
+
+
+def test_409_labelled_with_some_other_code_is_never_called_terminal():
+    """The terminal case is identified by the header being ABSENT, not by "isn't
+    the OCC code". Other middleware emits labelled 409s on this path — the
+    deduplication middleware sends DUPLICATE_REQUEST + Retry-After, and it skips
+    only multipart, so a text-only turn is in scope. Calling that terminal would
+    tell a user with a perfectly live case that their investigation is closed."""
+
+    client = make_client(
+        lambda req: httpx.Response(
+            409,
+            json={"message": "Duplicate request"},
+            headers={"x-error-code": "DUPLICATE_REQUEST", "Retry-After": "5"},
+        ),
+        token="tok",
+    )
+    with pytest.raises(FaultMavenAPIError) as exc:
+        client.submit_turn("c1", query="x")
+    assert not isinstance(exc.value, CaseTerminalError)
+    assert not isinstance(exc.value, CaseVersionConflictError)
+    assert exc.value.status_code == 409
 
 
 def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
