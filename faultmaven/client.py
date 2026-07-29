@@ -92,6 +92,12 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, list) else []
 
 
+# The backend's ``x-error-code`` marking a 409 as an optimistic-concurrency
+# version conflict, as opposed to the (unlabelled) terminal-case rejection that
+# shares the status. Sent alongside x-expected-version / x-actual-version.
+_VERSION_CONFLICT_CODE = "CASE_VERSION_CONFLICT"
+
+
 class FaultMavenError(Exception):
     """Raised when the FaultMaven API cannot service a request."""
 
@@ -117,6 +123,33 @@ class CaseNotFoundError(FaultMavenAPIError):
     Distinguished so callers can evict the stale thread→case mapping — without
     that, every retry the generic error message suggests routes straight back
     to the same dead case_id and the thread is stuck forever.
+    """
+
+
+class CaseTerminalError(FaultMavenAPIError):
+    """The case is terminal (``resolved``/``closed``) and refused this turn (409).
+
+    A terminal case is read-only but still *online* (ADR-005's two axes: the
+    workflow axis is done, the data tier is unchanged), so the backend still
+    answers text-only questions about it — it rejects only evidence, state
+    transitions, and file reclassification. Distinguished so a thread whose
+    investigation has concluded gets an explanation of what it can still do,
+    rather than a raw ``HTTP 409`` and "re-sending won't help", which reads as a
+    malfunction when it is the case working as designed.
+
+    NOT raised for the other 409 on this endpoint — an optimistic-concurrency
+    version conflict, which is transient and genuinely worth retrying. See
+    :data:`_VERSION_CONFLICT_CODE`.
+    """
+
+
+class CaseVersionConflictError(FaultMavenAPIError):
+    """Another writer advanced the case mid-turn (409, OCC).
+
+    The backend deliberately does not silently retry — an LLM turn is expensive
+    and non-idempotent — so it surfaces the conflict for the client to decide.
+    For us the turn did NOT commit, so unlike every other 409 a re-send is the
+    correct advice.
     """
 
 
@@ -872,6 +905,28 @@ class FaultMavenClient:
                     f"submit_turn hit a gateway timeout (HTTP {exc.status_code}); "
                     "the turn may still complete on the backend"
                 ) from exc
+            if exc.status_code == 409:
+                # Two unrelated conflicts share this status on this endpoint, and
+                # they need opposite advice. Only the OCC conflict is labelled
+                # (``x-error-code``), so it is the one we match POSITIVELY: an
+                # unlabelled 409 is the terminal-case rejection. Matching the
+                # other way round — sniffing the prose of ``detail`` for "closed"
+                # — would break on any rewording of a message we don't own.
+                #
+                # The label is authoritative on either path, so it is honored
+                # whether or not we polled. The *unlabelled* fallback is not:
+                # like the 404 above, "terminal case" is a claim about the turn
+                # POST, and asserting it from an unexpected 409 on the status
+                # resource would tell a user with a live case that it is closed.
+                # Off the POST, an unlabelled 409 stays a generic API error.
+                if resp.headers.get("x-error-code") == _VERSION_CONFLICT_CODE:
+                    raise CaseVersionConflictError(
+                        str(exc), status_code=409, detail=exc.detail
+                    ) from exc
+                if not polled:
+                    raise CaseTerminalError(
+                        str(exc), status_code=409, detail=exc.detail
+                    ) from exc
             raise
 
         # Status was 2xx here — the turn committed. Parsing must NEVER raise

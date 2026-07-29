@@ -31,7 +31,7 @@ Two goals drive every decision, and they are **complementary, not in tension**:
 | Framework | **Rebuild on Bolt for Python** (replace the raw-FastAPI skeleton) | Unlocks the Slack AI-App primitives that make the agent feel native; the skeleton uses none of them. |
 | Primary UX | **Assistant / AI-App container** (side panel) + channel `app_mention` (+ auto-continue) + the **Ask** message shortcut | The side panel is the natural home for a 1:1 investigation; channels are the war room. We serve both. |
 | Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
-| Case scoping & lifecycle | **Thread-scoped collaborative cases shared to the workspace's Team**, with offer-to-close / auto-close-on-inactivity / fresh-on-revival (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
+| Case scoping & lifecycle | **Thread-scoped collaborative cases shared to the workspace's Team**, with offer-to-close / auto-close-on-inactivity, and terminal-is-permanent (never reopened) (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
 | Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ a FaultMaven **Team** (within the customer's Organization); per-user FaultMaven account linking. |
 | Privacy posture | **Subscribe-and-gate** — `message.channels`/`message.groups` for in-thread continuity, but act only on already-owned threads (never ambient) | Same enterprise-trust "no firehose" guarantee as strict mention-only, with the in-thread UX; ownership gate does the filtering. |
@@ -48,8 +48,8 @@ not exist.** The real contract is: **create a case**
 
 | State | Surfaces / features |
 |---|---|
-| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport. |
-| **Designed, not yet built** | per-user FaultMaven account linking + workspace→Team binding (§10.2/10.3 — blocked on backend asks §15.2/15.3; beta runs all workspaces under one cloud FM service token) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer/auto-close/revival (§6.2). |
+| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · **graceful replies when a case is deleted or concluded** (§6.4) · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport. |
+| **Designed, not yet built** | per-user FaultMaven account linking + workspace→Team binding (§10.2/10.3 — blocked on backend asks §15.2/15.3; beta runs all workspaces under one cloud FM service token) · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer-to-close / auto-close-on-inactivity (§6.2). |
 | **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
 ---
@@ -468,19 +468,49 @@ user supplied by hand. The agent supplies them:
   gone quiet (`closure_reason="inactive"`). **Defaults (configurable):** an
   offer-to-close nudge at **~48 h** of quiet; a hard auto-close at **~7 days**.
   (Conservative, so a slow-moving incident isn't closed out from under the team.)
-- **Fresh case on revival.** Pinging a closed thread starts a **new** case (the
-  old one stays archived), so each case stays bounded to one active problem.
-  **Default:** reopen the same case if revived within a **~48 h** grace window of
-  closure; after that, a fresh case.
+- **Fresh thread for a new problem.** A terminal case is **never reopened** —
+  the backend has no reopen path and terminal is permanent by design (`update_case`
+  rejects terminal writes; `submit_turn` refuses `status_transition` on terminal).
+  A concluded thread stays useful for questions *about* what was found; anything
+  new belongs in a new thread. *(Not yet built: opening a fresh case automatically
+  from a concluded thread — see §6.4 for what the agent does today.)*
+
+> **Rejected alternative.** *Reopen the same case if revived within a ~48 h grace
+> window.* It contradicts the backend's terminal-is-permanent rule, and adds a
+> grace-window state machine to express something the server will not do.
 
 ### 6.3 Why this is achievable, not a rewrite
 
 The backend's bounded, lifecycle-managed case model is *correct* — we are not
 forcing it to be something it isn't. The Slack agent simply owns the **lifecycle
-policy** (case-per-thread, the auto-close job, offer-to-close actions,
-fresh-on-revival) that the individual Copilot user provided manually. The payoff:
-bounded focus, a flywheel that actually turns (cases reach RESOLVED → runbooks),
-and bounded storage/cost.
+policy** (case-per-thread, the auto-close job, offer-to-close actions) that the
+individual Copilot user provided manually. The payoff: bounded focus, a flywheel
+that actually turns (cases reach RESOLVED → runbooks), and bounded storage/cost.
+
+### 6.4 When the case is gone or concluded — what the agent says
+
+Two axes govern a case, and the agent must not conflate them (**ADR-005**):
+*workflow state* (`inquiry`/`investigating` → `resolved`/`closed`) and *data tier*
+(`online` → `archived` → `purged`). A `closed` case is finished on the first axis
+and still fully **online** on the second.
+
+The agent is **reactive**: it never proactively announces that a case ended.
+The Slack transcript is still there regardless, so nothing is lost by waiting for
+the next message and answering it clearly.
+
+| Condition | What the agent sees | Reply |
+|---|---|---|
+| **Terminal, still online** (`resolved`/`closed`) | `409` with no `x-error-code` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
+| **Deleted** | `404` on the turn POST | Says the case was deleted, unlinks the thread, and notes the next message starts a fresh investigation. |
+| **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
+| **Archived** | — | Not implemented: the backend has no archive tier yet (**ADR-014**, Proposed). Lands with that ADR, alongside Copilot and the Dashboard. |
+
+The two `409`s are unrelated conflicts sharing one status and needing opposite
+advice, so the client separates them at the boundary (`CaseTerminalError` vs
+`CaseVersionConflictError`). Only the version conflict is labelled by the
+backend, so *that* is matched positively and an unlabelled `409` is read as the
+terminal rejection — matching on the wording of `detail` would break the moment
+the backend rephrases a message we don't own.
 
 ---
 
@@ -500,7 +530,7 @@ and bounded storage/cost.
 | Evidence requests ("paste logs from X") | Prominent **EVIDENCE** call-to-action block | `suggested_actions[type=EVIDENCE]` |
 | Case status lifecycle | Status pill in the thread reply; offer-to-close / auto-close (§6.2) | `case_state`, `closure_reason` |
 | Reports (resolution/closure/runbook) | On terminal state: summary + "Generate runbook" / "Download" buttons; markdown posted or uploaded as a snippet | `/cases/{id}/report-recommendations`, `/cases/{id}/reports` |
-| Post-closure Q&A | Re-pinging a closed thread starts a fresh case (§6.2); the old case stays archived | `/cases/{id}/turns` |
+| Post-closure Q&A | A closed case still answers questions about what was found; evidence and state changes are declined in plain language (§6.4). A new problem belongs in a new thread — terminal is never reopened | `/cases/{id}/turns` |
 | Case list sidebar | **Deep-link to the Dashboard** (Slack doesn't reimplement the list, §4.5) | Dashboard |
 | Auth / login | OAuth account-linking (§10) | `/auth/...` |
 
@@ -870,7 +900,7 @@ requirement without widening the privacy surface.
    (§5.3); evidence consumption — files (`url_private`), paste, screenshots
    (multimodal), shortcut-existing-content (§5.4). *(Built.)*
 5. **P4 — Case lifecycle + reports.** Offer-to-close / auto-close-on-inactivity /
-   fresh-on-revival (§6.2); terminal-state report generation; deep-link to the
+   the gone/concluded replies (§6.4, built); terminal-state report generation; deep-link to the
    Dashboard for the case portfolio (no in-Slack case list, §4.5).
 6. **P5 — Multi-tenant OAuth hardening + war-room entry.** Per-user account
    linking + refresh; workspace→Team binding; war-room fallback; `not_in_channel`;
