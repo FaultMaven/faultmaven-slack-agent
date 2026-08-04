@@ -86,6 +86,42 @@ def test_submit_turn_sends_form_fields():
     assert "pasted_content" in seen["body"]
 
 
+def test_submit_turn_sends_observed_at_when_given():
+    """When the pasted evidence was OBSERVED, distinct from when it was sent.
+    Without it the backend stamps ingestion time and a stale alert reads live."""
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json={"agent_response": "ok", "turn_number": 1})
+
+    client = make_client(handler, token="tok")
+    client.submit_turn(
+        "c1",
+        query="investigate",
+        pasted_content="[FIRING:1] etcdInsufficientMembers",
+        observed_at="2026-08-04T17:36:17+00:00",
+    )
+    assert "observed_at" in seen["body"]
+    assert "2026-08-04T17" in seen["body"]
+
+
+def test_submit_turn_omits_observed_at_when_unknown():
+    """Absent is the honest encoding of "we don't know"; the field must not be
+    sent empty, which the backend would have to disambiguate."""
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json={"agent_response": "ok", "turn_number": 1})
+
+    client = make_client(handler, token="tok")
+    client.submit_turn("c1", query="investigate", pasted_content="x")
+    assert "observed_at" not in seen["body"]
+
+
 def test_submit_turn_multipart_when_files_present():
     seen: dict = {}
 

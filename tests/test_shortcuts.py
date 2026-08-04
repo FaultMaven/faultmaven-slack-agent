@@ -243,3 +243,102 @@ def test_run_turn_forwards_files_even_without_text_evidence():
     )
     assert turns[0]["files"] == files
     assert turns[0]["pasted_content"] is None  # no text, files carry the evidence
+
+
+# -- observation time: when the alert was POSTED, not when it was forwarded ----
+def _load_turn(name: str):
+    """Load listeners/_turn.py directly (its package __init__ pulls slack_bolt)."""
+    spec = importlib.util.spec_from_file_location(name, "listeners/_turn.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # let @dataclass resolve annotations
+    spec.loader.exec_module(module)
+    return module
+
+
+class _RecordingFM:
+    def __init__(self):
+        self.turns: list = []
+
+    def create_case(self, *, title=None, initial_message=None):
+        return "case_1"
+
+    def submit_turn(self, case_id, **kwargs):
+        self.turns.append(kwargs)
+        return TurnResult(agent_response="ok")
+
+
+class _MemStore:
+    def __init__(self):
+        self.m = {}
+
+    def get(self, t, c, th):
+        return self.m.get((t, c, th))
+
+    def put(self, t, c, th, cid):
+        self.m[(t, c, th)] = cid
+
+    def mark_seeded(self, t, c, th):
+        pass
+
+    def is_seeded(self, t, c, th):
+        return (t, c, th) in self.m
+
+
+def test_slack_ts_converts_to_an_iso_instant():
+    _turn = _load_turn("_turn_ts")
+    # 1785872177 == 2026-08-04T19:36:17Z — the alert's post time in this case.
+    assert _turn.slack_ts_to_iso("1785872177.123456") == "2026-08-04T19:36:17.123456+00:00"
+
+
+def test_malformed_slack_ts_yields_no_observation_time():
+    """Unknown is honest; a fabricated instant would be worse than none."""
+    _turn = _load_turn("_turn_ts_bad")
+    assert _turn.slack_ts_to_iso(None) is None
+    assert _turn.slack_ts_to_iso("") is None
+    assert _turn.slack_ts_to_iso("not-a-ts") is None
+
+
+def test_run_turn_forwards_observation_time():
+    _turn = _load_turn("_turn_obs")
+    fm = _RecordingFM()
+    _turn.run_turn(
+        fm, _MemStore(), team_id="T", channel_id="C", thread_ts="t1",
+        text="Please investigate this.",
+        pasted_content="[FIRING:1] etcdInsufficientMembers",
+        observed_at="2026-08-04T19:36:17+00:00",
+    )
+    assert fm.turns[0]["observed_at"] == "2026-08-04T19:36:17+00:00"
+
+
+def test_observation_time_is_withheld_when_a_thread_replay_is_merged_in():
+    """``prior_context`` splices many messages from many times into one blob;
+    no single instant describes it, so the stamp must be dropped rather than
+    mis-applied to the whole thing."""
+
+    _turn = _load_turn("_turn_obs_prior")
+    fm = _RecordingFM()
+    _turn.run_turn(
+        fm, _MemStore(), team_id="T", channel_id="C", thread_ts="t1",
+        text="Please investigate this.",
+        pasted_content="[FIRING:1] etcdInsufficientMembers",
+        observed_at="2026-08-04T19:36:17+00:00",
+        prior_context="earlier: we restarted kmaster-2",
+    )
+    assert fm.turns[0]["observed_at"] is None
+    assert "restarted kmaster-2" in fm.turns[0]["pasted_content"]
+
+
+def test_observation_time_is_not_prepended_to_the_message_text():
+    """Transport transparency: the engine must not be able to tell this alert
+    came via Slack rather than a Copilot paste, so the timestamp travels as
+    structured metadata and NEVER as framing inside the content."""
+
+    _turn = _load_turn("_turn_obs_clean")
+    fm = _RecordingFM()
+    alert = "[FIRING:1] etcdInsufficientMembers kube-system"
+    _turn.run_turn(
+        fm, _MemStore(), team_id="T", channel_id="C", thread_ts="t1",
+        text="Please investigate this.", pasted_content=alert,
+        observed_at="2026-08-04T19:36:17+00:00",
+    )
+    assert fm.turns[0]["pasted_content"] == alert

@@ -26,6 +26,7 @@ from ._turn import (
     run_gated,
     run_turn_and_post,
     skipped_files_note,
+    slack_ts_to_iso,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,12 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 logger.debug("permalink fetch failed: %s", exc)
 
             pasted = "\n\n".join(p for p in (alert_text, snippet_text) if p)
+            # When the selected message was POSTED — the alert's own time, not
+            # this turn's. Routinely hours older: an alert is triaged in
+            # channel, then handed to FaultMaven. Without this the backend
+            # stamps the evidence with submission time and the engine reads a
+            # stale alert as a live symptom. Sent as structured metadata, so
+            # `pasted` stays byte-identical to a Copilot paste of the same text.
             run_turn_and_post(
                 client,
                 fm,
@@ -179,6 +186,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 text=_SEED_QUERY,
                 pasted_content=pasted or None,
                 source_url=source_url,
+                observed_at=slack_ts_to_iso(message_ts),
                 files=files or None,
                 placeholder_ts=placeholder_ts,
                 mention_user=context.user_id,
