@@ -342,3 +342,96 @@ def test_observation_time_is_not_prepended_to_the_message_text():
         observed_at="2026-08-04T19:36:17+00:00",
     )
     assert fm.turns[0]["pasted_content"] == alert
+
+
+# -- the shortcut HANDLER itself: message.ts must reach the turn ---------------
+# The helpers above cover run_turn in isolation; this drives the registered
+# handler so the wiring from the Slack payload to the turn is covered too.
+class _CapturingApp:
+    """Stands in for slack_bolt.App: captures the decorated handler."""
+
+    def __init__(self):
+        self.handlers: dict = {}
+
+    def shortcut(self, spec):
+        def register(fn):
+            self.handlers[spec["callback_id"]] = fn
+            return fn
+
+        return register
+
+
+class _Ctx:
+    team_id = "T1"
+    user_id = "U1"
+
+
+class _FakeClient:
+    token = "xoxb-test"
+
+    def chat_getPermalink(self, *, channel, message_ts):
+        return {"permalink": f"https://slack/archives/{channel}/p{message_ts}"}
+
+
+def _drive_shortcut(monkeypatch, message: dict) -> dict:
+    """Invoke the registered shortcut handler and return run_turn_and_post's kwargs."""
+    from listeners import shortcuts as sc
+
+    captured: dict = {}
+    monkeypatch.setattr(sc, "post_placeholder", lambda *a, **k: "ph_ts")
+    monkeypatch.setattr(sc, "run_gated", lambda *a, **k: (k["work"](), True)[1])
+    monkeypatch.setattr(
+        sc, "run_turn_and_post", lambda *a, **k: captured.update(k)
+    )
+
+    app = _CapturingApp()
+    sc.register_shortcuts(app, object(), object())
+    app.handlers["fm_investigate_message"](
+        ack=lambda: None,
+        shortcut={
+            "trigger_id": "trig1",
+            "channel": {"id": "C1"},
+            "message": message,
+            "response_url": None,
+        },
+        context=_Ctx(),
+        client=_FakeClient(),
+        logger=__import__("logging").getLogger("test"),
+    )
+    return captured
+
+
+def test_shortcut_sends_the_selected_messages_post_time_as_observed_at(monkeypatch):
+    """The defect this fixes: the alert's own post time was read for threading
+    and then thrown away, so the backend stamped ingestion time and a two-hour-
+    old alert reached the engine looking live."""
+
+    captured = _drive_shortcut(
+        monkeypatch,
+        {"ts": "1785872177.123456", "text": "[FIRING:1] etcdInsufficientMembers"},
+    )
+    # Assert the turn ran at all first, so "handler never fired" can't be
+    # mistaken for "handler fired but dropped the timestamp".
+    assert captured, "the shortcut handler did not reach run_turn_and_post"
+    assert captured.get("observed_at") == "2026-08-04T19:36:17.123456+00:00"
+    # ...and it is NOT the moment of forwarding.
+    assert captured["pasted_content"] == "[FIRING:1] etcdInsufficientMembers"
+
+
+def test_shortcut_observed_at_is_independent_of_the_thread_root(monkeypatch):
+    """A shortcut on a REPLY threads under the parent but must timestamp the
+    reply that was actually selected — threading and observation are different
+    questions about different messages."""
+
+    captured = _drive_shortcut(
+        monkeypatch,
+        {
+            "ts": "1785872177.000000",
+            "thread_ts": "1785000000.000000",  # older parent
+            "text": "etcd quorum lost",
+        },
+    )
+    assert captured, "the shortcut handler did not reach run_turn_and_post"
+    # The parent's ts would render 2026-07-26T…; reading the wrong field is the
+    # most plausible mis-wiring, so pin the selected message's own instant.
+    assert captured.get("observed_at") == "2026-08-04T19:36:17+00:00"
