@@ -174,3 +174,53 @@ def test_degraded_path_still_renders():
 
     msg = Exploding(text=_ALERTMANAGER_TITLE)
     assert message_to_text(msg) == _ALERTMANAGER_RENDERED
+
+
+# -- review findings ----------------------------------------------------------
+def test_plain_text_is_left_entirely_alone():
+    """``plain_text`` is LITERAL by Slack's contract. Entity-unwrapping it
+    stripped the brackets from ordinary strings — Go's ``<no value>``, ``<nil>``,
+    a shell's ``<stdin>`` — and broke the cross-shape invariant besides."""
+
+    msg = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Parse error at <no value> on <stdin>",
+                },
+            }
+        ]
+    }
+    assert message_to_text(msg) == "Parse error at <no value> on <stdin>"
+
+
+def test_the_cross_shape_invariant_holds_for_angle_brackets():
+    """mrkdwn ``&lt;stdin&gt;`` and plain_text ``<stdin>`` are the same content
+    on screen, so they must reach the engine identically."""
+
+    as_mrkdwn = message_to_text(
+        {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "on &lt;stdin&gt;"}}]}
+    )
+    as_plain = message_to_text(
+        {"blocks": [{"type": "header", "text": {"type": "plain_text", "text": "on <stdin>"}}]}
+    )
+    assert as_mrkdwn == as_plain == "on <stdin>"
+
+
+def test_an_entity_never_spans_a_line_break():
+    """Slack's parser does not span lines. Allowing it turned an unrelated ``<``
+    and a later ``>`` into a pseudo-entity; with a ``|`` between them everything
+    before it — INCLUDING the newline — was deleted, merging two log lines and
+    dropping the text between. Data loss, not a rendering nit."""
+
+    raw = "ERROR at index <5 in pool\nWARN retry | giving up>\nnext line"
+    assert message_to_text({"text": raw}) == raw
+
+
+def test_a_multiline_paste_keeps_every_line():
+    raw = "panic: index out of range <5>\nwith length 3\n| col | val |\ntail"
+    out = message_to_text({"text": raw})
+    assert out.count("\n") == raw.count("\n")
+    assert "with length 3" in out and "tail" in out

@@ -435,3 +435,41 @@ def test_shortcut_observed_at_is_independent_of_the_thread_root(monkeypatch):
     # The parent's ts would render 2026-07-26T…; reading the wrong field is the
     # most plausible mis-wiring, so pin the selected message's own instant.
     assert captured.get("observed_at") == "2026-08-04T19:36:17+00:00"
+
+
+def test_out_of_range_slack_ts_does_not_escape():
+    """`datetime.fromtimestamp` raises OverflowError for inf/1e20 and OSError on
+    some platforms — neither is a ValueError. The only call site runs inside
+    work() AFTER the placeholder is posted and outside any try, so an escaping
+    exception is not "a bad timestamp is ignored", it is ":mag: Investigating…"
+    left in the channel forever with no reply."""
+
+    _turn = _load_turn("_turn_ts_overflow")
+    for bad in ("inf", "-inf", "1e20", "nan"):
+        assert _turn.slack_ts_to_iso(bad) is None
+
+
+def test_mention_path_renders_the_wire_form_too(monkeypatch):
+    """The rendering fix originally reached only the shortcut path, so the SAME
+    alert arrived in two different shapes depending on how it was forwarded."""
+
+    from rendering import clean_mention
+
+    alertmanager = (
+        "<@UBOT> <http://am:9093/#/alerts|[FIRING:1] etcdInsufficientMembers> "
+        "a &amp; b"
+    )
+    assert clean_mention(alertmanager) == (
+        "[FIRING:1] etcdInsufficientMembers a & b"
+    )
+
+
+def test_bot_mention_is_stripped_before_rendering():
+    """Order is load-bearing: rendering first would rewrite `<@UBOT>` to `@UBOT`
+    before the mention strip could match it, leaving the bot's own handle in the
+    query."""
+
+    from rendering import clean_mention
+
+    assert clean_mention("<@UBOT> why is etcd down?") == "why is etcd down?"
+    assert "UBOT" not in clean_mention("<@UBOT> why is etcd down?")

@@ -15,6 +15,7 @@ from typing import Any, Pattern
 
 from faultmaven.client import TurnResult
 from slack_mrkdwn import escape_mrkdwn, to_mrkdwn
+from slack_text import render_slack_text as _render
 
 # Slack section ``mrkdwn`` text tops out at 3000 chars; stay safely under.
 _SECTION_LIMIT = 2900
@@ -48,9 +49,23 @@ _COMMAND_LIMIT = 600
 
 
 def clean_mention(text: str) -> str:
-    """Strip ``<@U123>`` bot mentions and surrounding whitespace."""
+    """Strip ``<@U123>`` bot mentions, then render Slack's wire form.
 
-    return _MENTION_RE.sub("", text or "").strip()
+    Every inbound text path funnels through here — the ``@mention`` summons, the
+    DM summons, thread follow-ups, and the thread-replay catch-up — so this is
+    where the wire form has to be decoded for all of them. Without it only the
+    shortcut path was rendered, and the SAME alert reached the engine in two
+    different shapes depending on how it was forwarded: via the shortcut with
+    ``[FIRING:1]`` readable, via ``@mention`` with that marker still buried in
+    ``<url|label>`` markup and ``&amp;`` still escaped. Transport transparency
+    is not transparency if it holds on one route only.
+
+    Order is load-bearing: strip the bot mention FIRST. ``_MENTION_RE`` matches
+    the entity form ``<@U123>``, and rendering would rewrite it to ``@U123``
+    before the strip could see it, leaving the bot's own handle in the query.
+    """
+
+    return _render(_MENTION_RE.sub("", text or "")).strip()
 
 
 def _chunk(text: str) -> list[str]:

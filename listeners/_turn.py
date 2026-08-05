@@ -474,11 +474,19 @@ def slack_ts_to_iso(ts: str | None) -> str | None:
     observation time) rather than propagating a bogus instant — the engine
     treats a missing observation time as *unknown*, which is honest; a wrong one
     would be worse than none.
+
+    The exception list is wider than it looks like it needs to be, and
+    deliberately so. ``float("inf")`` and ``1e20`` raise ``OverflowError``, and
+    out-of-range values raise ``OSError`` on some platforms — neither is a
+    ``ValueError``. The only call site runs inside ``work()`` AFTER the
+    placeholder is posted and outside any try, so an escaping exception is not
+    "a bad timestamp is ignored", it is ":mag: Investigating…" left in the
+    channel forever with no reply.
     """
 
     try:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError, OSError):
         logger.warning("un-parseable Slack ts %r; sending no observation time", ts)
         return None
 

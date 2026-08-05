@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 # LITERAL here — genuine ``<`` in message content arrives as ``&lt;`` — which is
 # why entities are unwrapped BEFORE the escapes are undone. Reverse that order
 # and a log line reading ``&lt;stdin&gt;`` would be mistaken for an entity.
-_ENTITY = re.compile(r"<([^<>]*)>")
+#
+# ``\n`` is excluded from the body: Slack's own parser does not span lines, and
+# allowing it here turned an unrelated ``<`` and a later ``>`` into a
+# pseudo-entity. With a ``|`` between them everything before it — including the
+# line break — was DELETED, silently merging two log lines and dropping the text
+# in between. Data loss, not a rendering nit.
+_ENTITY = re.compile(r"<([^<>\n]*)>")
 
 
 def _unwrap_entities(text: str) -> str:
@@ -67,10 +73,20 @@ def _unescape(text: str) -> str:
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
-def _render(text: str) -> str:
-    """Slack mrkdwn wire form → the text as displayed."""
+def render_slack_text(text: str) -> str:
+    """Slack mrkdwn wire form → the text as displayed.
+
+    Public because every inbound path needs it, not just this module's block
+    walk: ``rendering.clean_mention`` applies it to the @mention / DM / thread
+    routes so a forwarded alert reaches the engine the same way whichever one
+    carried it.
+    """
 
     return _unescape(_unwrap_entities(text))
+
+
+# Internal alias kept for this module's own call sites.
+_render = render_slack_text
 
 
 def message_to_text(message: dict[str, Any]) -> str:
@@ -103,10 +119,15 @@ def message_to_text(message: dict[str, Any]) -> str:
 def _composition_text(obj: Any) -> str | None:
     """A Block Kit text field may be a {type,text} object or (loosely) a string.
 
-    ``mrkdwn`` objects carry Slack's wire encoding and are rendered; ``plain_text``
-    is literal by definition, so it is only entity-unwrapped (a stray entity there
-    is an app's mistake, but leaving markup in would still mislead the engine)
-    and never unescaped — that would corrupt a literal ``&amp;`` in a log line.
+    ``mrkdwn`` objects carry Slack's wire encoding and are rendered.
+    ``plain_text`` is LITERAL by Slack's contract and gets no transform at all —
+    not even entity-unwrapping. ``<no value>``, ``<nil>`` and ``<stdin>`` are
+    ordinary strings there, and stripping their brackets corrupts the content
+    while also breaking the cross-shape invariant this module exists to hold
+    (mrkdwn ``&lt;stdin&gt;`` renders as ``<stdin>``, so plain_text ``<stdin>``
+    must too). An app that puts a real entity in plain_text has made a mistake;
+    honouring the declared type is still the right response.
+
     A loose bare string is treated as mrkdwn, which is what apps that emit one mean.
     """
 
@@ -115,7 +136,7 @@ def _composition_text(obj: Any) -> str | None:
         if not isinstance(text, str):
             return None
         if obj.get("type") == "plain_text":
-            return _unwrap_entities(text)
+            return text
         return _render(text)
     if isinstance(obj, str):
         return _render(obj)
