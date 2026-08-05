@@ -145,6 +145,25 @@ def test_submit_turn_4xx_carries_backend_detail():
     assert "file type not allowed" in err.value.detail
 
 
+def test_submit_turn_4xx_carries_protection_error_message():
+    def handler(req):
+        return httpx.Response(
+            429,
+            json={
+                "error_type": "rate_limit_exceeded",
+                "message": "Rate limit exceeded: 11/20 requests. Retry after 60 seconds.",
+                "retry_after": 60,
+            },
+        )
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.status_code == 429
+    assert "Rate limit exceeded: 11/20 requests" in err.value.detail
+
+
+
 def test_submit_turn_timeout_is_typed():
     def handler(req: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow turn")

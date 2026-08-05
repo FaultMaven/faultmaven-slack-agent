@@ -756,7 +756,11 @@ class FaultMavenClient:
 
         try:
             body = resp.json()
-            detail = body.get("detail") if isinstance(body, dict) else None
+            detail = (
+                (body.get("detail") or body.get("message"))
+                if isinstance(body, dict)
+                else None
+            )
             text = detail if isinstance(detail, str) else resp.text
         except ValueError:
             text = resp.text
