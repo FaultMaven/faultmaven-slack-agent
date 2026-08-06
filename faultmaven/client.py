@@ -819,10 +819,16 @@ class FaultMavenClient:
         intent_data: dict[str, Any] | None = None,
         input_type: str | None = None,
         source_url: str | None = None,
+        observed_at: str | None = None,
     ) -> TurnResult:
         """Submit one turn (multipart) and return the normalized result.
 
         ``files`` items are ``(filename, content, content_type)`` tuples.
+
+        ``observed_at`` is an ISO-8601 instant saying when ``pasted_content``
+        was observed — distinct from when it was submitted. The backend
+        defaults to submission time when it is absent, which reads a
+        two-hour-old alert as current.
         """
 
         form: dict[str, str] = {}
@@ -838,6 +844,8 @@ class FaultMavenClient:
             form["input_type"] = input_type
         if source_url:
             form["source_url"] = source_url
+        if observed_at:
+            form["observed_at"] = observed_at
 
         file_parts = (
             [("files", (name, content, ctype)) for name, content, ctype in files]

@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -465,6 +466,31 @@ def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None
     return None
 
 
+def slack_ts_to_iso(ts: str | None) -> str | None:
+    """Slack's ``"1754336177.123456"`` → an ISO-8601 UTC instant, or None.
+
+    Slack timestamps are epoch seconds with a microsecond suffix. This is the
+    only place the conversion happens, so a malformed ts degrades to None (no
+    observation time) rather than propagating a bogus instant — the engine
+    treats a missing observation time as *unknown*, which is honest; a wrong one
+    would be worse than none.
+
+    The exception list is wider than it looks like it needs to be, and
+    deliberately so. ``float("inf")`` and ``1e20`` raise ``OverflowError``, and
+    out-of-range values raise ``OSError`` on some platforms — neither is a
+    ``ValueError``. The only call site runs inside ``work()`` AFTER the
+    placeholder is posted and outside any try, so an escaping exception is not
+    "a bad timestamp is ignored", it is ":mag: Investigating…" left in the
+    channel forever with no reply.
+    """
+
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        logger.warning("un-parseable Slack ts %r; sending no observation time", ts)
+        return None
+
+
 def run_turn(
     fm: FaultMavenClient,
     store: CaseStore,
@@ -475,6 +501,7 @@ def run_turn(
     text: str,
     pasted_content: str | None = None,
     source_url: str | None = None,
+    observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
 ) -> TurnResult:
@@ -497,6 +524,11 @@ def run_turn(
       failed opening turn re-delivers it instead of silently losing it.
     - ``source_url`` (e.g. a permalink to the alert) is passed through for case
       provenance.
+    - ``observed_at`` is when the pasted evidence was *observed* — for the
+      shortcut, when the selected alert was posted, which is routinely hours
+      before this turn. It travels as structured metadata, never as text
+      prepended to ``pasted_content``: the engine must not be able to tell a
+      Slack-forwarded alert from the same alert pasted into the Copilot.
     """
 
     case_id = store.get(team_id, channel_id, thread_ts)
@@ -516,6 +548,10 @@ def run_turn(
             if pasted_content
             else prior_context
         )
+        # A replayed thread spans many messages and many times, so no single
+        # instant describes the merged blob. Withhold rather than mis-stamp it:
+        # unknown is honest, a precise-looking wrong answer is not.
+        observed_at = None
 
     try:
         if pasted_content or source_url or files:
@@ -524,6 +560,7 @@ def run_turn(
                 query=text,
                 pasted_content=pasted_content or None,
                 source_url=source_url,
+                observed_at=observed_at,
                 files=files or None,
                 input_type="paste" if pasted_content else None,
             )
@@ -609,6 +646,7 @@ def run_turn_and_post(
     text: str,
     pasted_content: str | None = None,
     source_url: str | None = None,
+    observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
     placeholder_ts: str | None = None,
@@ -664,6 +702,7 @@ def run_turn_and_post(
             text=text,
             pasted_content=pasted_content,
             source_url=source_url,
+            observed_at=observed_at,
             prior_context=prior_context,
             files=files,
         )
