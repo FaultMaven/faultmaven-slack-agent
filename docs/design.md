@@ -503,7 +503,17 @@ the next message and answering it clearly.
 | **Terminal, still online** (`resolved`/`closed`) | `409` with no `x-error-code` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
 | **Deleted** | `404` on the turn POST | Says the case was deleted, unlinks the thread, and notes the next message starts a fresh investigation. |
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
+| **Rate limited** (*not* a lifecycle event) | `429` + `Retry-After` | Says FaultMaven is rate-limiting and quotes the wait ("send it again in 45 seconds" / "about an hour"). Not framed as an error — nothing is broken — and never "re-sending won't help", because a 429 *does* succeed later. |
 | **Archived** | — | Not implemented: the backend has no archive tier yet (**ADR-014**, Proposed). Lands with that ADR, alongside Copilot and the Dashboard. |
+
+The `429` reply quotes a wait rather than saying "try again", because the wait is
+the only actionable part and it spans two orders of magnitude: the backend's
+per-minute session buckets refuse for ~60s, the hourly ones for up to an hour
+(fm#994 split reads and writes into separate pairs). The interval comes from the
+`Retry-After` **header** — the protocol value the limiter computed for this
+caller, and the only one present when the body is not JSON — with the body's
+`retry_after` as fallback. An unparseable or absent value degrades to "in a
+little while": a guessed number earns the user a second refusal.
 
 These `409`s are unrelated conflicts sharing one status and needing opposite
 advice, so the client separates them at the boundary (`CaseTerminalError` vs
@@ -518,6 +528,30 @@ A labelled but unrecognized `409` falls through to the generic 4xx reply, which
 is the honest answer for a conflict we don't model. Matching on the wording of
 `detail` instead would break the moment the backend rephrases a message we
 don't own.
+
+> **This rule reads *absence* as evidence, and it concludes something about the
+> user's case.** That makes it only as sound as the premise "no non-terminal
+> `409` is unlabelled" — a premise this repo depends on and does not own. It had
+> already been broken once: the deduplication middleware carried a second,
+> unlabelled `409` builder (`_create_duplicate_error_response`) that would have
+> produced exactly the false "your investigation is closed" reply. It was
+> unreachable — `DuplicateRequestError` is constructed but never raised — so no
+> user ever saw it, but nothing would have caught it becoming reachable.
+>
+> The premise is now enforced on the side that owns it: the backend's
+> `tests/unit/api/middleware/test_conflict_labelling.py` fails if any `409`
+> emitter outside the terminal-case handler lacks `x-error-code`, **and** if the
+> terminal one ever gains a label (which would silently stop this rule firing,
+> stranding a user whose case really is closed on "try again" advice). The dead
+> deduplication path is deleted and the idempotency key-reuse `409` — the one
+> reachable unlabelled non-terminal conflict — is now labelled
+> `IDEMPOTENCY_KEY_REUSE`.
+>
+> The agent does not currently send `Idempotency-Key`, so that one was never
+> reachable from here. It was labelled anyway: "no client sends the header that
+> triggers it" is a property of today's callers, not an invariant, and this rule
+> is one where being wrong means telling someone their live investigation is
+> over.
 
 **Ordering against shutdown.** A terminal case is *permanent*, so its reply
 outranks the "I'm restarting — resend in a minute" drain notice: that promise
