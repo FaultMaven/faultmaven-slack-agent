@@ -117,6 +117,38 @@ class FaultMavenAPIError(FaultMavenError):
         self.detail = detail
 
 
+class FaultMavenRateLimitError(FaultMavenAPIError):
+    """The backend refused this request as backpressure (429).
+
+    Distinguished from a generic 4xx because the advice is the opposite one: a
+    429 reproduces on an *immediate* retry and succeeds on a later one, so
+    "re-sending the same input won't help" is false and "try again" with no
+    interval is useless — the wait is the only actionable part.
+
+    ``retry_after`` is that wait in seconds, or ``None`` when the backend did
+    not say. It is read from the ``Retry-After`` header first: that is the
+    protocol-level value the limiter computes per caller, and it is present on
+    every 429 the protection middleware sends, including the ones whose body is
+    not JSON at all. The body's ``retry_after`` mirrors it and is the fallback.
+
+    The distinction is not cosmetic. The per-session read and write buckets have
+    very different windows — a write bucket refuses for ~60s, the hourly buckets
+    for up to an hour — so a fixed "try again in a minute" would be a false
+    promise on exactly the refusal a user is most likely to hit twice.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 429,
+        detail: str = "",
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, detail=detail)
+        self.retry_after = retry_after
+
+
 class CaseNotFoundError(FaultMavenAPIError):
     """The case behind a thread no longer exists server-side (404).
 
@@ -780,9 +812,46 @@ class FaultMavenClient:
                 raise CaseNotFoundError(
                     message, status_code=404, detail=detail
                 ) from exc
+            if resp.status_code == 429:
+                raise FaultMavenRateLimitError(
+                    message,
+                    status_code=429,
+                    detail=detail,
+                    retry_after=self._retry_after(resp),
+                ) from exc
             raise FaultMavenAPIError(
                 message, status_code=resp.status_code, detail=detail
             ) from exc
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> int | None:
+        """How long the backend asked us to wait, in seconds, if it said.
+
+        The ``Retry-After`` header is preferred over the body's ``retry_after``:
+        it is the protocol-level value, it is present even when the body is not
+        JSON, and it is what the limiter actually computed for this caller.
+
+        Only the delta-seconds form is read. ``Retry-After`` also permits an
+        HTTP-date, which the backend does not send; parsing it here would be
+        dead code, and guessing at a malformed value would be worse than saying
+        nothing — ``None`` degrades to advice without an interval, which is
+        honest, whereas a wrong number tells the user to come back too early
+        and earns them a second refusal.
+        """
+
+        raw = resp.headers.get("retry-after")
+        if raw is None:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            raw = body.get("retry_after") if isinstance(body, dict) else None
+
+        try:
+            seconds = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return seconds if seconds >= 0 else None
 
     # -- core calls ---------------------------------------------------------
     def create_case(

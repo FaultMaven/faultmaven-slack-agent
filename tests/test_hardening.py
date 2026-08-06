@@ -7,12 +7,15 @@ Block Kit limit handling, typed backend errors (404 eviction / preset-token
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 
 from faultmaven.client import (
     CaseNotFoundError,
     FaultMavenAPIError,
+    FaultMavenRateLimitError,
     FaultMavenClient,
     FaultMavenTimeoutError,
 )
@@ -146,12 +149,22 @@ def test_submit_turn_4xx_carries_backend_detail():
 
 
 def test_submit_turn_4xx_carries_protection_error_message():
+    """A protection-shaped body (``message``, no ``detail``) yields JUST the message.
+
+    Asserted by **equality**, not substring. The pre-fix fallback was
+    ``resp.text`` — the whole raw JSON — which is 125 characters, under the
+    300-char cap, and *contains* the message. A substring assertion therefore
+    passed against the unfixed client and gated nothing.
+    """
+
+    message = "Rate limit exceeded: 11/20 requests. Retry after 60 seconds."
+
     def handler(req):
         return httpx.Response(
             429,
             json={
                 "error_type": "rate_limit_exceeded",
-                "message": "Rate limit exceeded: 11/20 requests. Retry after 60 seconds.",
+                "message": message,
                 "retry_after": 60,
             },
         )
@@ -159,9 +172,48 @@ def test_submit_turn_4xx_carries_protection_error_message():
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
         client.submit_turn("c1", query="hi")
-    assert err.value.status_code == 429
-    assert "Rate limit exceeded: 11/20 requests" in err.value.detail
 
+    assert err.value.status_code == 429
+    assert err.value.detail == message
+    # The distinguishing property: the raw body's other keys must be absent.
+    # These are what a `resp.text` fallback would drag in.
+    assert "error_type" not in err.value.detail
+    assert "retry_after" not in err.value.detail
+
+
+def test_submit_turn_4xx_message_fallback_does_not_shadow_detail():
+    """``detail`` still wins when both are present — the fix only adds a fallback."""
+
+    def handler(req):
+        return httpx.Response(
+            400,
+            json={"detail": "file type not allowed", "message": "generic protection text"},
+        )
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.detail == "file type not allowed"
+
+
+def test_submit_turn_422_list_detail_still_falls_back_to_raw_text():
+    """A 422 puts a *list* in ``detail``; that is not a message.
+
+    It must keep falling through to ``resp.text`` rather than being replaced by
+    ``message`` — pinned because ``detail or message`` makes an empty/absent
+    ``detail`` reach for ``message``, and a list is neither.
+    """
+
+    def handler(req):
+        return httpx.Response(
+            422,
+            json={"detail": [{"loc": ["body", "query"], "msg": "field required"}]},
+        )
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi")
+    assert "field required" in err.value.detail
 
 
 def test_submit_turn_timeout_is_typed():
@@ -218,10 +270,67 @@ def test_error_text_for_4xx_says_retry_wont_help_and_escapes_detail():
     assert "<!channel>" not in text
 
 
-def test_error_text_for_429_and_unknown_stays_generic():
-    exc = FaultMavenAPIError("busy", status_code=429, detail="slow down")
-    assert _turn.turn_error_text(exc) == _turn.TURN_ERROR_TEXT
+def test_error_text_for_an_unknown_failure_stays_generic():
     assert _turn.turn_error_text(RuntimeError("boom")) == _turn.TURN_ERROR_TEXT
+
+
+# A 429 used to return TURN_ERROR_TEXT — ":warning: FaultMaven hit an error on
+# that turn. Please try again or @mention me." Two things were wrong with it.
+# It framed deliberate backpressure as a malfunction, sending people to check
+# what isn't broken; and "try again" with no interval invites an immediate
+# resend, which is refused again. The wait is the only actionable part of a 429.
+def test_rate_limited_turn_says_rate_limited_and_quotes_the_wait():
+    exc = FaultMavenRateLimitError(
+        "busy", status_code=429, detail="Rate limit exceeded", retry_after=45
+    )
+    text = _turn.turn_error_text(exc)
+
+    assert text != _turn.TURN_ERROR_TEXT
+    assert "rate-limiting" in text
+    assert "45 seconds" in text
+    # Not framed as a fault, and not the generic 4xx advice — a 429 DOES
+    # succeed on a later retry.
+    assert "hit an error" not in text
+    assert "won't help" not in text
+
+
+def test_rate_limited_turn_omits_the_interval_when_the_backend_did_not_say():
+    exc = FaultMavenRateLimitError("busy", status_code=429, detail="", retry_after=None)
+    text = _turn.turn_error_text(exc)
+
+    assert "rate-limiting" in text
+    assert "in a little while" in text
+    # Must not invent a number: a wrong one earns the user a second refusal.
+    assert not re.search(r"\d+\s*(second|minute|hour)", text)
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (0, "1 seconds"),  # never "0 seconds" — that reads as "retry now"
+        (45, "45 seconds"),
+        (60, "60 seconds"),
+        (90, "2 minutes"),
+        (600, "10 minutes"),
+        (3600, "about an hour"),
+        (7200, "about 2 hours"),
+    ],
+)
+def test_humanized_waits_span_the_backend_buckets(seconds, expected):
+    """The buckets differ by two orders of magnitude, so one phrasing won't do.
+
+    The per-minute session buckets refuse for ~60s; the hourly ones for up to
+    3600s. "3600 seconds" is not a wait anyone can act on.
+    """
+    assert _turn._humanize_seconds(seconds) == expected
+
+
+def test_a_bare_api_error_at_429_still_gets_the_rate_limit_text():
+    """Defence in depth for a 429 constructed without the typed error."""
+    exc = FaultMavenAPIError("busy", status_code=429, detail="slow down")
+    text = _turn.turn_error_text(exc)
+    assert "rate-limiting" in text
+    assert "won't help" not in text
 
 
 # -- run_turn: mapping lifecycle ---------------------------------------------------
@@ -544,3 +653,100 @@ def test_error_text_during_shutdown_blames_the_restart():
         assert "try again" not in text.lower()
     finally:
         _turn._shutting_down.clear()
+
+
+# -- 429: the whole path, not the two halves ------------------------------------
+# The original fix extracted the backend's rate-limit message and no user ever
+# saw it: `turn_error_text` short-circuited 429 to a generic string before
+# `exc.detail` was read. Both halves were individually correct and the feature
+# was still a no-op, so these drive the real client against a real
+# protection-shaped 429 and assert on what Slack would actually render.
+def test_a_backend_429_reaches_slack_as_rate_limit_text_with_the_wait():
+    def handler(req):
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "45"},
+            json={
+                "error_type": "rate_limit_exceeded",
+                "message": "Rate limit exceeded: per_session (11/10)",
+                "retry_after": 45,
+            },
+        )
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenRateLimitError) as err:
+        client.submit_turn("c1", query="hi")
+
+    text = _turn.turn_error_text(err.value)
+    assert "rate-limiting" in text
+    assert "45 seconds" in text
+    assert text != _turn.TURN_ERROR_TEXT
+
+
+def test_the_retry_after_header_wins_over_the_body():
+    """The header is the protocol value the limiter computed for this caller.
+
+    They agree today; if they ever disagree, the header is authoritative — and
+    it is the only one present when the body is not JSON.
+    """
+
+    def handler(req):
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "30"},
+            json={"message": "slow down", "retry_after": 999},
+        )
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenRateLimitError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.retry_after == 30
+
+
+def test_a_429_with_a_non_json_body_still_carries_the_header_wait():
+    def handler(req):
+        return httpx.Response(429, headers={"Retry-After": "60"}, text="<html>429</html>")
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenRateLimitError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.retry_after == 60
+    assert "60 seconds" in _turn.turn_error_text(err.value)
+
+
+@pytest.mark.parametrize("bad", ["Wed, 21 Oct 2015 07:28:00 GMT", "soon", "", "-5"])
+def test_an_unparseable_retry_after_degrades_to_no_interval(bad):
+    """Never guess. A wrong number earns the user a second refusal."""
+
+    def handler(req):
+        return httpx.Response(429, headers={"Retry-After": bad}, json={"message": "slow"})
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenRateLimitError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.retry_after is None
+    assert "in a little while" in _turn.turn_error_text(err.value)
+
+
+def test_a_429_without_any_retry_signal_still_says_rate_limited():
+    def handler(req):
+        return httpx.Response(429, json={"message": "Rate limit exceeded"})
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenRateLimitError) as err:
+        client.submit_turn("c1", query="hi")
+    assert err.value.retry_after is None
+    assert "rate-limiting" in _turn.turn_error_text(err.value)
+
+
+def test_a_rate_limit_error_is_still_a_faultmaven_api_error():
+    """Existing `except FaultMavenAPIError` handlers must keep catching a 429."""
+
+    def handler(req):
+        return httpx.Response(429, json={"message": "slow down"})
+
+    client = _client(handler, token="tok")
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi")
+    assert isinstance(err.value, FaultMavenRateLimitError)
+    assert err.value.status_code == 429
