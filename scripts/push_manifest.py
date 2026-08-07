@@ -39,8 +39,9 @@ import json
 import sys
 from pathlib import Path
 
-# Run from anywhere: put the repo root on the path so `.env` resolves the same
-# way the runtime does.
+# Importable from anywhere: put the repo root on sys.path. Note this affects
+# IMPORTS only — it does not make `.env` resolve; that is anchored explicitly in
+# _ConfigTokens below, because pydantic-settings reads it relative to the cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx  # noqa: E402
