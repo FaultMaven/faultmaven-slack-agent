@@ -32,6 +32,7 @@ from faultmaven import (
     FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenCredentialError,
+    FaultMavenRateLimitError,
     FaultMavenTimeoutError,
     TurnResult,
 )
@@ -125,6 +126,41 @@ def skipped_files_note(skipped: list[str]) -> str:
     )
 
 
+def _humanize_seconds(seconds: int) -> str:
+    """A wait a person can act on: "45 seconds", "3 minutes", "about an hour"."""
+
+    if seconds < 90:
+        return f"{max(seconds, 1)} seconds"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} minutes"
+    hours = seconds / 3600
+    return "about an hour" if hours < 1.5 else f"about {round(hours)} hours"
+
+
+def _rate_limited_text(retry_after: int | None) -> str:
+    """The user-facing message for backend backpressure.
+
+    Says *rate limited* rather than "hit an error": the turn was refused
+    deliberately and nothing is broken, so an error framing sends people to
+    check the wrong things.
+
+    Without a stated wait it advises "in a little while" rather than naming a
+    number — inventing one earns the user a second refusal.
+    """
+
+    if retry_after is None:
+        return (
+            ":hourglass_flowing_sand: FaultMaven is rate-limiting requests right "
+            "now, so I didn't run that turn. Send it again in a little while."
+        )
+    return (
+        f":hourglass_flowing_sand: FaultMaven is rate-limiting requests right "
+        f"now, so I didn't run that turn. Send it again in "
+        f"{_humanize_seconds(retry_after)}."
+    )
+
+
 def turn_error_text(exc: Exception) -> str:
     """The user-facing message for a failed turn, by failure class.
 
@@ -166,9 +202,21 @@ def turn_error_text(exc: Exception) -> str:
     # neither is a malfunction.
     if isinstance(exc, CaseVersionConflictError):
         return CASE_BUSY_TEXT
+    # Backend backpressure. Transient, so it must NOT get the generic 4xx
+    # "re-sending won't help" — but TURN_ERROR_TEXT's bare "please try again"
+    # was no better: it dropped both the reason and the wait, so the user
+    # retried immediately and was refused again. The wait is the only actionable
+    # part of a 429, and it varies by two orders of magnitude across the
+    # backend's buckets (~60s for the per-minute ones, up to an hour for the
+    # hourly), so it is quoted rather than guessed at. Kept above the generic
+    # 4xx branch below.
+    if isinstance(exc, FaultMavenRateLimitError):
+        return _rate_limited_text(exc.retry_after)
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         if exc.status_code == 429:
-            return TURN_ERROR_TEXT  # backend backpressure IS transient
+            # A 429 that did not arrive as FaultMavenRateLimitError — only
+            # possible from a caller constructing FaultMavenAPIError directly.
+            return _rate_limited_text(None)
         detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
         suffix = f": _{detail}_" if detail else "."
         return (
