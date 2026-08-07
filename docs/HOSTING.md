@@ -117,9 +117,39 @@ externalized. Horizontal scale is a follow-up, not required for the beta.
 4. **Apply** the manifests (ConfigMap, Secret, Deployment+PVC, Service, Ingress).
 5. **Point Slack at the host** — apply `manifest.json` (already carries the
    `slack.faultmaven.ai` URLs + `socket_mode_enabled: false`) via
-   `scripts/push_manifest.py`.
+   `scripts/push_manifest.py`. The manifest also carries the `app_directory`
+   listing URLs (see below), and the push is a **full-manifest** update — run
+   `--validate` then `--diff` first so it cannot silently overwrite listing
+   fields set in the App Directory form.
 6. **Install** at `https://slack.faultmaven.ai/slack/install` per workspace (the
    Orgs track needs 5+); confirm a row in the Postgres `slack_installations` table.
+
+## Marketplace listing URLs
+
+Slack requires the listing's landing page, privacy policy, and support URLs to be
+hosted on a domain FaultMaven owns — a GitHub-hosted policy or repo README is
+rejected. All three are served by `faultmaven-website` (Vercel, deploys from
+`main`) and pinned in `manifest.json` under `app_directory`:
+
+| Field | URL | Served by |
+| --- | --- | --- |
+| `installation_landing_page` | `https://www.faultmaven.ai/slack` | `src/app/slack/page.tsx` |
+| `privacy_policy_url` | `https://www.faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
+| `support_url` | `https://www.faultmaven.ai/support` | `src/app/support/page.tsx` |
+| `support_email` | `support@faultmaven.ai` | — |
+| `direct_install_url` | `https://slack.faultmaven.ai/slack/install` | this service, `web.py` |
+
+These pages must be live on `www.faultmaven.ai` **before** the manifest is pushed
+or the listing is resubmitted — Slack fetches each URL during review.
+
+The privacy policy is maintained only in `faultmaven-website`. This repo's
+`PRIVACY.md` is a pointer to it, deliberately: two copies of a legal document
+drift, and only the hosted one satisfies the requirement.
+
+`app_directory` also requires `app_directory_categories`, `pricing`, and
+`supported_languages`. Those carry values already chosen in the App Directory
+listing form; because `push_manifest.py` sends the whole manifest, reconcile them
+against the live config (`--diff`) before pushing, or the push overwrites them.
 
 ## Deferred (documented, not silently dropped)
 
