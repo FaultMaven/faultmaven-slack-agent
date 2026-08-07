@@ -54,7 +54,7 @@ faultmaven-slack-agent/
 │   └── push_manifest.py  # push manifest.json to a Slack app via the App Manifest API
 ├── manifest.json         # Slack app manifest — hosted/OAuth (scopes, events, assistant_view, shortcut)
 ├── manifest.dev.json     # Slack app manifest — local dev (Socket Mode)
-├── PRIVACY.md            # privacy policy (Marketplace requirement)
+├── PRIVACY.md            # pointer to the hosted privacy policy (the canonical copy)
 ├── docs/design.md        # authoritative design
 └── docs/LIVE_TEST.md     # install + smoke runbook (real workspace)
 ```
@@ -119,7 +119,36 @@ in [docs/design.md](docs/design.md) §16.
 
 ## Privacy
 
-What the agent reads, forwards, and stores is documented in [PRIVACY.md](PRIVACY.md).
+What the agent reads, forwards, and stores is documented in the privacy policy at
+[www.faultmaven.ai/privacy/slack](https://www.faultmaven.ai/privacy/slack) — the
+canonical copy, and the URL the Marketplace listing points at. See
+[PRIVACY.md](PRIVACY.md).
+
+## Marketplace listing URLs
+
+The Slack Marketplace requires the listing's landing page, privacy policy, and
+support URLs to live on a domain FaultMaven owns. They are pinned in
+`manifest.json` under `app_directory` so `scripts/push_manifest.py` — which does
+a **full-manifest** update — cannot clobber them:
+
+| Listing field | URL |
+| --- | --- |
+| `installation_landing_page` | [www.faultmaven.ai/slack](https://www.faultmaven.ai/slack) |
+| `privacy_policy_url` | [www.faultmaven.ai/privacy/slack](https://www.faultmaven.ai/privacy/slack) |
+| `support_url` | [www.faultmaven.ai/support](https://www.faultmaven.ai/support) |
+| `support_email` | <support@faultmaven.ai> |
+| `direct_install_url` | `https://slack.faultmaven.ai/slack/install` |
+
+The remaining `app_directory` fields Slack requires alongside these
+(`app_directory_categories`, `pricing`, `supported_languages`) are **not** part
+of the URL fix and must be reconciled against what is already selected in the App
+Directory listing form before pushing — a full-manifest update would otherwise
+overwrite those selections. Confirm with a no-op validate first:
+
+```bash
+python scripts/push_manifest.py --validate   # validates only; changes nothing
+python scripts/push_manifest.py --diff       # live-vs-local, before updating
+```
 
 ## License
 

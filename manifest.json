@@ -46,6 +46,21 @@
       ]
     }
   },
+  "app_directory": {
+    "app_directory_categories": [
+      "Developer Tools"
+    ],
+    "use_direct_install": true,
+    "direct_install_url": "https://slack.faultmaven.ai/slack/install",
+    "installation_landing_page": "https://www.faultmaven.ai/slack",
+    "privacy_policy_url": "https://www.faultmaven.ai/privacy/slack",
+    "support_url": "https://www.faultmaven.ai/support",
+    "support_email": "support@faultmaven.ai",
+    "supported_languages": [
+      "en-US"
+    ],
+    "pricing": "free"
+  },
   "settings": {
     "event_subscriptions": {
       "request_url": "https://slack.faultmaven.ai/slack/events",
