@@ -119,8 +119,8 @@ externalized. Horizontal scale is a follow-up, not required for the beta.
    `slack.faultmaven.ai` URLs + `socket_mode_enabled: false`) via
    `scripts/push_manifest.py`. The manifest also carries the `app_directory`
    listing URLs (see below), and the push is a **full-manifest** update — run
-   `--validate` then `--diff` first so it cannot silently overwrite listing
-   fields set in the App Directory form.
+   it bare first (which previews and stops) so it cannot silently overwrite
+   listing fields set in the App Directory form, then `--apply`.
 6. **Install** at `https://slack.faultmaven.ai/slack/install` per workspace (the
    Orgs track needs 5+); confirm a row in the Postgres `slack_installations` table.
 
@@ -149,7 +149,20 @@ drift, and only the hosted one satisfies the requirement.
 `app_directory` also requires `app_directory_categories`, `pricing`, and
 `supported_languages`. Those carry values already chosen in the App Directory
 listing form; because `push_manifest.py` sends the whole manifest, reconcile them
-against the live config (`--diff`) before pushing, or the push overwrites them.
+against the live config before pushing, or the push overwrites them.
+
+The push is a **full-manifest replace**: anything present in the live App Config
+but absent from `manifest.json` is reset. `push_manifest.py` therefore previews
+by default and mutates only with `--apply`, and it aborts rather than applying
+when the live config cannot be read.
+
+⚠️ **Unverified against the real API:** nothing has yet confirmed that
+`apps.manifest.export`/`update` round-trip the `app_directory` block — the
+manifest schema Slack publishes does not document it, and the Directory
+submission form is a separate system. Check the raw export for an
+`app_directory` key on the first live run. If it is absent, those fields belong
+in the Directory form only and the block should come **out** of `manifest.json`
+rather than being pushed blind.
 
 ## Deferred (documented, not silently dropped)
 

@@ -6,10 +6,20 @@ instead of pasting it into the App Manifest tab and clicking Save. This validate
 first, then updates, and tells you whether the change ALSO needs a workspace
 reinstall (only OAuth-scope changes do — content and event changes don't).
 
-    python scripts/push_manifest.py             # validate + update from manifest.json
-    python scripts/push_manifest.py --validate  # validate only (makes no change)
-    python scripts/push_manifest.py --diff      # show live-vs-local before updating
-    python scripts/push_manifest.py path/to.json
+    python scripts/push_manifest.py             # validate + show live-vs-local, then STOP
+    python scripts/push_manifest.py --validate  # schema check only; reads nothing live
+    python scripts/push_manifest.py --apply     # validate + diff + UPDATE (the only mutating form)
+    python scripts/push_manifest.py --apply path/to.json
+
+**Nothing here mutates without ``--apply``.** The update is a *full-manifest
+replace* (``apps.manifest.update``): anything set in the App Config UI but absent
+from the local file is reset. That matters most for the ``app_directory`` listing
+fields, which are also editable in the App Directory submission form — inspect the
+live config first and reconcile before applying.
+
+``--dry-run`` is accepted as an explicit spelling of the default. ``--diff`` is a
+deprecated alias: it *used* to print a diff and then push, which read as a preview
+and was not one.
 
 Needs an APP CONFIGURATION TOKEN — separate from the bot/app tokens — in ``.env``:
 
@@ -29,8 +39,9 @@ import json
 import sys
 from pathlib import Path
 
-# Run from anywhere: put the repo root on the path so `.env` resolves the same
-# way the runtime does.
+# Importable from anywhere: put the repo root on sys.path. Note this affects
+# IMPORTS only — it does not make `.env` resolve; that is anchored explicitly in
+# _ConfigTokens below, because pydantic-settings reads it relative to the cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx  # noqa: E402
@@ -45,8 +56,15 @@ _AUTH_ERRORS = {"token_expired", "invalid_auth", "not_authed", "token_revoked"}
 class _ConfigTokens(BaseSettings):
     """Ops-only config-token settings (read from .env, like the runtime)."""
 
+    # Anchor to the repo's own .env, NOT the cwd. pydantic-settings resolves a
+    # relative env_file against the working directory, so running this from a
+    # directory that happens to hold its own .env would load THAT app's
+    # SLACK_APP_ID and full-replace the wrong Slack app with this manifest.
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=str(Path(__file__).resolve().parent.parent / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
     )
 
     slack_config_token: str = Field(default="", validation_alias="SLACK_CONFIG_TOKEN")
@@ -83,13 +101,22 @@ def _fmt_errors(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def _print_diff(token: str, app_id: str, local_manifest: str) -> None:
-    """Show a unified diff of the live app config vs the local manifest."""
+def _print_diff(token: str, app_id: str, local_manifest: str) -> bool:
+    """Show a unified diff of the live app config vs the local manifest.
+
+    Returns False when the live config could not be read. That is a FAILURE, not
+    a cosmetic one: the diff is the only thing standing between an operator and a
+    full-manifest replace of an app they have not looked at. Reporting success
+    here would mean "reviewed" when nothing was reviewed.
+    """
 
     exported = _call("apps.manifest.export", token, app_id=app_id)
     if not exported.get("ok"):
-        print(f"  (couldn't export live manifest for diff: {exported.get('error')})")
-        return
+        print(
+            f"✗ Could not export the live manifest ({exported.get('error')}) — so the\n"
+            "  live-vs-local diff below is unavailable and NOTHING has been compared."
+        )
+        return False
     live = json.dumps(exported["manifest"], indent=2, sort_keys=True).splitlines()
     local = json.dumps(json.loads(local_manifest), indent=2, sort_keys=True).splitlines()
     diff = list(
@@ -97,6 +124,7 @@ def _print_diff(token: str, app_id: str, local_manifest: str) -> None:
     )
     print("\n".join(diff) if diff else "  (local manifest matches the live config)")
     print()
+    return True
 
 
 def main() -> int:
@@ -104,8 +132,16 @@ def main() -> int:
     parser.add_argument(
         "manifest", nargs="?", default="manifest.json", help="manifest path (default: manifest.json)"
     )
-    parser.add_argument("--validate", action="store_true", help="validate only; make no change")
-    parser.add_argument("--diff", action="store_true", help="show live-vs-local before updating")
+    parser.add_argument(
+        "--validate", action="store_true", help="schema check only; reads nothing live"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="APPLY the manifest (the only mutating form)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="explicit spelling of the default (no change)"
+    )
+    parser.add_argument("--diff", action="store_true", help=argparse.SUPPRESS)  # deprecated alias
     args = parser.parse_args()
 
     cfg = _ConfigTokens()
@@ -115,8 +151,11 @@ def main() -> int:
             "  api.slack.com/apps → 'Your app configuration tokens', then add it to .env."
         )
         return 2
-    if not args.validate and not cfg.slack_app_id:
-        print("✗ SLACK_APP_ID is not set (needed to update). It's on the app's Basic Information page.")
+    if not args.validate and not cfg.slack_app_id:  # noqa: SIM102 — read AND write need it
+        print(
+            "✗ SLACK_APP_ID is not set (needed to read or update the app). "
+            "It's on the app's Basic Information page."
+        )
         return 2
 
     manifest_path = Path(args.manifest)
@@ -147,7 +186,27 @@ def main() -> int:
             return 0
 
         if args.diff:
-            _print_diff(token, cfg.slack_app_id, manifest_str)
+            print(
+                "  note: --diff is deprecated and no longer pushes. It is now the\n"
+                "  default preview; pass --apply to actually update the app.\n"
+            )
+
+        # The diff runs for EVERY non-validate path, --apply included: an operator
+        # must not be able to replace the live app without it having been shown.
+        if not _print_diff(token, cfg.slack_app_id, manifest_str):
+            print("  Refusing to continue without a live comparison.")
+            return 5
+
+        # Nothing below is reachable without an explicit --apply. Keep it that
+        # way: apps.manifest.update is a full-manifest REPLACE, so a default or
+        # a mistyped flag must never reach it.
+        if not args.apply:
+            print(
+                "  Preview only — nothing was changed. Re-run with --apply to update the app.\n"
+                "  Remember the update is a FULL REPLACE: reconcile anything above that is\n"
+                "  set live but missing locally (notably app_directory) before applying."
+            )
+            return 0
 
         updated = _call("apps.manifest.update", token, app_id=cfg.slack_app_id, manifest=manifest_str)
         if not updated.get("ok"):
