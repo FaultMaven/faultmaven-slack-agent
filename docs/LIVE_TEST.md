@@ -43,8 +43,12 @@ instead of re-pasting into the App Manifest tab:
 # tokens) at api.slack.com/apps → "Your app configuration tokens", then add to .env:
 #   SLACK_CONFIG_TOKEN=xoxe.xoxp-...
 #   SLACK_APP_ID=A0XXXXXXX
-python scripts/push_manifest.py --diff   # preview live-vs-local, then update
+python scripts/push_manifest.py          # preview live-vs-local; changes nothing
+python scripts/push_manifest.py --apply  # after reviewing the diff, apply it
 ```
+
+⚠️ The update is a **full-manifest replace** — anything set in the App Config UI
+but missing from `manifest.json` is reset. Nothing mutates without `--apply`.
 
 It validates, updates, and tells you whether the change also needs a **reinstall**
 (only OAuth-scope changes do). Config tokens expire ~12 h — regenerate on a token
