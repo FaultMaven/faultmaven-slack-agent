@@ -8,8 +8,17 @@ reinstall (only OAuth-scope changes do — content and event changes don't).
 
     python scripts/push_manifest.py             # validate + update from manifest.json
     python scripts/push_manifest.py --validate  # validate only (makes no change)
-    python scripts/push_manifest.py --diff      # show live-vs-local before updating
+    python scripts/push_manifest.py --dry-run   # show live-vs-local, then STOP (no change)
+    python scripts/push_manifest.py --diff      # show live-vs-local, then UPDATE
     python scripts/push_manifest.py path/to.json
+
+``--diff`` is **not** a preview: it prints the diff and then performs the update.
+Use ``--dry-run`` to inspect the live config without touching it.
+
+The update is a **full-manifest replace** (``apps.manifest.update``): anything set
+in the App Config UI but absent from the local file is reset. That matters most
+for the ``app_directory`` listing fields, which are also editable in the App
+Directory submission form — always ``--dry-run`` first and reconcile.
 
 Needs an APP CONFIGURATION TOKEN — separate from the bot/app tokens — in ``.env``:
 
@@ -105,7 +114,14 @@ def main() -> int:
         "manifest", nargs="?", default="manifest.json", help="manifest path (default: manifest.json)"
     )
     parser.add_argument("--validate", action="store_true", help="validate only; make no change")
-    parser.add_argument("--diff", action="store_true", help="show live-vs-local before updating")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show live-vs-local, then stop — makes no change",
+    )
+    parser.add_argument(
+        "--diff", action="store_true", help="show live-vs-local, then UPDATE (not a preview)"
+    )
     args = parser.parse_args()
 
     cfg = _ConfigTokens()
@@ -116,7 +132,10 @@ def main() -> int:
         )
         return 2
     if not args.validate and not cfg.slack_app_id:
-        print("✗ SLACK_APP_ID is not set (needed to update). It's on the app's Basic Information page.")
+        print(
+            "✗ SLACK_APP_ID is not set (needed to read or update the app). "
+            "It's on the app's Basic Information page."
+        )
         return 2
 
     manifest_path = Path(args.manifest)
@@ -146,8 +165,18 @@ def main() -> int:
         if args.validate:
             return 0
 
-        if args.diff:
+        if args.dry_run or args.diff:
             _print_diff(token, cfg.slack_app_id, manifest_str)
+
+        # --dry-run stops here, BEFORE the update. --diff does not: it shows the
+        # diff and then pushes. Keep this ordering — the whole point of
+        # --dry-run is that no mutating call is reachable from it.
+        if args.dry_run:
+            print(
+                "  --dry-run: nothing was changed. Re-run without it (or with --diff)\n"
+                "  to apply this manifest."
+            )
+            return 0
 
         updated = _call("apps.manifest.update", token, app_id=cfg.slack_app_id, manifest=manifest_str)
         if not updated.get("ok"):

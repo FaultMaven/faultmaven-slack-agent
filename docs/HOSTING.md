@@ -119,8 +119,9 @@ externalized. Horizontal scale is a follow-up, not required for the beta.
    `slack.faultmaven.ai` URLs + `socket_mode_enabled: false`) via
    `scripts/push_manifest.py`. The manifest also carries the `app_directory`
    listing URLs (see below), and the push is a **full-manifest** update — run
-   `--validate` then `--diff` first so it cannot silently overwrite listing
-   fields set in the App Directory form.
+   `--dry-run` first so it cannot silently overwrite listing fields set in the
+   App Directory form. (`--diff` is **not** a preview — it diffs and then
+   pushes.)
 6. **Install** at `https://slack.faultmaven.ai/slack/install` per workspace (the
    Orgs track needs 5+); confirm a row in the Postgres `slack_installations` table.
 
@@ -149,7 +150,12 @@ drift, and only the hosted one satisfies the requirement.
 `app_directory` also requires `app_directory_categories`, `pricing`, and
 `supported_languages`. Those carry values already chosen in the App Directory
 listing form; because `push_manifest.py` sends the whole manifest, reconcile them
-against the live config (`--diff`) before pushing, or the push overwrites them.
+against the live config (`--dry-run`) before pushing, or the push overwrites
+them.
+
+The push is a **full-manifest replace**. Anything present in the live App Config
+but absent from `manifest.json` is reset — so `--dry-run` is the safety step, not
+`--diff`, which pushes after printing its diff.
 
 ## Deferred (documented, not silently dropped)
 

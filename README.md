@@ -143,12 +143,16 @@ The remaining `app_directory` fields Slack requires alongside these
 (`app_directory_categories`, `pricing`, `supported_languages`) are **not** part
 of the URL fix and must be reconciled against what is already selected in the App
 Directory listing form before pushing — a full-manifest update would otherwise
-overwrite those selections. Confirm with a no-op validate first:
+overwrite those selections. Inspect the live config first, then reconcile:
 
 ```bash
-python scripts/push_manifest.py --validate   # validates only; changes nothing
-python scripts/push_manifest.py --diff       # live-vs-local, before updating
+python scripts/push_manifest.py --validate   # schema check only; changes nothing
+python scripts/push_manifest.py --dry-run    # live-vs-local diff, then STOPS
+python scripts/push_manifest.py             # applies the manifest
 ```
+
+⚠️ **`--diff` is not a preview** — it prints the diff and *then* pushes. Use
+`--dry-run` to look without touching anything.
 
 ## License
 
