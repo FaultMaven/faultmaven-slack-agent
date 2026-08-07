@@ -34,32 +34,19 @@
     ],
     "scopes": {
       "bot": [
+        "app_mentions:read",
         "assistant:write",
+        "channels:history",
         "chat:write",
         "commands",
-        "reactions:write",
-        "app_mentions:read",
         "files:read",
+        "groups:history",
         "im:history",
-        "channels:history",
-        "groups:history"
+        "incoming-webhook",
+        "reactions:write"
       ]
-    }
-  },
-  "app_directory": {
-    "app_directory_categories": [
-      "Developer Tools"
-    ],
-    "use_direct_install": true,
-    "direct_install_url": "https://slack.faultmaven.ai/slack/install",
-    "installation_landing_page": "https://www.faultmaven.ai/slack",
-    "privacy_policy_url": "https://www.faultmaven.ai/privacy/slack",
-    "support_url": "https://www.faultmaven.ai/support",
-    "support_email": "support@faultmaven.ai",
-    "supported_languages": [
-      "en-US"
-    ],
-    "pricing": "free"
+    },
+    "pkce_enabled": false
   },
   "settings": {
     "event_subscriptions": {
@@ -79,6 +66,7 @@
     },
     "org_deploy_enabled": true,
     "socket_mode_enabled": false,
-    "token_rotation_enabled": false
+    "token_rotation_enabled": false,
+    "is_mcp_enabled": false
   }
 }

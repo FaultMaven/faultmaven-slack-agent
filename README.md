@@ -126,24 +126,23 @@ canonical copy, and the URL the Marketplace listing points at. See
 
 ## Marketplace listing URLs
 
-The Slack Marketplace requires the listing's landing page, privacy policy, and
-support URLs to live on a domain FaultMaven owns. They are pinned in
-`manifest.json` under `app_directory` so `scripts/push_manifest.py` — which does
-a **full-manifest** update — cannot clobber them:
+Slack requires the listing's landing page, privacy policy, and support URLs to
+live on a domain FaultMaven owns. All three are served by `faultmaven-website`:
 
 | Listing field | URL |
 | --- | --- |
-| `installation_landing_page` | [www.faultmaven.ai/slack](https://www.faultmaven.ai/slack) |
-| `privacy_policy_url` | [www.faultmaven.ai/privacy/slack](https://www.faultmaven.ai/privacy/slack) |
-| `support_url` | [www.faultmaven.ai/support](https://www.faultmaven.ai/support) |
-| `support_email` | <support@faultmaven.ai> |
-| `direct_install_url` | `https://slack.faultmaven.ai/slack/install` |
+| Installation landing page | [www.faultmaven.ai/slack](https://www.faultmaven.ai/slack) |
+| Privacy policy | [www.faultmaven.ai/privacy/slack](https://www.faultmaven.ai/privacy/slack) |
+| Support | [www.faultmaven.ai/support](https://www.faultmaven.ai/support) |
+| Support email | <support@faultmaven.ai> |
+| Direct install | `https://slack.faultmaven.ai/slack/install` |
 
-The remaining `app_directory` fields Slack requires alongside these
-(`app_directory_categories`, `pricing`, `supported_languages`) are **not** part
-of the URL fix and must be reconciled against what is already selected in the App
-Directory listing form before pushing — a full-manifest update would otherwise
-overwrite those selections. Inspect the live config first, then reconcile:
+Set these in the **App Directory form**, not in `manifest.json`. Slack accepts an
+`app_directory` block on write but does not return it on export, so its values
+can be neither previewed nor reconciled — see
+[docs/HOSTING.md](docs/HOSTING.md#marketplace-listing-urls).
+
+## Pushing manifest.json
 
 ```bash
 python scripts/push_manifest.py --validate   # schema check only; reads nothing live
@@ -152,9 +151,14 @@ python scripts/push_manifest.py --apply      # applies it (the only mutating for
 ```
 
 ⚠️ The push is a **full-manifest replace**: anything set in the App Config UI but
-absent from `manifest.json` is reset. Nothing mutates without `--apply`, and the
-diff is always shown first — if the live config can't be read, the run aborts
-rather than replacing an app nobody looked at.
+absent from `manifest.json` is reset. Nothing mutates without `--apply`, the diff
+is always shown first, and the run aborts rather than replacing an app it could
+not read.
+
+`manifest.json` therefore tracks what the live app *actually* holds — including
+the unused `incoming-webhook` scope, which is recorded only because removing a
+granted scope forces every workspace to reinstall. Details in
+[docs/HOSTING.md](docs/HOSTING.md#the-manifest-must-match-the-live-app).
 
 ## License
 
