@@ -131,16 +131,22 @@ hosted on a domain FaultMaven owns — a GitHub-hosted policy or repo README is
 rejected. All three are served by `faultmaven-website` (Vercel, deploys from
 `main`):
 
-| Listing field | URL | Served by |
+| Listing field | Value | Served by |
 | --- | --- | --- |
-| Installation landing page | `https://www.faultmaven.ai/slack` | `src/app/slack/page.tsx` |
-| Privacy policy | `https://www.faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
-| Support | `https://www.faultmaven.ai/support` | `src/app/support/page.tsx` |
+| Installation landing page | `https://faultmaven.ai/slack` | `src/app/slack/page.tsx` |
+| Privacy policy | `https://faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
+| Support | `https://faultmaven.ai/support` | `src/app/support/page.tsx` |
 | Support email | `support@faultmaven.ai` | — |
-| Direct install | `https://slack.faultmaven.ai/slack/install` | this service, `web.py` |
+| Categories | Developer Tools, Productivity | — |
+| Pricing | `freemium` | — |
+| Languages | `en-US` | — |
 
-These pages must be live on `www.faultmaven.ai` **before** the listing is
-submitted — Slack fetches each URL during review.
+The listing uses the **apex** host (`faultmaven.ai`), which 301s to `www` — all
+three resolve 200. The site canonicalises to `www`, so leave the manifest on the
+apex form to match what is set rather than "fixing" it into a mismatch.
+
+These pages must be live **before** the listing is submitted — Slack fetches
+each URL during review.
 
 These values are also declared in `manifest.json` under `app_directory`, so the
 manifest is a complete description of the app and a push is idempotent rather
@@ -155,7 +161,12 @@ the block cannot be verified programmatically — after any push that touches it
 confirm the App Directory form by eye.
 
 Because of that, the values here must only ever be **copied from the form**,
-never invented. A guessed value in this block is applied blind over a real
+never invented.
+
+`use_direct_install` and `direct_install_url` are the two optional fields and are
+deliberately **absent**: the form shows no direct-install entry, and an optional
+field whose live state is unknown is precisely what forced this block to be
+rewritten twice. Add them only after reading them off the form. A guessed value in this block is applied blind over a real
 selection, with no way to see the damage first.
 
 The privacy policy is maintained only in `faultmaven-website`. This repo's

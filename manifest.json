@@ -6,16 +6,15 @@
     "background_color": "#1a1a2e"
   },
   "app_directory": {
-    "installation_landing_page": "https://www.faultmaven.ai/slack",
-    "privacy_policy_url": "https://www.faultmaven.ai/privacy/slack",
-    "support_url": "https://www.faultmaven.ai/support",
+    "installation_landing_page": "https://faultmaven.ai/slack",
+    "privacy_policy_url": "https://faultmaven.ai/privacy/slack",
+    "support_url": "https://faultmaven.ai/support",
     "support_email": "support@faultmaven.ai",
-    "use_direct_install": true,
-    "direct_install_url": "https://slack.faultmaven.ai/slack/install",
     "app_directory_categories": [
-      "Developer Tools"
+      "Developer Tools",
+      "Productivity"
     ],
-    "pricing": "free",
+    "pricing": "freemium",
     "supported_languages": [
       "en-US"
     ]
