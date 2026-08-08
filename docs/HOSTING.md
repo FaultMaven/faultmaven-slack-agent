@@ -142,14 +142,21 @@ rejected. All three are served by `faultmaven-website` (Vercel, deploys from
 These pages must be live on `www.faultmaven.ai` **before** the listing is
 submitted — Slack fetches each URL during review.
 
-**Set these in the App Directory form, not in `manifest.json`.** The manifest has
-an `app_directory` block and `apps.manifest.validate` accepts it, but
-`apps.manifest.export` does **not** return it — verified against the live API on
-2026-08-07. That makes it write-only: you cannot preview what a push would do to
-the listing, and you cannot reconcile local values against the ones already
-chosen in the form. A block of guessed values in the file that the push applies
-blind is a loaded gun, so it was removed. If Slack later starts exporting it, it
-can come back — the requirement is that a value be *checkable* before it ships.
+These values are also declared in `manifest.json` under `app_directory`, so the
+manifest is a complete description of the app and a push is idempotent rather
+than a gamble. Every value there is the one already set on the server — none is
+a guess.
+
+⚠️ **`app_directory` does not come back from `apps.manifest.export`** (verified
+2026-08-07). It is write-only: `apps.manifest.validate` accepts it, but a preview
+will always render the whole block as an addition, because the live side has
+nothing to compare against. That is expected and is **not** drift. It also means
+the block cannot be verified programmatically — after any push that touches it,
+confirm the App Directory form by eye.
+
+Because of that, the values here must only ever be **copied from the form**,
+never invented. A guessed value in this block is applied blind over a real
+selection, with no way to see the damage first.
 
 The privacy policy is maintained only in `faultmaven-website`. This repo's
 `PRIVACY.md` is a pointer to it, deliberately: two copies of a legal document
