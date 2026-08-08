@@ -129,40 +129,60 @@ externalized. Horizontal scale is a follow-up, not required for the beta.
 Slack requires the listing's landing page, privacy policy, and support URLs to be
 hosted on a domain FaultMaven owns — a GitHub-hosted policy or repo README is
 rejected. All three are served by `faultmaven-website` (Vercel, deploys from
-`main`) and pinned in `manifest.json` under `app_directory`:
+`main`):
 
-| Field | URL | Served by |
+| Listing field | URL | Served by |
 | --- | --- | --- |
-| `installation_landing_page` | `https://www.faultmaven.ai/slack` | `src/app/slack/page.tsx` |
-| `privacy_policy_url` | `https://www.faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
-| `support_url` | `https://www.faultmaven.ai/support` | `src/app/support/page.tsx` |
-| `support_email` | `support@faultmaven.ai` | — |
-| `direct_install_url` | `https://slack.faultmaven.ai/slack/install` | this service, `web.py` |
+| Installation landing page | `https://www.faultmaven.ai/slack` | `src/app/slack/page.tsx` |
+| Privacy policy | `https://www.faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
+| Support | `https://www.faultmaven.ai/support` | `src/app/support/page.tsx` |
+| Support email | `support@faultmaven.ai` | — |
+| Direct install | `https://slack.faultmaven.ai/slack/install` | this service, `web.py` |
 
-These pages must be live on `www.faultmaven.ai` **before** the manifest is pushed
-or the listing is resubmitted — Slack fetches each URL during review.
+These pages must be live on `www.faultmaven.ai` **before** the listing is
+submitted — Slack fetches each URL during review.
+
+**Set these in the App Directory form, not in `manifest.json`.** The manifest has
+an `app_directory` block and `apps.manifest.validate` accepts it, but
+`apps.manifest.export` does **not** return it — verified against the live API on
+2026-08-07. That makes it write-only: you cannot preview what a push would do to
+the listing, and you cannot reconcile local values against the ones already
+chosen in the form. A block of guessed values in the file that the push applies
+blind is a loaded gun, so it was removed. If Slack later starts exporting it, it
+can come back — the requirement is that a value be *checkable* before it ships.
 
 The privacy policy is maintained only in `faultmaven-website`. This repo's
 `PRIVACY.md` is a pointer to it, deliberately: two copies of a legal document
 drift, and only the hosted one satisfies the requirement.
 
-`app_directory` also requires `app_directory_categories`, `pricing`, and
-`supported_languages`. Those carry values already chosen in the App Directory
-listing form; because `push_manifest.py` sends the whole manifest, reconcile them
-against the live config before pushing, or the push overwrites them.
+## The manifest must match the live app
 
 The push is a **full-manifest replace**: anything present in the live App Config
 but absent from `manifest.json` is reset. `push_manifest.py` therefore previews
-by default and mutates only with `--apply`, and it aborts rather than applying
-when the live config cannot be read.
+by default and mutates only with `--apply`, and aborts rather than applying when
+the live config cannot be read.
 
-⚠️ **Unverified against the real API:** nothing has yet confirmed that
-`apps.manifest.export`/`update` round-trip the `app_directory` block — the
-manifest schema Slack publishes does not document it, and the Directory
-submission form is a separate system. Check the raw export for an
-`app_directory` key on the first live run. If it is absent, those fields belong
-in the Directory form only and the block should come **out** of `manifest.json`
-rather than being pushed blind.
+Because of that, `manifest.json` has to record what the app *actually* holds, not
+only what this repo intended. Two entries exist for that reason alone:
+
+- **`incoming-webhook`** (bot scope) — granted on the live app, added by hand in
+  **OAuth & Permissions**, never through this file. Nothing here uses it: the
+  shortcut handler replies via `response_url`, which is a per-interaction
+  callback needing no scope, and `settings.incoming_webhooks` is absent. It is
+  recorded because *removing* a granted scope sets `permissions_updated`, which
+  forces every installed workspace to reinstall. Dropping it is a deliberate
+  least-privilege cleanup with a reinstall cost — not a side effect of an
+  unrelated push.
+- **`oauth_config.pkce_enabled`** and **`settings.is_mcp_enabled`** — defaults
+  Slack populates on the live app. Declared so a preview shows only real drift.
+
+Scopes are listed in Slack's canonical (sorted) order for the same reason: a
+reordered list produces a diff that looks like a change and isn't.
+
+⚠️ This drift was invisible until 2026-08-07. `--validate` never read the live
+config and `--diff` pushed, so there was no safe way to compare — the
+`incoming-webhook` divergence sat undetected for the life of the repo. Run a bare
+`push_manifest.py` periodically, not just before a push.
 
 ## Deferred (documented, not silently dropped)
 
