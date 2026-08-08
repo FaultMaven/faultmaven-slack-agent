@@ -131,25 +131,43 @@ hosted on a domain FaultMaven owns — a GitHub-hosted policy or repo README is
 rejected. All three are served by `faultmaven-website` (Vercel, deploys from
 `main`):
 
-| Listing field | URL | Served by |
+| Listing field | Value | Served by |
 | --- | --- | --- |
-| Installation landing page | `https://www.faultmaven.ai/slack` | `src/app/slack/page.tsx` |
-| Privacy policy | `https://www.faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
-| Support | `https://www.faultmaven.ai/support` | `src/app/support/page.tsx` |
+| Installation landing page | `https://faultmaven.ai/slack` | `src/app/slack/page.tsx` |
+| Privacy policy | `https://faultmaven.ai/privacy/slack` | `src/app/privacy/slack/page.tsx` |
+| Support | `https://faultmaven.ai/support` | `src/app/support/page.tsx` |
 | Support email | `support@faultmaven.ai` | — |
-| Direct install | `https://slack.faultmaven.ai/slack/install` | this service, `web.py` |
+| Categories | Developer Tools, Productivity | — |
+| Pricing | `freemium` | — |
+| Languages | `en-US` | — |
 
-These pages must be live on `www.faultmaven.ai` **before** the listing is
-submitted — Slack fetches each URL during review.
+The listing uses the **apex** host (`faultmaven.ai`), which 301s to `www` — all
+three resolve 200. The site canonicalises to `www`, so leave the manifest on the
+apex form to match what is set rather than "fixing" it into a mismatch.
 
-**Set these in the App Directory form, not in `manifest.json`.** The manifest has
-an `app_directory` block and `apps.manifest.validate` accepts it, but
-`apps.manifest.export` does **not** return it — verified against the live API on
-2026-08-07. That makes it write-only: you cannot preview what a push would do to
-the listing, and you cannot reconcile local values against the ones already
-chosen in the form. A block of guessed values in the file that the push applies
-blind is a loaded gun, so it was removed. If Slack later starts exporting it, it
-can come back — the requirement is that a value be *checkable* before it ships.
+These pages must be live **before** the listing is submitted — Slack fetches
+each URL during review.
+
+These values are also declared in `manifest.json` under `app_directory`, so the
+manifest is a complete description of the app and a push is idempotent rather
+than a gamble. Every value there is the one already set on the server — none is
+a guess.
+
+⚠️ **`app_directory` does not come back from `apps.manifest.export`** (verified
+2026-08-07). It is write-only: `apps.manifest.validate` accepts it, but a preview
+will always render the whole block as an addition, because the live side has
+nothing to compare against. That is expected and is **not** drift. It also means
+the block cannot be verified programmatically — after any push that touches it,
+confirm the App Directory form by eye.
+
+Because of that, the values here must only ever be **copied from the form**,
+never invented.
+
+`use_direct_install` and `direct_install_url` are the two optional fields and are
+deliberately **absent**: the form shows no direct-install entry, and an optional
+field whose live state is unknown is precisely what forced this block to be
+rewritten twice. Add them only after reading them off the form. A guessed value in this block is applied blind over a real
+selection, with no way to see the damage first.
 
 The privacy policy is maintained only in `faultmaven-website`. This repo's
 `PRIVACY.md` is a pointer to it, deliberately: two copies of a legal document

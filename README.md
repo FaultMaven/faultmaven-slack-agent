@@ -129,18 +129,23 @@ canonical copy, and the URL the Marketplace listing points at. See
 Slack requires the listing's landing page, privacy policy, and support URLs to
 live on a domain FaultMaven owns. All three are served by `faultmaven-website`:
 
-| Listing field | URL |
+| Listing field | Value |
 | --- | --- |
-| Installation landing page | [www.faultmaven.ai/slack](https://www.faultmaven.ai/slack) |
-| Privacy policy | [www.faultmaven.ai/privacy/slack](https://www.faultmaven.ai/privacy/slack) |
-| Support | [www.faultmaven.ai/support](https://www.faultmaven.ai/support) |
+| Installation landing page | [faultmaven.ai/slack](https://faultmaven.ai/slack) |
+| Privacy policy | [faultmaven.ai/privacy/slack](https://faultmaven.ai/privacy/slack) |
+| Support | [faultmaven.ai/support](https://faultmaven.ai/support) |
 | Support email | <support@faultmaven.ai> |
-| Direct install | `https://slack.faultmaven.ai/slack/install` |
+| Categories | Developer Tools, Productivity |
+| Pricing | `freemium` |
+| Languages | `en-US` |
 
-Set these in the **App Directory form**, not in `manifest.json`. Slack accepts an
-`app_directory` block on write but does not return it on export, so its values
-can be neither previewed nor reconciled — see
-[docs/HOSTING.md](docs/HOSTING.md#marketplace-listing-urls).
+These are declared in `manifest.json` under `app_directory`, matching what is set
+in the App Directory form, so the manifest completely describes the app.
+
+⚠️ `app_directory` is **write-only** — `apps.manifest.export` does not return it,
+so a preview always shows the block as an addition and it cannot be verified
+programmatically. Only ever copy these values from the form; never invent one.
+See [docs/HOSTING.md](docs/HOSTING.md#marketplace-listing-urls).
 
 ## Pushing manifest.json
 
