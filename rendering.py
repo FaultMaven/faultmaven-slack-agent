@@ -136,7 +136,7 @@ def _action_label(action: dict[str, Any]) -> str:
 
 
 def _format_evidence(action: dict[str, Any]) -> str:
-    """Render an evidence ask, appending acquisition hints when present."""
+    """Render a data request, appending acquisition hints when present."""
 
     label = to_mrkdwn(_action_label(action))
     hints = action.get("hints")
@@ -310,7 +310,7 @@ def build_turn_blocks(
     # single section fails the whole post with invalid_blocks.
     if evidence:
         lines = "\n".join(_format_evidence(a) for a in evidence)
-        for part in _chunk(f":mag: *To move forward, FaultMaven needs:*\n{lines}"):
+        for part in _chunk(f":mag: *To move forward, FaultMaven needs this data:*\n{lines}"):
             blocks.append(_section(part))
 
     if text_actions:
@@ -348,7 +348,7 @@ def build_turn_blocks(
         context.append({"type": "mrkdwn", "text": f"Turn {result.turn_number}"})
     if evidence and not terminal:
         context.append(
-            {"type": "mrkdwn", "text": "Investigation in progress — gathering evidence"}
+            {"type": "mrkdwn", "text": "Investigation in progress — analyzing data"}
         )
     if context:
         blocks.append({"type": "context", "elements": context})

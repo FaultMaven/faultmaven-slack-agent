@@ -21,8 +21,8 @@ FaultMaven core API.
   case) but the backend is linear, so the agent answers the first message and
   **skips** any that arrive before its reply (marked ⏭️, resend after), and
   `@mention`s the person it's answering. See [design.md](docs/design.md) §5.3.
-- **Evidence in-thread** — attached logs/configs/screenshots are downloaded and
-  forwarded as multipart evidence on any surface (§5.4).
+- **Files in-thread** — attached logs/configs/screenshots are downloaded and
+  forwarded as multipart file data on any surface (§5.4).
 - **Thread = case.** Each Slack thread maps to one FaultMaven case; the mapping
   is tracked locally (we do *not* pass `thread_ts` to the backend as a session
   id — it validates those server-side).
@@ -96,7 +96,7 @@ Two manifests, two transports:
 
 Both request the same least-privilege scopes — `assistant:write`, `chat:write`,
 `app_mentions:read`, `commands` (the shortcut), `reactions:write` (the ⏭️ skip
-mark), `files:read` (attached evidence), and `*:history` (thread catch-up + the
+mark), `files:read` (attached files), and `*:history` (thread catch-up + the
 reply events that drive continuity) — and register the **Ask** message shortcut
 (shown as *Ask FaultMaven*).
 
@@ -105,7 +105,7 @@ reply events that drive continuity) — and register the **Ask** message shortcu
 **Working:** Assistant container + `@mention`, **thread-reply auto-continue**, the
 **Ask FaultMaven** message shortcut (open a case seeded from any message),
 **file ingestion** on all surfaces (attached logs/screenshots → multipart
-evidence), **one-turn-per-thread drop-if-busy** with ⏭️ skip marks and replier
+file data), **one-turn-per-thread drop-if-busy** with ⏭️ skip marks and replier
 `@mention`s, the corrected case/turn backend contract, thread→case mapping, Block
 Kit rendering, **interactive suggested-action buttons**, the Home tab, and
 **HTTP/Events transport + multi-workspace OAuth** with a Postgres
