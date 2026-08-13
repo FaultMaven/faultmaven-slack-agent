@@ -64,7 +64,7 @@ The manifest pre-wires everything this agent uses:
 | `shortcuts: [fm_investigate_message]` + `interactivity` + `commands` | the **Ask** message shortcut (shown as *Ask FaultMaven*; shortcuts need `commands`) |
 | `chat:write` | posting replies + the investigating placeholder |
 | `reactions:write` | marking a skipped message ⏭️ (drop-if-busy) |
-| `files:read` | downloading attached logs/screenshots as evidence |
+| `files:read` | downloading attached logs/screenshots for analysis |
 | `channels:history` / `groups:history` / `im:history` | thread catch-up on first summons + receiving reply events |
 | `socket_mode_enabled: true` | the dev transport (no public URL) |
 
@@ -161,7 +161,7 @@ the attached file. A reply in a thread it was *not* summoned into is ignored.
    Kit), better yet with a **log file attached**. Hover → **⋮ More actions** →
    **Ask FaultMaven**.
 
-**Expect:** a case opens **seeded with that message as evidence** (rich alerts
+**Expect:** a case opens **seeded with that message as the first data** (rich alerts
 are extracted from blocks/attachments, not a bare "Alert triggered" stub), the
 attached file is **downloaded and forwarded**, and the first reply threads under
 the selected message.

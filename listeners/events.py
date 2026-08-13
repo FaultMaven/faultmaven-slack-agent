@@ -356,7 +356,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=text or "Please continue the investigation with this evidence.",
+                text=text or "Please continue the investigation with this data.",
                 pasted_content=snippet_text,
                 files=files or None,
                 prior_context=prior_context,

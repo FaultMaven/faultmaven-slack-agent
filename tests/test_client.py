@@ -205,7 +205,7 @@ def test_submit_turn_409_terminal_case_is_its_own_class():
     client = make_client(
         lambda req: httpx.Response(
             409,
-            json={"detail": "Cannot submit evidence to a closed case."},
+            json={"detail": "Cannot submit new data to a closed case."},
         ),
         token="tok",
     )

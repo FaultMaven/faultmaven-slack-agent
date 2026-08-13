@@ -65,7 +65,7 @@ TURN_ERROR_TEXT = (
 TURN_TIMEOUT_TEXT = (
     ":hourglass: I gave up waiting on the backend — that turn may still be "
     "completing on the case. Give it a moment before re-sending the same "
-    "message or evidence."
+    "message or files."
 )
 # Stale mapping evicted; unlike TURN_ERROR_TEXT, a retry WILL work (fresh case).
 CASE_GONE_TEXT = (
@@ -79,7 +79,7 @@ CASE_GONE_TEXT = (
 # state changes. So this says what still works, rather than reading as a fault.
 CASE_CLOSED_TEXT = (
     ":white_check_mark: This investigation is closed, so I can't take new "
-    "evidence or change its status. I can still answer questions about what we "
+    "data or change its status. I can still answer questions about what we "
     "found — for anything new, start a fresh thread and @mention me."
 )
 # The turn did NOT commit (another writer advanced the case first), so this is

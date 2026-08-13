@@ -65,8 +65,8 @@ universal **"investigate this"** flow:
    user fires the **"Ask FaultMaven" message shortcut** (§4.3): a
    case opens, seeded with that message (+ optional context/file via the modal).
 2. FaultMaven drives a **structured investigation** in the thread — triage →
-   hypotheses → *specific* evidence requests → root cause → verified fix —
-   collaborating as the user supplies evidence.
+   hypotheses → *specific* data requests → root cause → verified fix —
+   collaborating as the user supplies data.
 3. On resolution it posts a **resolution summary + auto-generated runbook** (the
    knowledge flywheel) and the case closes (§6).
 
@@ -193,7 +193,7 @@ backend's single-author turn model — Slack's own recommended home for an AI
 conversation.
 
 - **`assistant_thread_started`** → greet + **FaultMaven-aware suggested prompts**:
-  - "Investigate an error or stack trace" → opens an evidence-paste flow
+  - "Investigate an error or stack trace" → opens a data-paste flow
   - "Summarize an incident thread" → catch-me-up
   - "What changed recently?" → recent-deploy correlation prompt
   - "Search our runbooks" → knowledge Q&A
@@ -374,14 +374,14 @@ attributed to the pinging Slack user (used for the `@mention`); the *case* is a
 collaborative artifact shared to the workspace's Team (§6.1). Content drives the
 diagnosis, not authorship.
 
-### 5.4 Evidence input — consume Slack's native inputs, don't build an uploader
+### 5.4 Data input — consume Slack's native inputs, don't build an uploader
 
 The Copilot had to ship a file picker, a page-capture engine, and a text-pad
 because a web page provides none. Slack provides file upload, paste, and image
 sharing **natively**, so our job shrinks to *consuming* them and forwarding to the
 turn (§8.1):
 
-| Evidence | Slack mechanism | → backend |
+| Data | Slack mechanism | → backend |
 |---|---|---|
 | **File(s)** | native composer (drag/drop, paperclip) **or** the opening modal's `file_input`; **multiple per turn** | download via `url_private` (`files:read`) → multipart `files` |
 | **Pasted text / logs** | type/paste into the ping, or the modal text box | `pasted_content` (a *large* paste auto-becomes a Slack **snippet file** → handled on the file path) |
@@ -389,7 +389,7 @@ turn (§8.1):
 | **Existing Slack content** (an alert, a teammate's log) | the **message shortcut** on it (§4.3) | `pasted_content` — the *page-capture analog*: capture what's already in the conversation |
 
 There is **no DOM page-capture** in Slack (no browser); its intent is covered by
-shortcutting the monitoring message or a screenshot. Evidence rides on a **ping**:
+shortcutting the monitoring message or a screenshot. Data rides on a **ping**:
 attach/paste *with* an `@mention`, or in the side panel where every message is a
 turn, or via the opening modal. So a single turn can carry several files at once
 — richer than the Copilot's one-at-a-time. We extract readable text from a
@@ -577,7 +577,7 @@ exactly right.
 | Hypothesis tracker | Block Kit section + lifecycle rendered as `TaskUpdateChunk`s (pending→testing→validated/refuted) | `TurnResponse` hypotheses / `progress_transparency` |
 | Suggested actions (DECIDE/RUN/EVIDENCE/FREE_SPEECH) | Interactive Block Kit buttons / prompt chips (§9.2) | `suggested_actions[]` |
 | Knowledge/runbook lookup | Rendered inline with source links; deep-link to Dashboard KB | `/knowledge/...`, returned in turns |
-| Evidence requests ("paste logs from X") | Prominent **EVIDENCE** call-to-action block | `suggested_actions[type=EVIDENCE]` |
+| Data requests ("paste logs from X") | Prominent **EVIDENCE** call-to-action block | `suggested_actions[type=EVIDENCE]` |
 | Case status lifecycle | Status pill in the thread reply; offer-to-close / auto-close (§6.2) | `case_state`, `closure_reason` |
 | Reports (resolution/closure/runbook) | On terminal state: summary + "Generate runbook" / "Download" buttons; markdown posted or uploaded as a snippet | `/cases/{id}/report-recommendations`, `/cases/{id}/reports` |
 | Post-closure Q&A | A closed case still answers questions about what was found; evidence and state changes are declined in plain language (§6.4). A new problem belongs in a new thread — terminal is never reopened | `/cases/{id}/turns` |
@@ -700,8 +700,8 @@ execution (`POST /cases/{id}/sessions/{sid}/execute`, events
 | `type` | Slack rendering | On click |
 |---|---|---|
 | `DECIDE` | Primary button with the pre-composed label | Submit a typed turn (status_transition/confirmation) |
-| `RUN` | Fenced code block + "Mark as run / paste output" affordance | Prompt the user for command output as the next evidence turn |
-| `EVIDENCE` | Highlighted "FaultMaven needs…" block with acquisition hints | Open a file/paste flow for that evidence |
+| `RUN` | Fenced code block + "Mark as run / paste output" affordance | Prompt the user for command output as the next data turn |
+| `EVIDENCE` | Highlighted "FaultMaven needs…" block with acquisition hints | Open a file/paste flow for that data |
 | `FREE_SPEECH` | Suggested-prompt chip | Pre-fill the next message |
 
 > Slack bots cannot copy to a user's clipboard, so `RUN` renders the command as

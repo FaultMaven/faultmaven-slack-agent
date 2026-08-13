@@ -109,7 +109,7 @@ for title, body in [
     chip(cx, 79.6, cx + cw, 86.0, title, body, SLACK)
     cx += cw + 3.0
 ax.text(MAIN_L + 1.8, 77.0,
-        "Suggested-action buttons (Decide · Run)  ·  attach logs/configs as evidence on every surface",
+        "Suggested-action buttons (Decide · Run)  ·  attach logs/configs on every surface",
         ha="left", va="center", color=INK, fontsize=9.4)
 ax.text(MAIN_R - 1.8, 77.0,
         "●  strict summon-only — no channel firehose",

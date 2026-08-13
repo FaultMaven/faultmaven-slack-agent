@@ -3,7 +3,7 @@
 FaultMaven is an AI troubleshooting copilot that runs the investigation right
 inside your Slack thread. `@mention` it on an incident — or run **Ask
 FaultMaven** on any alert — and it triages the symptom, forms hypotheses, asks
-for the specific evidence that confirms or rules each one out, and keeps going
+for the specific data that confirms or rules each one out, and keeps going
 until the root cause is found and the fix is verified. You approve and execute;
 it never acts on its own.
 
@@ -53,13 +53,13 @@ context.
 
 **Then just reply — no re-mention.** Once FaultMaven owns a thread, plain
 replies keep the investigation going. Attach a log to a reply and it's ingested
-as evidence. (Replies in threads it was *not* summoned into are ignored.)
+for analysis. (Replies in threads it was *not* summoned into are ignored.)
 
 ### C. "Ask FaultMaven" — open a case from any message
 On **any** message — a Datadog/PagerDuty/Grafana alert, a pasted stack trace, a
 teammate's note — hover, open the **⋮ More actions** menu, and choose **Ask
 FaultMaven**. The case opens seeded with that message (and any attached log) as
-the first evidence, and the investigation starts threaded under it. This is the
+the first data on the case, and the investigation starts threaded under it. This is the
 fastest way to go from "an alert fired" to "an investigation is running."
 
 ### D. Direct message — a quick private start
@@ -73,7 +73,7 @@ Assistant panel.
 Once a case is open, FaultMaven drives a real diagnostic loop and you
 collaborate in the thread:
 
-- **It asks for specific evidence.** Rather than guessing, it names the exact
+- **It asks for specific data.** Rather than guessing, it names the exact
   log, config, or metric that would confirm or eliminate a hypothesis. Attach it
   to a reply (logs, configs, screenshots — up to 8 MiB each) and it's ingested.
 - **It shows suggested-action buttons.** When there's a decision to make or a
@@ -100,7 +100,7 @@ next time this happens, the investigation starts from what this one learned.
   reply at once, FaultMaven answers the first (and `@mention`s that person) and
   marks the others with a ⏭️ reaction — just resend after it replies.
 - **It won't fabricate a root cause.** While a case is still open, FaultMaven
-  tells you what evidence it needs rather than posting a confident, made-up
+  tells you what data it needs rather than posting a confident, made-up
   answer to look decisive. When data is inadequate, it keeps engaging and names
   the gap.
 - **It only acts where you invite it.** No ambient listening, no reading channel
@@ -113,7 +113,7 @@ next time this happens, the investigation starts from what this one learned.
 
 - **Seed it with real signal.** The richer the first message or attachment (the
   actual error, the alert payload, the config), the faster it converges.
-- **Keep evidence files ≤ 8 MiB.** Larger files are skipped; paste the key
+- **Keep uploaded files ≤ 8 MiB.** Larger files are skipped; paste the key
   section instead.
 - **Deep artifacts live in the Dashboard.** Full reports, the knowledge base,
   and case browsing are on the FaultMaven Dashboard; Slack owns the in-flow
@@ -135,7 +135,7 @@ FaultMaven requests least-privilege scopes, each tied to a capability:
 | `chat:write` | post replies and the "investigating…" placeholder |
 | `app_mentions:read` | receive `@FaultMaven` summons |
 | `commands` | register the **Ask FaultMaven** message shortcut |
-| `files:read` | download attached logs/configs/screenshots as evidence |
+| `files:read` | download attached logs/configs/screenshots for analysis |
 | `reactions:write` | mark a skipped message ⏭️ when busy |
 | `channels:history` / `groups:history` / `im:history` | read a thread for catch-up on first summons, and receive the reply events that drive auto-continue |
 
