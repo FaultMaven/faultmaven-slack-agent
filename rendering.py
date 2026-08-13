@@ -348,7 +348,7 @@ def build_turn_blocks(
         context.append({"type": "mrkdwn", "text": f"Turn {result.turn_number}"})
     if evidence and not terminal:
         context.append(
-            {"type": "mrkdwn", "text": "Investigation in progress — analyzing data"}
+            {"type": "mrkdwn", "text": "Investigation in progress — awaiting the data above"}
         )
     if context:
         blocks.append({"type": "context", "elements": context})
