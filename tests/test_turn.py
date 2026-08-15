@@ -19,6 +19,7 @@ from listeners._turn import (
     TURN_ERROR_TEXT,
     TURN_TIMEOUT_TEXT,
     Dedup,
+    retry_may_help,
     run_turn,
     turn_error_text,
 )
@@ -214,6 +215,97 @@ def test_version_conflict_yields_to_the_shutdown_notice():
         turn_error_text(CaseVersionConflictError("stale", status_code=409))
         == RESTARTING_TEXT
     )
+
+
+# -- retry_may_help: the same taxonomy, in a form a caller can act on ---------
+def test_retry_may_help_refuses_the_do_not_resend_family():
+    """Every class whose message tells the user NOT to re-send must also refuse
+    to re-arm a button — a live button IS an invitation to re-send."""
+
+    from faultmaven import CaseNotFoundError, FaultMavenCredentialError
+
+    for exc in (
+        FaultMavenTimeoutError("x"),  # may have COMMITTED — a re-click duplicates it
+        FaultMavenCredentialError("dead"),  # retrying can't fix a dead credential
+        CaseTerminalError("closed", status_code=409),  # permanent, forever
+        CaseNotFoundError("gone", status_code=404),  # thread unlinked, see below
+        FaultMavenAPIError("bad", status_code=422),  # same input, same rejection
+    ):
+        assert retry_may_help(exc) is False, type(exc).__name__
+
+
+def test_retry_may_help_allows_the_transient_family():
+    from faultmaven import FaultMavenRateLimitError
+
+    for exc in (
+        CaseVersionConflictError("stale", status_code=409),  # never committed
+        FaultMavenRateLimitError("slow down", retry_after=30),  # backpressure
+        FaultMavenAPIError("boom", status_code=503),  # transient 5xx
+        RuntimeError("socket reset"),  # transport
+    ):
+        assert retry_may_help(exc) is True, type(exc).__name__
+
+
+def test_retry_may_help_agrees_with_turn_error_text():
+    """The pin that keeps the two in sync: whenever the words say "won't help"
+    or warn against a re-send, the buttons must stay down — and whenever they
+    invite a resend, the buttons must come back. If they ever disagree, the
+    message and the buttons tell the user opposite things."""
+
+    from faultmaven import (
+        CaseNotFoundError,
+        FaultMavenCredentialError,
+        FaultMavenRateLimitError,
+    )
+
+    for exc in (
+        FaultMavenTimeoutError("x"),
+        FaultMavenCredentialError("dead"),
+        CaseTerminalError("closed", status_code=409),
+        CaseNotFoundError("gone", status_code=404),
+        CaseVersionConflictError("stale", status_code=409),
+        FaultMavenRateLimitError("slow", retry_after=30),
+        FaultMavenAPIError("bad", status_code=422),
+        FaultMavenAPIError("boom", status_code=503),
+        RuntimeError("socket reset"),
+    ):
+        text = turn_error_text(exc)
+        invites_resend = any(
+            phrase in text.lower()
+            for phrase in ("send it again", "please try again", "re-sending the same")
+        )
+        # "Re-sending the same input won't help" contains a resend phrase but
+        # denies it — the negation is what counts.
+        if "won't help" in text or "may still be completing" in text:
+            invites_resend = False
+        assert retry_may_help(exc) is invites_resend, f"{type(exc).__name__}: {text}"
+
+
+def test_deleted_case_refuses_retry_even_though_a_resend_would_work():
+    """The one place retry_may_help deliberately parts from "would a resend
+    work?": CASE_GONE_TEXT says the next message starts fresh, which is true for
+    a TYPED message. A restored BUTTON is different — it carries the old
+    decision, so re-arming it would land a stale choice on the fresh case."""
+
+    from faultmaven import CaseNotFoundError
+
+    exc = CaseNotFoundError("gone", status_code=404)
+    assert "starts a fresh investigation" in turn_error_text(exc)
+    assert retry_may_help(exc) is False
+
+
+def test_retry_may_help_permits_a_resend_during_shutdown():
+    """The drain notice promises "resend it in a minute", so the buttons that
+    back that promise must survive the restart — except for the classes that
+    pierce the shutdown override, which stay refused."""
+
+    from faultmaven import FaultMavenCredentialError
+
+    turn_mod.begin_shutdown()  # autouse fixture clears it again after
+    assert retry_may_help(RuntimeError("store closed")) is True
+    assert retry_may_help(FaultMavenTimeoutError("x")) is False
+    assert retry_may_help(FaultMavenCredentialError("dead")) is False
+    assert retry_may_help(CaseTerminalError("closed", status_code=409)) is False
 
 
 # -- Dedup --------------------------------------------------------------------

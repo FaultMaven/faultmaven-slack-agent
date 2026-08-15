@@ -227,6 +227,39 @@ def turn_error_text(exc: Exception) -> str:
     return TURN_ERROR_TEXT
 
 
+def retry_may_help(exc: Exception) -> bool:
+    """Does :func:`turn_error_text` invite the user to send that turn again?
+
+    The companion to ``turn_error_text``: that function *words* the advice, this
+    one answers the same question in a form a caller can act on — a Slack button
+    is only worth re-arming when a re-click can actually succeed. **Keep the two
+    in sync**; if they disagree, the message and the buttons tell the user
+    opposite things.
+
+    False for the whole "don't re-send" family, each for its own reason:
+    a timeout's turn may have COMMITTED (a re-click double-submits it against
+    state the user never saw), a dead credential and a concluded case reproduce
+    identically forever, a 4xx rejects the same input every time, and a deleted
+    case has already been unlinked — its retry wouldn't repeat the failure, it
+    would land the stale decision on whatever fresh case the thread opens next,
+    which is worse than refusing it.
+    """
+
+    if isinstance(
+        exc, (FaultMavenTimeoutError, FaultMavenCredentialError, CaseTerminalError)
+    ):
+        return False
+    if _shutting_down.is_set():
+        return True  # RESTARTING_TEXT: "please resend it in a minute"
+    if isinstance(exc, CaseNotFoundError):
+        return False
+    if isinstance(exc, (CaseVersionConflictError, FaultMavenRateLimitError)):
+        return True
+    if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
+        return exc.status_code == 429  # a 429 is backpressure, not a bad request
+    return True  # transient transport/5xx — TURN_ERROR_TEXT's "please try again"
+
+
 def notification_text(result: TurnResult) -> str:
     """The short ``text=`` fallback accompanying a blocks post, neutralized."""
 
