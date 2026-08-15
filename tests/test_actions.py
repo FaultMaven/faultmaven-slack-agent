@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from listeners.actions import _disable_actions, _plain, apply_action
+from listeners.actions import (
+    _disable_actions,
+    _plain,
+    _restore_actions,
+    _show_working,
+    apply_action,
+)
 from rendering import build_turn_blocks
 
 
@@ -61,6 +67,80 @@ def test_disable_actions_rebuilds_question_when_payload_has_no_section():
     kept = client.updated["blocks"]
     assert not any(b["type"] == "actions" for b in kept)
     assert _sections_of(kept) == ["Shall I proceed?"]  # reconstructed, not blank
+
+
+def _body(blocks, text="Would you like to investigate?"):
+    return {
+        "channel": {"id": "C1"},
+        "message": {"ts": "111.222", "text": text, "blocks": blocks},
+    }
+
+
+def test_show_working_swaps_buttons_for_a_working_note():
+    # The instant a click lands the buttons must go away (Slack can't disable
+    # them) and a visible in-progress cue must take their place.
+    client = _CaptureClient()
+    body = _body(
+        [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Would you like to investigate?"}},
+            {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
+        ]
+    )
+    _show_working(client, body, "Yes")
+    kept = client.updated["blocks"]
+    assert not any(b["type"] == "actions" for b in kept)  # unclickable now
+    assert "Would you like to investigate?" in _sections_of(kept)  # question stays
+    contexts = [b for b in kept if b["type"] == "context"]
+    assert len(contexts) == 1
+    assert "Working on *Yes*" in contexts[0]["elements"][0]["text"]
+
+
+def test_show_working_strips_every_actions_block():
+    # rendering chunks >5 buttons into MULTIPLE actions blocks (Slack's per-block
+    # element cap) — one click must take down all of them, not just the first.
+    client = _CaptureClient()
+    button = {"type": "button", "text": {"type": "plain_text", "text": "x"}}
+    body = _body(
+        [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Would you like to investigate?"}},
+            {"type": "actions", "elements": [button] * 5},
+            {"type": "actions", "elements": [button] * 2},
+        ]
+    )
+    _show_working(client, body, "x")
+    assert not any(b["type"] == "actions" for b in client.updated["blocks"])
+
+
+def test_show_working_neutralizes_label_and_survives_missing_label():
+    # The label lands inside *...* mrkdwn — active chars must be stripped, and
+    # a payload without a label still gets a generic in-progress note.
+    client = _CaptureClient()
+    body = _body(
+        [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "x"}}]}],
+        text="Shall I proceed?",
+    )
+    _show_working(client, body, "run *now* & <cmd>")
+    note = [b for b in client.updated["blocks"] if b["type"] == "context"][0]
+    assert "run now &amp; &lt;cmd&gt;" in note["elements"][0]["text"]
+    assert _sections_of(client.updated["blocks"]) == ["Shall I proceed?"]  # rebuilt
+
+    _show_working(client, body, "")
+    note = [b for b in client.updated["blocks"] if b["type"] == "context"][0]
+    assert "Working on it" in note["elements"][0]["text"]
+
+
+def test_restore_actions_puts_the_original_message_back():
+    # A failed submit must return the message to its delivered state — buttons
+    # live again, working note gone — so retry stays one click away.
+    client = _CaptureClient()
+    original_blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "Would you like to investigate?"}},
+        {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
+    ]
+    body = _body(original_blocks)
+    _restore_actions(client, body)
+    assert client.updated["blocks"] == original_blocks
+    assert client.updated["text"] == "Would you like to investigate?"
 
 
 def test_plain_neutralizes_mrkdwn_in_echoed_label():
@@ -213,3 +293,205 @@ def test_apply_action_submits_free_speech_without_intent_data():
     _, kwargs = fm.turns[0]
     assert kwargs["intent_type"] == "conversation"
     assert kwargs.get("intent_data") is None
+
+
+# -- the click lifecycle: hide → submit → settle -------------------------------
+# The buttons come down the instant a click lands and come back only where a
+# re-click can genuinely succeed, so these drive the real handler end to end.
+class _LifecycleClient:
+    """WebClient stand-in recording the FULL sequence of message updates."""
+
+    def __init__(self) -> None:
+        self.updates: list[dict] = []
+        self.posts: list[dict] = []
+
+    def chat_update(self, **kwargs) -> None:
+        self.updates.append(kwargs)
+
+    def chat_postMessage(self, **kwargs) -> None:
+        self.posts.append(kwargs)
+
+    def chat_postEphemeral(self, **kwargs) -> None:
+        self.posts.append(kwargs)
+
+
+class _FakeApp:
+    """Captures the handler that register_actions decorates."""
+
+    def __init__(self) -> None:
+        self.handler = None
+
+    def action(self, pattern):
+        def decorate(fn):
+            self.handler = fn
+            return fn
+
+        return decorate
+
+
+class _LifecycleStore:
+    def __init__(self, case_id="c1", get_error=None) -> None:
+        self.case_id = case_id
+        self.get_error = get_error
+        self.deleted: list[tuple] = []
+
+    def get(self, team, channel, thread):
+        if self.get_error:
+            raise self.get_error
+        return self.case_id
+
+    def delete(self, team, channel, thread):
+        self.deleted.append((team, channel, thread))
+
+
+class _FailingFM:
+    def __init__(self, error) -> None:
+        self.error = error
+
+    def submit_turn(self, case_id, **kwargs):
+        raise self.error
+
+
+_ORIGINAL_BLOCKS = [
+    {"type": "section", "text": {"type": "mrkdwn", "text": "Mark this resolved?"}},
+    {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": "fm_suggested_action:0",
+                "text": {"type": "plain_text", "text": "Yes"},
+                "value": '{"q": "fixed", "it": "status_transition"}',
+            }
+        ],
+    },
+]
+
+
+def _run_click(fm, store):
+    """Drive one real button click through the registered handler."""
+
+    import logging
+    from types import SimpleNamespace
+
+    import listeners._turn as turn_mod
+    from listeners.actions import register_actions
+
+    app = _FakeApp()
+    register_actions(app, fm, store)
+    client = _LifecycleClient()
+    body = {
+        "channel": {"id": "C1"},
+        "user": {"id": "U1"},
+        "message": {
+            "ts": "111.222",
+            "text": "Mark this resolved?",
+            "blocks": [dict(b) for b in _ORIGINAL_BLOCKS],
+        },
+        "actions": [
+            {
+                "action_id": "fm_suggested_action:0",
+                "text": {"type": "plain_text", "text": "Yes"},
+                "value": '{"q": "fixed", "it": "status_transition"}',
+            }
+        ],
+    }
+    app.handler(
+        ack=lambda: None,
+        body=body,
+        context=SimpleNamespace(team_id="T1"),
+        client=client,
+        logger=logging.getLogger("test"),
+    )
+    turn_mod.drain_turns(5.0)  # the turn runs on a background daemon
+    return client
+
+
+def _has_buttons(update) -> bool:
+    return any(b.get("type") == "actions" for b in update["blocks"])
+
+
+def _working_note(update) -> bool:
+    return any(
+        "Working on" in e.get("text", "")
+        for b in update["blocks"]
+        if b.get("type") == "context"
+        for e in b.get("elements", [])
+    )
+
+
+def test_click_hides_buttons_before_the_turn_runs():
+    """The FIRST update must land before the submit — that window is the whole
+    point: a slow turn used to leave the buttons live for its full duration."""
+
+    client = _run_click(FakeFM(), _LifecycleStore())
+    assert not _has_buttons(client.updates[0])  # unclickable immediately
+    assert _working_note(client.updates[0])  # and visibly in progress
+
+
+def test_committed_click_settles_with_buttons_gone_for_good():
+    client = _run_click(FakeFM(), _LifecycleStore())
+    final = client.updates[-1]
+    assert not _has_buttons(final)  # never re-armed after a committed decision
+    assert not _working_note(final)  # transient note cleared
+    assert "Mark this resolved?" in _sections_of(final["blocks"])  # question kept
+
+
+def test_transient_failure_re_arms_the_buttons():
+    """A conflict/5xx never committed and its message says to send it again, so
+    the one-click path must be there to take."""
+
+    from faultmaven import CaseVersionConflictError
+
+    client = _run_click(
+        _FailingFM(CaseVersionConflictError("stale", status_code=409)),
+        _LifecycleStore(),
+    )
+    assert _has_buttons(client.updates[-1])  # retry stays one click away
+    assert not _working_note(client.updates[-1])
+
+
+def test_closed_case_leaves_the_buttons_down():
+    """A concluded case refuses this forever — a re-armed button would offer a
+    retry that can only fail again, contradicting the reply's own wording."""
+
+    from faultmaven import CaseTerminalError
+
+    client = _run_click(
+        _FailingFM(CaseTerminalError("closed", status_code=409)), _LifecycleStore()
+    )
+    assert not _has_buttons(client.updates[-1])
+
+
+def test_deleted_case_leaves_the_buttons_down_after_unlinking():
+    """The sharp one: the thread is unlinked here, so its next message opens a
+    FRESH case. A re-armed button still carries the old decision, which would
+    then land on that unrelated case."""
+
+    from faultmaven import CaseNotFoundError
+
+    store = _LifecycleStore()
+    client = _run_click(
+        _FailingFM(CaseNotFoundError("gone", status_code=404)), store
+    )
+    assert store.deleted == [("T1", "C1", "111.222")]  # mapping evicted
+    assert not _has_buttons(client.updates[-1])  # and no stale decision left armed
+
+
+def test_lost_mapping_leaves_the_buttons_down():
+    # Same stale-decision hazard: no case to submit against, and the next
+    # @mention opens a fresh one.
+    client = _run_click(FakeFM(), _LifecycleStore(case_id=None))
+    assert not _has_buttons(client.updates[-1])
+    assert any("lost track" in p.get("text", "") for p in client.posts)
+
+
+def test_store_failure_still_settles_the_message():
+    """Regression: the store read sits inside the pending window. An unguarded
+    raise there stranded the message at "working…" — buttons gone, no reply."""
+
+    client = _run_click(FakeFM(), _LifecycleStore(get_error=RuntimeError("db gone")))
+    assert client.posts, "the failure must be reported in-thread"
+    assert len(client.updates) >= 2, "the working note must be settled, not stranded"
+    assert _has_buttons(client.updates[-1])  # a transient failure re-arms
+    assert not _working_note(client.updates[-1])

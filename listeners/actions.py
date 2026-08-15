@@ -3,9 +3,11 @@
 When a user clicks a DECIDE button rendered on a turn result (the only clickable
 suggestion type — RUN and FREE_SPEECH are text), Slack delivers a
 ``block_actions`` payload (over Socket Mode). We recover the case for that thread,
-submit the encoded turn, echo the choice as the clicker's turn, post the next
-result in-thread, and strip the clicked buttons so the same action can't be
-double-submitted.
+submit the encoded turn, echo the choice as the clicker's turn, and post the next
+result in-thread. Slack has no disabled state for message buttons, so the buttons
+are swapped for a "working…" note the moment the click lands (a long turn would
+otherwise leave them clickable for its whole duration), restored if the submit
+fails (retry stays one click away), and stripped for good once the turn commits.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from store import CaseStore
 from ._turn import (
     CASE_GONE_TEXT,
     deliver_turn_result,
+    retry_may_help,
     run_gated,
     turn_error_text,
     unlink_stale_case,
@@ -52,9 +55,8 @@ def _plain(text: str) -> str:
     return text
 
 
-def _disable_actions(client: WebClient, body: dict) -> None:
-    """Strip the buttons off the clicked message so the choice can't be re-sent,
-    keeping the question itself visible.
+def _stripped_blocks(message: dict) -> tuple[list[dict], str]:
+    """The message's blocks without the ``actions`` block, plus fallback text.
 
     Defensive: if the surface delivered a thinner message whose blocks carry no
     section (so removing the ``actions`` block would leave the question blank),
@@ -62,16 +64,64 @@ def _disable_actions(client: WebClient, body: dict) -> None:
     never vanish, leaving only the echoed choice with nothing it answered.
     """
 
-    message = body["message"]
     text = message.get("text") or "FaultMaven"
     kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
     if not any(b.get("type") == "section" for b in kept):
         kept.insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    return kept, text
+
+
+def _rewrite(client: WebClient, body: dict, blocks: list[dict], text: str) -> None:
+    """Replace the clicked message's blocks in place (the one ``chat_update``)."""
+
     client.chat_update(
         channel=body["channel"]["id"],
-        ts=message["ts"],
-        blocks=kept,
+        ts=body["message"]["ts"],
+        blocks=blocks,
         text=text,
+    )
+
+
+def _disable_actions(client: WebClient, body: dict) -> None:
+    """Strip the buttons off the clicked message so the choice can't be re-sent,
+    keeping the question itself visible."""
+
+    kept, text = _stripped_blocks(body["message"])
+    _rewrite(client, body, kept, text)
+
+
+def _show_working(client: WebClient, body: dict, label: str) -> None:
+    """Swap the buttons for a "working…" note the moment a click lands.
+
+    Slack message buttons cannot be disabled, so removing them is the only way
+    to make a click unrepeatable while the turn runs. The note doubles as
+    instant feedback that the click registered. If the turn then fails a way a
+    retry could survive, :func:`_restore_actions` puts the buttons back.
+    """
+
+    kept, text = _stripped_blocks(body["message"])
+    working = (
+        f":hourglass_flowing_sand: Working on *{_plain(label)}*…"
+        if label
+        else ":hourglass_flowing_sand: Working on it…"
+    )
+    kept.append(
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": working}]}
+    )
+    _rewrite(client, body, kept, text)
+
+
+def _restore_actions(client: WebClient, body: dict) -> None:
+    """Put the clicked message back exactly as delivered (buttons included).
+
+    Runs only after a failure a retry could survive: the decision was not
+    applied, so the retry path stays one click away. Leaving the "working…"
+    state there instead would tell the thread the choice went through.
+    """
+
+    message = body["message"]
+    _rewrite(
+        client, body, message.get("blocks", []), message.get("text") or "FaultMaven"
     )
 
 
@@ -113,29 +163,88 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         def work() -> None:
             action = body["actions"][0]
             label = action.get("text", {}).get("text", "")
-            case_id = store.get(team_id, channel, thread_ts)
-            if not case_id:
-                post(
-                    ":warning: I lost track of this investigation's case. "
-                    "Please @mention me to continue."
-                )
-                return
 
-            # Submit first; everything after is presentation. The two failure
-            # regimes get opposite advice: a failed SUBMIT may be retried (the
-            # buttons stay live for that), but once the backend committed the
-            # decision, no Slack-side failure may claim the action errored —
-            # that message plus still-live buttons invites double-submitting
-            # the same decision.
+            def settle(*, restore: bool) -> None:
+                """Leave the clicked message in its final state. Never raises.
+
+                Best-effort by necessity — the turn's outcome is already posted
+                in-thread, so a failed update here costs the message's cosmetic
+                state, never the answer. Logged, because the visible result is a
+                stale "working…" note.
+                """
+
+                try:
+                    if restore:
+                        _restore_actions(client, body)
+                    else:
+                        _disable_actions(client, body)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "could not settle clicked buttons in %s: %s", channel, exc
+                    )
+
+            # Take the buttons down BEFORE the submit — a turn can run for
+            # minutes, and Slack buttons can't be disabled, so this is the
+            # only way a second click can't land meanwhile. Best-effort: if
+            # the update fails, the per-thread gate still serializes turns
+            # (a re-click just gets the ephemeral busy notice, as before).
             try:
-                result = apply_action(fm, case_id, action["value"])
-            except CaseNotFoundError:
-                unlink_stale_case(store, team_id, channel, thread_ts, case_id)
-                post(CASE_GONE_TEXT)
-                return
+                _show_working(client, body, label)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("suggested-action failed: %s", exc)
-                post(turn_error_text(exc))
+                logger.warning(
+                    "could not hide clicked buttons in %s: %s", channel, exc
+                )
+
+            # Whether a failure leaves the buttons re-armed. Default False:
+            # buttons come back ONLY where a re-click can genuinely succeed
+            # (see :func:`retry_may_help`). Re-arming after a permanent failure
+            # offers a retry that can only fail again — and after a DELETED case
+            # it is worse than that: the thread has just been unlinked, so a
+            # later click would land this stale decision on whatever fresh case
+            # the thread opens next.
+            restore = False
+
+            def attempt() -> TurnResult | None:
+                """Run the click's turn, or post why it failed and return None.
+
+                Every pre-commit exit lives here — including the store read,
+                which is inside the try because an unguarded raise would strand
+                the message at "working…" with no buttons and no reply.
+                """
+
+                nonlocal restore
+                case_id = None
+                try:
+                    case_id = store.get(team_id, channel, thread_ts)
+                    if not case_id:
+                        # No mapping to submit against, and the next @mention
+                        # opens a fresh case — same stale-decision hazard as a
+                        # deleted case, so the buttons stay down.
+                        post(
+                            ":warning: I lost track of this investigation's "
+                            "case. Please @mention me to continue."
+                        )
+                        return None
+                    return apply_action(fm, case_id, action["value"])
+                except CaseNotFoundError:
+                    # Only apply_action raises this, so case_id is set.
+                    unlink_stale_case(store, team_id, channel, thread_ts, case_id)
+                    post(CASE_GONE_TEXT)
+                    return None
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("suggested-action failed: %s", exc)
+                    post(turn_error_text(exc))
+                    restore = retry_may_help(exc)
+                    return None
+
+            # Everything below is presentation. The two failure regimes get
+            # opposite treatment: a failed SUBMIT may re-arm the buttons, but
+            # once the backend committed the decision, no Slack-side failure may
+            # claim the action errored or hand back a button — that invites
+            # double-submitting the same decision.
+            result = attempt()
+            if result is None:
+                settle(restore=restore)
                 return
 
             # A button click posts no user message on its own, so consecutive
@@ -153,16 +262,10 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             # strip below.
             deliver_turn_result(post, result)
 
-            # Strip the clicked buttons last, and best-effort: the decision is
-            # already applied, so a failure here (message deleted, rate limit)
-            # only risks a re-click — which the backend's own state handles —
-            # and must not discard the reply that was already posted.
-            try:
-                _disable_actions(client, body)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "could not strip clicked buttons in %s: %s", channel, exc
-                )
+            # Settle the clicked message last: replace the transient "working…"
+            # note with the clean stripped state (question kept, buttons gone
+            # for good). Last so a settle failure can't discard the reply.
+            settle(restore=False)
 
         # A click advances the case, so it's a turn — reserve the thread and run
         # in the background. If one is already running, the click is dropped (not
