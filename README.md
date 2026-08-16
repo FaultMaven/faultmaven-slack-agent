@@ -74,7 +74,7 @@ How the agent authenticates to the FaultMaven backend, in precedence order:
 
 | Credential | When |
 |---|---|
-| `FAULTMAVEN_REFRESH_TOKEN` | Backend runs `AUTH_MODE=oauth` (cloud), where dev-login is not served. Provisioned on the backend with `scripts/auth/provision_service_account.py`; the agent renews and rotates it automatically. See [docs/HOSTING.md](docs/HOSTING.md#service-account-credentials-oauth-mode-backends). |
+| `FAULTMAVEN_REFRESH_TOKEN` | Backend runs `AUTH_MODE=oauth` (cloud), where dev-login is not served. Provisioned on the backend with `fm-provision-service-account` (pass `-o <organization-id>` against a multi-tenant backend); the agent renews and rotates it automatically. See [docs/HOSTING.md](docs/HOSTING.md#service-account-credentials-oauth-mode-backends). |
 | `FAULTMAVEN_API_TOKEN` | A static bearer you supply. Cannot be renewed. |
 | `FAULTMAVEN_DEV_LOGIN_USERNAME` | Neither of the above set — bootstraps via `/api/v1/auth/dev-login` (local `AUTH_MODE` only). |
 
