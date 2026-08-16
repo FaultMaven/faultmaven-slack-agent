@@ -83,8 +83,22 @@ Secret as `FAULTMAVEN_REFRESH_TOKEN`:
 
 ```bash
 kubectl exec -it deploy/faultmaven-api -- \
-    python scripts/auth/provision_service_account.py -u slack-agent --token-only
+    fm-provision-service-account -u slack-agent -o <organization-id> --token-only
 ```
+
+`fm-provision-service-account` is a console entrypoint shipped with the
+installed package. Invoking the source file by path (`python
+scripts/auth/provision_service_account.py`) does **not** work in the pod: the
+wheel excludes `scripts/` and the image never copies it.
+
+`--organization-id` / `-o` names the FaultMaven organization the credential acts
+within. It is **required** when the backend runs `TENANT_PROVIDER=multi` (Cloud)
+and **must be omitted** on a single-tenant backend; either mistake is refused at
+mint with a message naming the fix. The `users` table has no organization
+column, so the tenant travels in the credential itself and is carried across
+each rotation — which is also why restoring a stale Secret loses the binding
+rather than just the session. `fm-provision-sso-org` reports the organization id
+when it provisions a tenant.
 
 **Renewal is automatic and rotating.** Every renewal returns a new refresh token
 and revokes the presented one. The agent persists the new token before using it,
