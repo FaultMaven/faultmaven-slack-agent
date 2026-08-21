@@ -1,9 +1,9 @@
 # FaultMaven Slack Agent
 
 Brings FaultMaven's AI troubleshooting copilot into Slack — investigate incidents
-right in the thread (or the AI side panel), grounded in the logs and configs you
-share, correlated with your runbooks and past fixes. Built on **Bolt for
-Python**'s Assistant container, backed by the FaultMaven core API.
+right in the thread (or the AI side panel), grounded in the logs, metrics, and
+configs you share, correlated with your runbooks and past fixes. Built on
+**Bolt for Python**'s Assistant container, backed by the FaultMaven core API.
 
 > Full architecture, feature design, backend contract, and roadmap:
 > [docs/design.md](docs/design.md).
