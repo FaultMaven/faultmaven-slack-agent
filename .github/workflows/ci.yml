@@ -32,6 +32,51 @@ jobs:
       - run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
       - run: ruff check .
 
+  api-models-drift:
+    name: API Contract Drift Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # The generator formats with the pinned ruff, so both pins matter: an
+      # unpinned formatter or generator shows up here as a contract change that
+      # never happened.
+      - run: |
+          pip install "$(grep -E '^datamodel-code-generator==' requirements-dev.txt)" \
+                      "$(grep -E '^ruff==' requirements-dev.txt)"
+
+      # Regenerates from the PINNED contract (api-contract.pin.json), not from
+      # the API's main branch. Adoption of a contract change is moving that
+      # ref, in a pull request here — until it moves, a backend merge cannot
+      # turn this repository red or change what this client is written against.
+      - name: Regenerate the API models and compare
+        run: |
+          python scripts/generate_api_models.py
+          # `git status --porcelain`, not `git diff --exit-code`: the latter
+          # reports nothing for an UNTRACKED file, so a deleted generated
+          # module would be regenerated and quietly pass having compared the
+          # contract against nothing.
+          if [ -n "$(git status --porcelain faultmaven/api_generated.py)" ]; then
+            echo "::error::faultmaven/api_generated.py no longer matches the pinned API contract."
+            echo ""
+            echo "Regenerate and commit it:"
+            echo "    pip install -r requirements-dev.txt"
+            echo "    python scripts/generate_api_models.py"
+            echo "    git add faultmaven/api_generated.py"
+            echo ""
+            echo "If you are adopting a new contract, move \`ref\` in"
+            echo "api-contract.pin.json in the same pull request — that is the"
+            echo "commit where this client accepts the change."
+            git --no-pager diff --stat faultmaven/api_generated.py
+            exit 1
+          fi
+
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest

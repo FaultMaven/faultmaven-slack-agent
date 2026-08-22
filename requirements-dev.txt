@@ -3,3 +3,7 @@
 pytest==8.3.4
 # linter — single source of truth; CI's lint job installs this exact pin
 ruff==0.9.10
+# OpenAPI -> Pydantic models for the FaultMaven API contract
+# (scripts/generate_api_models.py; the CI drift job regenerates and diffs, so
+# this pin is what keeps the committed models reproducible).
+datamodel-code-generator==0.74.0
