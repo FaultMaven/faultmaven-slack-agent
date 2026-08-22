@@ -198,10 +198,13 @@ def test_concurrent_renewals_issue_exactly_one_request():
 
 # -- failure handling ---------------------------------------------------------
 #: How the token endpoint refuses a grant under API contract 2.0.0: RFC 6749
-#: §5.2, not FastAPI's `{"detail": ...}`. The turn and poll mocks below keep
-#: `detail`, because every route other than /auth/oauth/{token,revoke} still
-#: answers that shape — a mock that used one shape everywhere would stop
-#: describing the server either way.
+#: §5.2 at **400**, not FastAPI's `{"detail": ...}` at 401. Both halves moved
+#: together, so pairing this body with a 401 would describe a server that never
+#: existed — 1.0.0 sent 401 + `detail`, 2.0.0 sends 400 + this.
+#:
+#: The turn and poll mocks below keep `detail`, because every route other than
+#: /auth/oauth/{token,revoke} still answers that shape. A mock using one shape
+#: everywhere would stop describing the server either way.
 REJECTED_GRANT = {
     "error": "invalid_grant",
     "error_description": "Refresh token expired or revoked",
@@ -263,7 +266,7 @@ def test_rejected_stored_credential_falls_back_to_a_fresh_seed():
         token = json.loads(request.content)["refresh_token"]
         presented.append(token)
         if token == "dead-rt":
-            return httpx.Response(401, json=REJECTED_GRANT)
+            return httpx.Response(400, json=REJECTED_GRANT)
         return token_response()
 
     store = FakeStore(token="dead-rt")
@@ -278,7 +281,7 @@ def test_rejected_credential_with_no_alternative_does_not_retry():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return httpx.Response(401, json=REJECTED_GRANT)
+        return httpx.Response(400, json=REJECTED_GRANT)
 
     store = FakeStore(token="same-rt")
     client = make_client(handler, refresh_token="same-rt", store=store)
@@ -524,7 +527,7 @@ def test_rejected_credential_falls_back_to_the_store():
         token = json.loads(request.content)["refresh_token"]
         presented.append(token)
         if token == "stale-rt":
-            return httpx.Response(401, json=REJECTED_GRANT)
+            return httpx.Response(400, json=REJECTED_GRANT)
         return token_response()
 
     store = FakeStore(token="stale-rt")
@@ -543,7 +546,7 @@ def test_store_then_seed_are_both_tried_before_declaring_lockout():
         presented.append(token)
         if token == "good-seed":
             return token_response()
-        return httpx.Response(401, json=REJECTED_GRANT)
+        return httpx.Response(400, json=REJECTED_GRANT)
 
     store = FakeStore(token="dead-a")
     client = make_client(handler, refresh_token="good-seed", store=store)
@@ -556,7 +559,7 @@ def test_store_then_seed_are_both_tried_before_declaring_lockout():
 def test_lockout_is_still_reported_when_nothing_works():
     store = FakeStore(token="dead-a")
     client = make_client(
-        lambda r: httpx.Response(401, json=REJECTED_GRANT),
+        lambda r: httpx.Response(400, json=REJECTED_GRANT),
         refresh_token="dead-b",
         store=store,
     )
