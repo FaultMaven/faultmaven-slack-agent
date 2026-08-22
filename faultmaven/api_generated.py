@@ -602,6 +602,17 @@ class OAuthConfigResponse(BaseModel):
     token_url: str = Field(..., title="Token Url")
 
 
+class OAuthErrorResponse(BaseModel):
+    error: str = Field(
+        ..., description="RFC 6749 §5.2 error code, e.g. 'invalid_grant'", title="Error"
+    )
+    error_description: str = Field(
+        ...,
+        description="Human-readable explanation, for the developer holding the request",
+        title="Error Description",
+    )
+
+
 class OperatorAccessAuditEntry(BaseModel):
     action: str = Field(..., title="Action")
     audit_id: int = Field(..., title="Audit Id")
@@ -753,19 +764,6 @@ class ResolutionSummary(BaseModel):
         ...,
         description="Total time from case creation to resolution",
         title="Total Duration Minutes",
-    )
-
-
-class TokenTypeHint(Enum):
-    access_token = "access_token"
-    refresh_token = "refresh_token"
-
-
-class RevokeRequest(BaseModel):
-    client_id: str = Field(..., description="OAuth client ID", title="Client Id")
-    token: str = Field(..., description="Token to revoke (access or refresh)", title="Token")
-    token_type_hint: TokenTypeHint | None = Field(
-        None, description="Hint about token type (optional)", title="Token Type Hint"
     )
 
 
@@ -988,34 +986,6 @@ class TokenRefreshResponse(BaseModel):
     )
     token_type: str | None = Field(
         "bearer", description="Token type (always 'bearer')", title="Token Type"
-    )
-
-
-class GrantType(Enum):
-    authorization_code = "authorization_code"
-    refresh_token = "refresh_token"
-
-
-class TokenRequest(BaseModel):
-    client_id: str = Field(..., description="OAuth client ID", title="Client Id")
-    code: str | None = Field(
-        None, description="Authorization code (required for authorization_code grant)", title="Code"
-    )
-    code_verifier: str | None = Field(
-        None,
-        description="PKCE code verifier (required for authorization_code grant)",
-        title="Code Verifier",
-    )
-    grant_type: GrantType = Field(
-        ..., description="Grant type: 'authorization_code' or 'refresh_token'", title="Grant Type"
-    )
-    redirect_uri: str | None = Field(
-        None,
-        description="Redirect URI (required for authorization_code grant, must match)",
-        title="Redirect Uri",
-    )
-    refresh_token: str | None = Field(
-        None, description="Refresh token (required for refresh_token grant)", title="Refresh Token"
     )
 
 

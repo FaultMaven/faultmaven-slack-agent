@@ -789,14 +789,44 @@ class FaultMavenClient:
         try:
             body = resp.json()
             detail = (
-                (body.get("detail") or body.get("message"))
-                if isinstance(body, dict)
-                else None
+                FaultMavenClient._explanation(body) if isinstance(body, dict) else None
             )
             text = detail if isinstance(detail, str) else resp.text
         except ValueError:
             text = resp.text
         return " ".join((text or "").split())[:300]
+
+    @staticmethod
+    def _explanation(body: dict[str, Any]) -> str | None:
+        """The human-readable half of an error body, in either shape.
+
+        Most routes answer FastAPI's ``{"detail": ...}``. The OAuth token and
+        revocation endpoints answer RFC 6749 §5.2 instead —
+        ``{"error", "error_description"}`` — as of API contract 2.0.0, and
+        reading only ``detail`` there yielded None and fell back to dumping the
+        raw JSON body at whoever was reading the log.
+
+        Nothing validates the body against a model here on purpose: this runs
+        on the *error* path, where being strict would mean an unparseable
+        refusal becomes an exception instead of a message.
+        """
+
+        for key in ("detail", "message"):
+            value = body.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        code = body.get("error")
+        description = body.get("error_description")
+        if isinstance(code, str) and code:
+            # The code is what an operator acts on ("invalid_grant" means
+            # re-provision); the description says which instance of it this was.
+            if isinstance(description, str) and description:
+                return f"{code}: {description}"
+            return code
+        if isinstance(description, str) and description:
+            return description
+        return None
 
     def _raise_for_status(
         self, resp: httpx.Response, op: str, *, not_found_is_case: bool = False

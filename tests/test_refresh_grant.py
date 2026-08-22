@@ -197,16 +197,61 @@ def test_concurrent_renewals_issue_exactly_one_request():
 
 
 # -- failure handling ---------------------------------------------------------
+#: How the token endpoint refuses a grant under API contract 2.0.0: RFC 6749
+#: §5.2, not FastAPI's `{"detail": ...}`. The turn and poll mocks below keep
+#: `detail`, because every route other than /auth/oauth/{token,revoke} still
+#: answers that shape — a mock that used one shape everywhere would stop
+#: describing the server either way.
+REJECTED_GRANT = {
+    "error": "invalid_grant",
+    "error_description": "Refresh token expired or revoked",
+}
+
+
 @pytest.mark.parametrize("status", [400, 401])
 def test_rejected_credential_names_the_recovery_step(status):
     client = make_client(
-        lambda r: httpx.Response(status, json={"detail": "invalid_grant"})
+        lambda r: httpx.Response(status, json=REJECTED_GRANT)
     )
 
     with pytest.raises(FaultMavenCredentialError) as exc:
         client._current_token()
 
     assert "provision_service_account" in str(exc.value)
+
+
+def test_the_refusal_reaches_the_operator_in_the_rfc_shape():
+    """A refusal must still say WHY under contract 2.0.0.
+
+    `_error_detail` read only `detail` and `message`. The token endpoint stopped
+    sending either — it answers RFC 6749 §5.2 — so the explanation silently
+    became a dump of the raw JSON body, on the one message an operator reads to
+    learn that a service-account credential needs re-provisioning. Nothing in
+    the type system or the drift gate would have said so: the models are
+    generated, but this path reads a dict.
+    """
+    client = make_client(lambda r: httpx.Response(400, json=REJECTED_GRANT))
+
+    with pytest.raises(FaultMavenCredentialError) as exc:
+        client._current_token()
+
+    message = str(exc.value)
+    assert "invalid_grant" in message
+    assert "Refresh token expired or revoked" in message
+    # Not the raw body dumped verbatim.
+    assert '{"error"' not in message
+
+
+def test_a_detail_body_is_still_read():
+    """Every route but /auth/oauth/{token,revoke} still answers `detail`."""
+    client = make_client(
+        lambda r: httpx.Response(400, json={"detail": "something else entirely"})
+    )
+
+    with pytest.raises(FaultMavenCredentialError) as exc:
+        client._current_token()
+
+    assert "something else entirely" in str(exc.value)
 
 
 def test_rejected_stored_credential_falls_back_to_a_fresh_seed():
@@ -218,7 +263,7 @@ def test_rejected_stored_credential_falls_back_to_a_fresh_seed():
         token = json.loads(request.content)["refresh_token"]
         presented.append(token)
         if token == "dead-rt":
-            return httpx.Response(401, json={"detail": "invalid_grant"})
+            return httpx.Response(401, json=REJECTED_GRANT)
         return token_response()
 
     store = FakeStore(token="dead-rt")
@@ -233,7 +278,7 @@ def test_rejected_credential_with_no_alternative_does_not_retry():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return httpx.Response(401, json={"detail": "invalid_grant"})
+        return httpx.Response(401, json=REJECTED_GRANT)
 
     store = FakeStore(token="same-rt")
     client = make_client(handler, refresh_token="same-rt", store=store)
@@ -479,7 +524,7 @@ def test_rejected_credential_falls_back_to_the_store():
         token = json.loads(request.content)["refresh_token"]
         presented.append(token)
         if token == "stale-rt":
-            return httpx.Response(401, json={"detail": "invalid_grant"})
+            return httpx.Response(401, json=REJECTED_GRANT)
         return token_response()
 
     store = FakeStore(token="stale-rt")
@@ -498,7 +543,7 @@ def test_store_then_seed_are_both_tried_before_declaring_lockout():
         presented.append(token)
         if token == "good-seed":
             return token_response()
-        return httpx.Response(401, json={"detail": "invalid_grant"})
+        return httpx.Response(401, json=REJECTED_GRANT)
 
     store = FakeStore(token="dead-a")
     client = make_client(handler, refresh_token="good-seed", store=store)
@@ -511,7 +556,7 @@ def test_store_then_seed_are_both_tried_before_declaring_lockout():
 def test_lockout_is_still_reported_when_nothing_works():
     store = FakeStore(token="dead-a")
     client = make_client(
-        lambda r: httpx.Response(401, json={"detail": "invalid_grant"}),
+        lambda r: httpx.Response(401, json=REJECTED_GRANT),
         refresh_token="dead-b",
         store=store,
     )
