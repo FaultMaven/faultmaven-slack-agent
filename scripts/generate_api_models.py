@@ -60,7 +60,7 @@ def pinned_spec_url() -> str:
     return RAW_URL.format(repository=pin["repository"], ref=pin["ref"])
 
 
-def local_copy(spec: str, directory: str) -> str:
+def local_copy(spec: str, directory: str, *, from_pin: bool) -> str:
     """A local path for ``spec``, downloading it first if it is a URL.
 
     `datamodel-codegen --input` reads a path, not a URL, and downloading here
@@ -69,7 +69,11 @@ def local_copy(spec: str, directory: str) -> str:
     module, and a drift check comparing it would "pass" by matching nothing.
     """
     if not spec.startswith(("http://", "https://")):
-        return spec
+        # Resolved against the CALLER's cwd before the generator runs with
+        # cwd=REPO_ROOT, or `--spec ./openapi.json` from anywhere else would
+        # silently read <repo>/openapi.json — a stale file if one exists, and a
+        # confusing failure if not.
+        return str(Path(spec).resolve())
 
     destination = os.path.join(directory, "openapi.json")
     try:
@@ -84,9 +88,39 @@ def local_copy(spec: str, directory: str) -> str:
         sys.exit(f"The contract at {spec} is not valid JSON: {exc}")
     if not document.get("paths"):
         sys.exit(f"The contract at {spec} declares no paths; refusing to generate.")
+    if from_pin:
+        check_pinned_version(document)
 
     Path(destination).write_bytes(payload)
     return destination
+
+
+def check_pinned_version(document: dict) -> None:
+    """The pin names a contract version as well as a ref; they must agree.
+
+    Without this the version is decorative: a pin bump that moves `ref` and
+    forgets `contractVersion` (or the reverse) would pass silently, and the
+    client would be generated from a contract nobody reviewed. copilot and
+    dashboard check the same thing in CI; here it belongs in the generator,
+    which has already parsed the document.
+
+    Only called for the pinned contract. A `--spec` or FM_OPENAPI_SPEC
+    override is the "prepare against a proposed contract" path, where
+    disagreeing with the pin is the whole point.
+    """
+    try:
+        pin = json.loads(PIN_PATH.read_text())
+    except (OSError, ValueError):
+        return
+
+    pinned = pin.get("contractVersion")
+    published = (document.get("info") or {}).get("version")
+    if pinned and published and pinned != published:
+        sys.exit(
+            f"{PIN_PATH.name} says contractVersion {pinned}, but the pinned ref "
+            f"serves {published}. The ref is not the commit whoever edited the "
+            f"pin meant."
+        )
 
 
 def main() -> int:
@@ -97,12 +131,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    spec = args.spec or os.environ.get("FM_OPENAPI_SPEC") or pinned_spec_url()
+    override = args.spec or os.environ.get("FM_OPENAPI_SPEC")
+    spec = override or pinned_spec_url()
 
     print(f"Generating {OUTPUT_PATH.relative_to(REPO_ROOT)} from {spec}")
 
     with tempfile.TemporaryDirectory() as directory:
-        return generate(local_copy(spec, directory))
+        return generate(local_copy(spec, directory, from_pin=override is None))
 
 
 def generate(input_path: str) -> int:
