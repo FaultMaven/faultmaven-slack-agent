@@ -203,10 +203,41 @@ def _attachment_text(attachment: dict[str, Any]) -> list[str]:
     # Legacy attachments carry mrkdwn wire form throughout (this is the shape
     # Alertmanager's Slack receiver emits), so every string here is rendered.
     out: list[str] = []
+    title_index: int | None = None
     for key in ("pretext", "title", "text"):
         value = attachment.get(key)
         if value:
+            if key == "title":
+                title_index = len(out)
             out.append(_render(str(value)))
+    # The title's destination, on its own line under the title it annotates.
+    #
+    # Slack renders a linked title as a hyperlink, so unlike an INLINE entity
+    # — where the label is prose the author wrote INSTEAD of the URL, and
+    # ``_unwrap_entities`` is right to keep the label alone — ``title_link``
+    # is a separate structural field whose URL is nowhere in the title text.
+    # For Alertmanager's default Slack template it is the only actionable
+    # field in the whole notification, and that template always sets ``title``,
+    # so ``fallback`` (which renders it as ``<title> | <url>``, i.e. the
+    # SENDER's own plain-text form, URL included) is never reached and the
+    # link was dropped every time.
+    #
+    # This is the only place it can be fixed: the FaultMaven API is
+    # client-agnostic — it cannot tell this agent from the Copilot and must
+    # not have to — so there is no side channel for "the alert also had a
+    # link". Anything a Slack reader can reach from the message has to arrive
+    # in the content or not at all.
+    #
+    # Emitted bare (no invented punctuation), which is also how
+    # ``_unwrap_entities`` degrades an UNLABELLED link. Gated on a title
+    # because Slack ignores ``title_link`` without one, and skipped when some
+    # other field already carried the URL so a forwarded alert never arrives
+    # with it twice.
+    link = attachment.get("title_link")
+    if link and title_index is not None:
+        url = _render(str(link)).strip()
+        if url and not any(url in part for part in out):
+            out.insert(title_index + 1, url)
     for field in attachment.get("fields") or []:
         if not isinstance(field, dict):
             continue
