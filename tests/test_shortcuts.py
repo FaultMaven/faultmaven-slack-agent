@@ -124,6 +124,14 @@ def test_title_without_a_link_is_unchanged():
     assert message_to_text(msg) == "disk full on web-1"
 
 
+def test_malformed_title_link_degrades_to_no_link():
+    """External payloads are occasionally malformed; `str()` on a non-string
+    would splice a Python repr into the evidence."""
+
+    msg = {"attachments": [{"title": "T", "title_link": {"unexpected": 1}}]}
+    assert message_to_text(msg) == "T"
+
+
 def test_title_link_without_a_title_is_ignored():
     """Slack does not render `title_link` without a `title`, so neither do we —
     a URL with nothing naming it is not something the reader saw."""

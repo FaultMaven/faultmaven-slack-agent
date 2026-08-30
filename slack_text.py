@@ -234,8 +234,11 @@ def _attachment_text(attachment: dict[str, Any]) -> list[str]:
     # other field already carried the URL so a forwarded alert never arrives
     # with it twice.
     link = attachment.get("title_link")
-    if link and title_index is not None:
-        url = _render(str(link)).strip()
+    # ``isinstance`` before ``str()``: these payloads are external and
+    # occasionally malformed, and ``str()`` on a dict would splice a Python
+    # repr into the evidence rather than degrading to "no link".
+    if isinstance(link, str) and link and title_index is not None:
+        url = _render(link).strip()
         if url and not any(url in part for part in out):
             out.insert(title_index + 1, url)
     for field in attachment.get("fields") or []:
