@@ -65,6 +65,81 @@ def test_attachment_fallback_only_when_no_structure():
     assert message_to_text(msg) == "raw alert text"
 
 
+# -- the title's destination (#52) --------------------------------------------
+# Alertmanager's default Slack template always sets `title` AND `title_link`,
+# so `fallback` — the only field carrying the URL — is never reached. The
+# engine then asked the reporter for an `<alertmanager-host>:<port>` that was
+# in the message it had been handed.
+_ALERTMANAGER = {
+    "text": "",
+    "attachments": [
+        {
+            "color": "a30200",
+            "fallback": (
+                "[FIRING:2] FaultMavenSLAAtRisk (faultmaven-api backend warning) | "
+                "<http://alertmanager.monitoring:9093/#/alerts?receiver=warning-receiver>"
+            ),
+            "title": "[FIRING:2] FaultMavenSLAAtRisk (faultmaven-api backend warning)",
+            "title_link": (
+                "http://alertmanager.monitoring:9093/#/alerts?receiver=warning-receiver"
+            ),
+            "mrkdwn_in": ["fallback", "pretext", "text"],
+        }
+    ],
+}
+
+
+def test_alertmanager_title_link_reaches_the_engine():
+    text = message_to_text(_ALERTMANAGER)
+    assert "FaultMavenSLAAtRisk" in text
+    assert "alertmanager.monitoring:9093" in text
+
+
+def test_title_link_follows_the_title_it_annotates():
+    lines = message_to_text(_ALERTMANAGER).splitlines()
+    assert lines[0].startswith("[FIRING:2]")
+    assert lines[1] == (
+        "http://alertmanager.monitoring:9093/#/alerts?receiver=warning-receiver"
+    )
+
+
+def test_title_link_is_not_repeated_when_another_field_carried_it():
+    """Some senders put the link in `text` too; the alert must not arrive with
+    the same URL twice."""
+
+    msg = {
+        "attachments": [
+            {
+                "title": "payments-svc error rate > 5%",
+                "title_link": "https://app.datadoghq.com/monitors/123",
+                "text": "See https://app.datadoghq.com/monitors/123 for history",
+            }
+        ]
+    }
+    assert message_to_text(msg).count("https://app.datadoghq.com/monitors/123") == 1
+
+
+def test_title_without_a_link_is_unchanged():
+    msg = {"attachments": [{"title": "disk full on web-1"}]}
+    assert message_to_text(msg) == "disk full on web-1"
+
+
+def test_malformed_title_link_degrades_to_no_link():
+    """External payloads are occasionally malformed; `str()` on a non-string
+    would splice a Python repr into the evidence."""
+
+    msg = {"attachments": [{"title": "T", "title_link": {"unexpected": 1}}]}
+    assert message_to_text(msg) == "T"
+
+
+def test_title_link_without_a_title_is_ignored():
+    """Slack does not render `title_link` without a `title`, so neither do we —
+    a URL with nothing naming it is not something the reader saw."""
+
+    msg = {"attachments": [{"text": "body", "title_link": "https://example.com/x"}]}
+    assert message_to_text(msg) == "body"
+
+
 def test_rich_text_block():
     msg = {
         "blocks": [
