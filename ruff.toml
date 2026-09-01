@@ -1,5 +1,17 @@
 # Lint config for the FaultMaven Slack agent. Pinned so CI (`ruff check .`) is
-# deterministic across ruff releases. Default rule set (E4/E7/E9 + F) — the
-# high-signal correctness/pyflakes checks — is sufficient here.
+# deterministic across ruff releases.
 target-version = "py312"
 line-length = 100
+
+[lint]
+# The E4/E7/E9 + F set — the high-signal correctness and pyflakes checks — is
+# what this repository has always enforced, and it is sufficient here.
+#
+# Stated explicitly rather than left to ruff's defaults, because those defaults
+# widen between releases: the same `ruff check .` that passes on 0.9.10 reports
+# 60 findings across 16 rule families on 0.16 (import ordering, pyupgrade,
+# tryceratops, flake8-bugbear and more). Leaving it implicit means a routine
+# linter bump silently changes what CI enforces and fails an unrelated PR —
+# which is exactly what #57 hit. Adopting a broader set is a deliberate choice
+# to make here, in its own change, not a side effect of a version bump.
+select = ["E4", "E7", "E9", "F"]
