@@ -1,9 +1,9 @@
 # Dev/test dependencies (install alongside requirements.txt)
 -r requirements.txt
-pytest==9.0.3
+pytest==9.1.1
 # linter — single source of truth; CI's lint job installs this exact pin
-ruff==0.9.10
+ruff==0.16.5
 # OpenAPI -> Pydantic models for the FaultMaven API contract
 # (scripts/generate_api_models.py; the CI drift job regenerates and diffs, so
 # this pin is what keeps the committed models reproducible).
-datamodel-code-generator==0.74.0
+datamodel-code-generator==0.76.0
