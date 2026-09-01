@@ -24,8 +24,8 @@ from ._turn import (
     Dedup,
     deliver_turn_result,
     disable_previous_actions,
-    has_actions_blocks,
     offload_turn,
+    record_posted_turn,
     resolve_query,
     run_turn,
     skipped_files_note,
@@ -90,7 +90,10 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     resp = say(text)
                 else:
                     resp = say(text=text, blocks=blocks)
-                if isinstance(resp, dict):
+                # say() returns a SlackResponse, which is NOT a dict subclass
+                # — an isinstance(resp, dict) check here would silently never
+                # record anything. It does support .get().
+                if resp is not None:
                     last_posted_ts = resp.get("ts")
                 return True
             except Exception as exc:  # noqa: BLE001
@@ -99,9 +102,6 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
 
         def turn_work() -> None:
             try:
-                # When advancing to a new turn, make previous turn choice buttons unavailable.
-                disable_previous_actions(client, store, team_id, channel, thread_ts)
-
                 # No-ops when there are no files. Pasted snippets come back
                 # as text so the backend sees paste provenance, not a fake
                 # "Untitled" file upload; attachments beyond the one-file-
@@ -150,12 +150,15 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
             opening_case_id = (
                 store.get(team_id, channel, thread_ts) if first_turn else None
             )
+            # The conversation has genuinely advanced now (every decline above
+            # returns without running a turn), so the previous turn's choice
+            # buttons can come down.
+            disable_previous_actions(client, store, team_id, channel, thread_ts)
+
             delivered_blocks = deliver_turn_result(post, result, case_id=opening_case_id)
-            if hasattr(store, "set_last_action_ts"):
-                if has_actions_blocks(delivered_blocks) and last_posted_ts:
-                    store.set_last_action_ts(team_id, channel, thread_ts, last_posted_ts)
-                else:
-                    store.clear_last_action_ts(team_id, channel, thread_ts)
+            record_posted_turn(
+                store, team_id, channel, thread_ts, last_posted_ts, delivered_blocks
+            )
 
         # set_status shows the native "investigating" indicator immediately, so
         # the offloaded download/turn has visible feedback in front of it. It's

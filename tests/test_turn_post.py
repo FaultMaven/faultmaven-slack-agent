@@ -43,7 +43,12 @@ class FakeClient:
         return {"ok": True}
 
     def conversations_replies(self, **kw):
-        return {"messages": self.replies}
+        # Slack always returns the thread parent first and honors ``limit``, so
+        # a limit with no room left for the reply comes back as the parent
+        # alone — the case a limit=1 lookup silently loses.
+        messages = [{"ts": kw.get("ts"), "text": "parent", "blocks": []}]
+        messages.extend(self.replies)
+        return {"messages": messages[: kw.get("limit", 100)]}
 
 
 class FakeFM:
@@ -63,6 +68,7 @@ class FakeStore:
     def __init__(self) -> None:
         self.m: dict = {}
         self.seeded: set = set()
+        self.last_turn: dict = {}
         self.last_action: dict = {}
 
     def get(self, t, c, th):
@@ -77,14 +83,19 @@ class FakeStore:
     def is_seeded(self, t, c, th):
         return (t, c, th) in self.seeded
 
+    def get_last_turn_ts(self, t, c, th):
+        return self.last_turn.get((t, c, th))
+
     def get_last_action_ts(self, t, c, th):
         return self.last_action.get((t, c, th))
 
-    def set_last_action_ts(self, t, c, th, ts):
-        if ts is None:
+    def record_turn(self, t, c, th, *, turn_ts, action_ts):
+        if turn_ts is not None:
+            self.last_turn[(t, c, th)] = turn_ts
+        if action_ts is None:
             self.last_action.pop((t, c, th), None)
         else:
-            self.last_action[(t, c, th)] = ts
+            self.last_action[(t, c, th)] = action_ts
 
     def clear_last_action_ts(self, t, c, th):
         self.last_action.pop((t, c, th), None)
@@ -168,47 +179,136 @@ def test_forwards_files_to_submit_turn():
     assert kw["files"] == files
 
 
-def test_disables_previous_turn_actions_when_new_turn_runs():
-    _turn = _load_turn()
-    prev_msg = {
+def _prev_choice_message(blocks="buttons") -> dict:
+    """A previous turn's message, still carrying its choice buttons."""
+
+    return {
         "ts": "PREV_ACTION_TS",
         "text": "Choose an option:",
         "blocks": [
             {"type": "section", "text": {"type": "mrkdwn", "text": "Choose an option:"}},
-            {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
-        ],
+            {
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Yes"}}
+                ],
+            },
+        ]
+        if blocks == "buttons"
+        else blocks,
     }
-    client = FakeClient(replies=[prev_msg])
-    fm = FakeFM()
-    store = FakeStore()
+
+
+def _with_buttons(store) -> None:
     store.put("T", "C", "TS", "case_1")
-    store.set_last_action_ts("T", "C", "TS", "PREV_ACTION_TS")
+    store.record_turn(
+        "T", "C", "TS", turn_ts="PREV_ACTION_TS", action_ts="PREV_ACTION_TS"
+    )
 
-    _turn.run_turn_and_post(client, fm, store, text="next turn query", **_COMMON)
 
-    # Verify previous message buttons were stripped
+_DECIDE_RESULT = TurnResult(
+    agent_response="Should I proceed?",
+    suggested_actions=[
+        {
+            "type": "DECIDE",
+            "label": "Yes proceed",
+            "payload": "yes",
+            "intent": {"type": "confirmation", "confirmation_value": True},
+        }
+    ],
+)
+
+
+def test_disables_previous_turn_actions_when_new_turn_runs():
+    _turn = _load_turn()
+    client = FakeClient(replies=[_prev_choice_message()])
+    store = FakeStore()
+    _with_buttons(store)
+
+    _turn.run_turn_and_post(client, FakeFM(), store, text="next turn query", **_COMMON)
+
     assert len(client.updates) >= 2
     prev_update = client.updates[0]
     assert prev_update["ts"] == "PREV_ACTION_TS"
     assert not any(b["type"] == "actions" for b in prev_update["blocks"])
-    assert any("Choose an option:" in b["text"]["text"] for b in prev_update["blocks"] if b["type"] == "section")
+    assert any(
+        "Choose an option:" in b["text"]["text"]
+        for b in prev_update["blocks"]
+        if b["type"] == "section"
+    )
 
 
-def test_records_last_action_ts_when_turn_has_decide_buttons():
+def test_records_the_posted_turn_when_it_has_decide_buttons():
     _turn = _load_turn()
     client = FakeClient()
-    result_with_buttons = TurnResult(
-        agent_response="Should I proceed?",
-        suggested_actions=[
-            {
-                "type": "DECIDE",
-                "label": "Yes proceed",
-                "payload": "yes",
-                "intent": {"type": "confirmation", "confirmation_value": True},
-            }
-        ],
-    )
-    fm = FakeFM(result=result_with_buttons)
     store = FakeStore()
-    _turn.run_turn_and_post(client, fm, store, text="hello", placeholder_ts="PH_ACTION", **_COMMON)
+
+    _turn.run_turn_and_post(
+        client,
+        FakeFM(result=_DECIDE_RESULT),
+        store,
+        text="hello",
+        placeholder_ts="PH_ACTION",
+        **_COMMON,
+    )
+
     assert store.get_last_action_ts("T", "C", "TS") == "PH_ACTION"
+    assert store.get_last_turn_ts("T", "C", "TS") == "PH_ACTION"
+
+
+def test_records_the_turn_even_when_it_carries_no_buttons():
+    """The turn marker is the stale-click guard's only anchor, so a plain reply
+    has to move it too — erasing it would let a click on the previous turn's
+    buttons (a stale client view, an offline queue) sail through as live."""
+
+    _turn = _load_turn()
+    client = FakeClient(replies=[_prev_choice_message()])
+    store = FakeStore()
+    _with_buttons(store)
+
+    _turn.run_turn_and_post(
+        client, FakeFM(), store, text="hello", placeholder_ts="PH_PLAIN", **_COMMON
+    )
+
+    assert store.get_last_turn_ts("T", "C", "TS") == "PH_PLAIN"
+    assert store.get_last_action_ts("T", "C", "TS") is None
+
+
+def test_a_failed_turn_leaves_the_previous_choice_buttons_alone():
+    """The conversation never advanced, so the question the user can still
+    answer must stay answerable."""
+
+    _turn = _load_turn()
+
+    class _FailingFM:
+        def create_case(self, *, title=None, initial_message=None):
+            return "case_1"
+
+        def submit_turn(self, case_id, **kwargs):
+            raise RuntimeError("backend down")
+
+    client = FakeClient(replies=[_prev_choice_message()])
+    store = FakeStore()
+    _with_buttons(store)
+
+    _turn.run_turn_and_post(client, _FailingFM(), store, text="next", **_COMMON)
+
+    assert all(u["ts"] != "PREV_ACTION_TS" for u in client.updates)
+    assert store.get_last_action_ts("T", "C", "TS") == "PREV_ACTION_TS"
+
+
+def test_null_blocks_on_the_tracked_message_do_not_break_the_strip():
+    """Slack sends ``"blocks": null`` on some messages, so ``.get("blocks", [])``
+    hands back None rather than the default."""
+
+    _turn = _load_turn()
+    client = FakeClient(replies=[_prev_choice_message(blocks=None)])
+    store = FakeStore()
+    _with_buttons(store)
+
+    _turn.run_turn_and_post(
+        client, FakeFM(), store, text="next", placeholder_ts="PH", **_COMMON
+    )
+
+    assert all(u["ts"] != "PREV_ACTION_TS" for u in client.updates)
+    assert store.get_last_action_ts("T", "C", "TS") is None

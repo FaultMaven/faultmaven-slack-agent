@@ -304,12 +304,18 @@ class _LifecycleClient:
     def __init__(self) -> None:
         self.updates: list[dict] = []
         self.posts: list[dict] = []
+        self.post_ts: list[str] = []
 
     def chat_update(self, **kwargs) -> None:
         self.updates.append(kwargs)
 
-    def chat_postMessage(self, **kwargs) -> None:
+    def chat_postMessage(self, **kwargs) -> dict:
         self.posts.append(kwargs)
+        # A real WebClient answers with a SlackResponse carrying the new
+        # message's ts — that is how the handler learns which message it just
+        # posted, so the stand-in has to hand one back too.
+        self.post_ts.append(f"post{len(self.post_ts) + 1}.000")
+        return {"ok": True, "ts": self.post_ts[-1]}
 
     def chat_postEphemeral(self, **kwargs) -> None:
         self.posts.append(kwargs)
@@ -330,10 +336,18 @@ class _FakeApp:
 
 
 class _LifecycleStore:
-    def __init__(self, case_id="c1", get_error=None, last_action_ts="111.222") -> None:
+    def __init__(
+        self,
+        case_id="c1",
+        get_error=None,
+        last_turn_ts="111.222",
+        turn_ts_error=None,
+    ) -> None:
         self.case_id = case_id
         self.get_error = get_error
-        self.last_action_ts = last_action_ts
+        self.turn_ts_error = turn_ts_error
+        self.last_turn_ts = last_turn_ts
+        self.last_action_ts = last_turn_ts
         self.deleted: list[tuple] = []
 
     def get(self, team, channel, thread):
@@ -344,11 +358,18 @@ class _LifecycleStore:
     def delete(self, team, channel, thread):
         self.deleted.append((team, channel, thread))
 
+    def get_last_turn_ts(self, team, channel, thread):
+        if self.turn_ts_error:
+            raise self.turn_ts_error
+        return self.last_turn_ts
+
     def get_last_action_ts(self, team, channel, thread):
         return self.last_action_ts
 
-    def set_last_action_ts(self, team, channel, thread, ts):
-        self.last_action_ts = ts
+    def record_turn(self, team, channel, thread, *, turn_ts, action_ts):
+        if turn_ts is not None:
+            self.last_turn_ts = turn_ts
+        self.last_action_ts = action_ts
 
     def clear_last_action_ts(self, team, channel, thread):
         self.last_action_ts = None
@@ -510,11 +531,71 @@ def test_store_failure_still_settles_the_message():
 def test_stale_button_click_is_rejected_and_disabled():
     """Clicking a button from an older turn must strip buttons and notify user ephemerally."""
     fm = FakeFM()
-    # Store indicates active buttons are on a newer turn (e.g. ts=999.999), while clicked msg is 111.222
-    store = _LifecycleStore(last_action_ts="999.999")
+    # The thread has moved on to a newer turn (ts=999.999); the click is on the
+    # older 111.222 message.
+    store = _LifecycleStore(last_turn_ts="999.999")
     client = _run_click(fm, store)
 
     assert fm.turns == [], "Must not submit turn to backend"
     assert len(client.updates) == 1
     assert not _has_buttons(client.updates[0]), "Must disable stale buttons"
     assert any("previous turn and is no longer available" in p.get("text", "") for p in client.posts)
+
+
+def test_the_reply_s_new_buttons_become_the_current_turn():
+    """Regression: the ts came back as a SlackResponse, not a dict, so the
+    isinstance(resp, dict) gate recorded nothing — every fresh set of buttons
+    was left untracked and the stale-click guard never armed."""
+
+    class _DecidingFM:
+        """Answers the click with a turn that asks a new question."""
+
+        def __init__(self) -> None:
+            self.turns: list[tuple] = []
+
+        def submit_turn(self, case_id, **kwargs) -> TurnResult:
+            self.turns.append((case_id, kwargs))
+            return TurnResult(
+                agent_response="Should I proceed?",
+                suggested_actions=[
+                    {
+                        "type": "DECIDE",
+                        "label": "Yes",
+                        "payload": "yes",
+                        "intent": {
+                            "type": "confirmation",
+                            "confirmation_value": True,
+                        },
+                    }
+                ],
+            )
+
+    store = _LifecycleStore()
+    client = _run_click(_DecidingFM(), store)
+
+    reply_ts = client.post_ts[-1]
+    assert store.last_turn_ts == reply_ts, "the reply is now the current turn"
+    assert store.last_action_ts == reply_ts, "its buttons are the live ones"
+
+
+def test_a_plain_reply_still_becomes_the_current_turn():
+    """No buttons on the reply, but the turn marker still has to advance — it is
+    what rejects a click on the turn just superseded."""
+
+    store = _LifecycleStore()
+    client = _run_click(FakeFM(), store)
+
+    assert store.last_turn_ts == client.post_ts[-1]
+    assert store.last_action_ts is None
+
+
+def test_a_store_failure_in_the_stale_check_still_runs_the_click():
+    """The check lands after ack(), so an unguarded raise would drop the click
+    with nothing on screen: no reply, no notice, buttons still armed."""
+
+    fm = FakeFM()
+    store = _LifecycleStore(turn_ts_error=RuntimeError("closed database"))
+    client = _run_click(fm, store)
+
+    assert fm.turns, "the click must still reach the backend"
+    assert client.posts, "and its reply must still land in the thread"
