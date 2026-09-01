@@ -1,0 +1,32 @@
+# Keep the pinned dependencies current.
+#
+# Every dependency in this repository is pinned exactly, and deliberately so:
+# CI's lint and contract-drift jobs install specific versions of ruff and
+# datamodel-code-generator to stay reproducible, and the runtime image is built
+# from requirements.txt. The cost of that is that nothing moves on its own — a
+# security advisory only surfaces as a warning on `git push`, which is how
+# CVE-2025-71176 in pytest sat open for months (#55).
+#
+# Weekly, grouped so routine minor/patch bumps arrive as one reviewable PR;
+# majors come on their own, because those are the ones that need a real look.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    # Picks up both requirements.txt (runtime, shipped in the image) and
+    # requirements-dev.txt (linter, model generator, test runner).
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      python-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
