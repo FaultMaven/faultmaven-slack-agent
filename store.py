@@ -9,9 +9,12 @@ thread_ts)`` so it is already multi-workspace safe ahead of P5 OAuth.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class CaseStore:
@@ -30,11 +33,13 @@ class CaseStore:
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS thread_cases (
-                team_id    TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                thread_ts  TEXT NOT NULL,
-                case_id    TEXT NOT NULL,
-                seeded     INTEGER NOT NULL DEFAULT 0,
+                team_id        TEXT NOT NULL,
+                channel_id     TEXT NOT NULL,
+                thread_ts      TEXT NOT NULL,
+                case_id        TEXT NOT NULL,
+                seeded         INTEGER NOT NULL DEFAULT 0,
+                last_turn_ts   TEXT,
+                last_action_ts TEXT,
                 PRIMARY KEY (team_id, channel_id, thread_ts)
             )
             """
@@ -48,6 +53,13 @@ class CaseStore:
             )
         except sqlite3.OperationalError:
             pass  # column already exists (fresh create above, or already migrated)
+        for column in ("last_turn_ts", "last_action_ts"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE thread_cases ADD COLUMN {column} TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
 
     def get(self, team_id: str, channel_id: str, thread_ts: str) -> str | None:
@@ -102,6 +114,92 @@ class CaseStore:
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return bool(row and row[0])
+
+    def get_last_turn_ts(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> str | None:
+        """The Slack ts of the newest bot turn message in this thread.
+
+        This is what identifies the *current* turn: a button click carries no
+        proof of which turn rendered it, so a click on any other message is a
+        click from a turn the conversation has already moved past.
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_turn_ts FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def get_last_action_ts(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> str | None:
+        """Return the Slack ts of the last message in this thread with active buttons."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_action_ts FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def record_turn(
+        self,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        *,
+        turn_ts: str | None,
+        action_ts: str | None,
+    ) -> None:
+        """Point the thread at its newest turn message, and at its live buttons.
+
+        ``turn_ts=None`` keeps whatever turn is already on record — the reply
+        never landed, so the previous turn is still the newest one we know of,
+        and forgetting it would disarm the stale-click guard entirely.
+        ``action_ts=None`` records that no buttons are live.
+
+        This is an UPDATE, not an upsert (``case_id`` is NOT NULL, so there is
+        nothing sensible to insert): a thread whose row was evicted mid-turn
+        writes nothing, and that deserves a log line rather than a silent
+        no-op that leaves the caller believing the turn was recorded.
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE thread_cases "
+                "SET last_turn_ts=COALESCE(?, last_turn_ts), last_action_ts=? "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (turn_ts, action_ts, team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+            rowcount = cursor.rowcount
+        if rowcount == 0:
+            logger.warning(
+                "no thread_cases row for %s/%s/%s: turn %s not recorded "
+                "(this thread's stale-click guard is unarmed)",
+                team_id, channel_id, thread_ts, turn_ts or "?",
+            )
+
+    def clear_last_action_ts(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        """Record that this thread has no live choice buttons left.
+
+        Leaves the recorded turn alone: which turn is current is a separate
+        fact, and it stays true after the buttons come down.
+        """
+
+        with self._lock:
+            self._conn.execute(
+                "UPDATE thread_cases SET last_action_ts=NULL "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
 
     def delete(self, team_id: str, channel_id: str, thread_ts: str) -> None:
         """Evict a mapping whose case no longer exists server-side.

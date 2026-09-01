@@ -25,8 +25,10 @@ from store import CaseStore
 from ._turn import (
     CASE_GONE_TEXT,
     deliver_turn_result,
+    record_posted_turn,
     retry_may_help,
     run_gated,
+    stripped_blocks,
     turn_error_text,
     unlink_stale_case,
 )
@@ -55,22 +57,6 @@ def _plain(text: str) -> str:
     return text
 
 
-def _stripped_blocks(message: dict) -> tuple[list[dict], str]:
-    """The message's blocks without the ``actions`` block, plus fallback text.
-
-    Defensive: if the surface delivered a thinner message whose blocks carry no
-    section (so removing the ``actions`` block would leave the question blank),
-    rebuild a section from the message's fallback ``text`` — the question must
-    never vanish, leaving only the echoed choice with nothing it answered.
-    """
-
-    text = message.get("text") or "FaultMaven"
-    kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
-    if not any(b.get("type") == "section" for b in kept):
-        kept.insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": text}})
-    return kept, text
-
-
 def _rewrite(client: WebClient, body: dict, blocks: list[dict], text: str) -> None:
     """Replace the clicked message's blocks in place (the one ``chat_update``)."""
 
@@ -86,7 +72,7 @@ def _disable_actions(client: WebClient, body: dict) -> None:
     """Strip the buttons off the clicked message so the choice can't be re-sent,
     keeping the question itself visible."""
 
-    kept, text = _stripped_blocks(body["message"])
+    kept, text = stripped_blocks(body["message"])
     _rewrite(client, body, kept, text)
 
 
@@ -99,7 +85,7 @@ def _show_working(client: WebClient, body: dict, label: str) -> None:
     retry could survive, :func:`_restore_actions` puts the buttons back.
     """
 
-    kept, text = _stripped_blocks(body["message"])
+    kept, text = stripped_blocks(body["message"])
     working = (
         f":hourglass_flowing_sand: Working on *{_plain(label)}*…"
         if label
@@ -140,21 +126,62 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = message.get("thread_ts") or message["ts"]
         team_id = context.team_id or ""
 
+        # Stale-click guard: a click carries no proof of which turn rendered
+        # it, and Slack delivers it even when the message has since been
+        # rewritten (a client with a stale view, an offline queue), so taking
+        # the buttons down is not by itself enough. Compare the clicked message
+        # against the thread's current turn and reject anything older.
+        try:
+            current_turn_ts = store.get_last_turn_ts(team_id, channel, thread_ts)
+        except Exception as exc:  # noqa: BLE001
+            # ack() has already gone out, so an unguarded raise here would drop
+            # the click with nothing on screen. Fall back to the pre-guard
+            # behavior — run the turn — rather than swallowing it.
+            logger.warning("stale-click check failed in %s: %s", channel, exc)
+            current_turn_ts = None
+        if current_turn_ts and message.get("ts") != current_turn_ts:
+            user_id = (body.get("user") or {}).get("id")
+            try:
+                _disable_actions(client, body)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not disable stale actions in %s: %s", channel, exc)
+            if user_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user=user_id,
+                        text=":information_source: That choice was from a previous turn and is no longer available.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "could not post stale action notice to %s in %s: %s",
+                        user_id, channel, exc,
+                    )
+            return
+
+        last_posted_ts: str | None = None
+
         def post(text: str, blocks: list[dict] | None = None) -> bool:
             """Threaded post that reports failure instead of raising."""
-
+            nonlocal last_posted_ts
             try:
                 if blocks is None:
-                    client.chat_postMessage(
+                    resp = client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts, text=text
                     )
                 else:
-                    client.chat_postMessage(
+                    resp = client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
                         text=text,
                         blocks=blocks,
                     )
+                # chat_postMessage returns a SlackResponse, which is NOT a
+                # dict subclass — an isinstance(resp, dict) check here would
+                # silently never record anything. It does support .get().
+                if resp is not None:
+                    last_posted_ts = resp.get("ts")
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("post failed in %s: %s", channel, exc)
@@ -260,7 +287,10 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             # rendering guarded, blocks post, then escaped plain-text fallback
             # — a render failure must not skip the fallback or the button
             # strip below.
-            deliver_turn_result(post, result)
+            delivered_blocks = deliver_turn_result(post, result)
+            record_posted_turn(
+                store, team_id, channel, thread_ts, last_posted_ts, delivered_blocks
+            )
 
             # Settle the clicked message last: replace the transient "working…"
             # note with the clean stripped state (question kept, buttons gone

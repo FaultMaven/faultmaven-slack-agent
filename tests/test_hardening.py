@@ -339,6 +339,8 @@ class _Store:
         self.m: dict = {}
         self.deleted: list = []
         self.seeded: set = set()
+        self.turn_ts: dict = {}
+        self.action_ts: dict = {}
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
@@ -356,6 +358,20 @@ class _Store:
 
     def is_seeded(self, t, c, th):
         return (t, c, th) in self.seeded
+
+    def get_last_turn_ts(self, t, c, th):
+        return self.turn_ts.get((t, c, th))
+
+    def get_last_action_ts(self, t, c, th):
+        return self.action_ts.get((t, c, th))
+
+    def record_turn(self, t, c, th, *, turn_ts, action_ts):
+        if turn_ts is not None:
+            self.turn_ts[(t, c, th)] = turn_ts
+        self.action_ts[(t, c, th)] = action_ts
+
+    def clear_last_action_ts(self, t, c, th):
+        self.action_ts[(t, c, th)] = None
 
 
 class _FM:
