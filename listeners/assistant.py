@@ -23,10 +23,12 @@ from ._turn import (
     UNREADABLE_FILES_TEXT,
     Dedup,
     deliver_turn_result,
+    disable_previous_actions,
+    has_actions_blocks,
     offload_turn,
     resolve_query,
-    skipped_files_note,
     run_turn,
+    skipped_files_note,
     try_begin_turn,
     turn_error_text,
 )
@@ -77,15 +79,19 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         ):
             return
 
+        last_posted_ts: str | None = None
+
         def post(text: str, blocks: list[dict] | None = None) -> bool:
             """Guarded say(): log-and-False instead of raising, so a posting
             failure can never fall through to a handler that blames the turn."""
-
+            nonlocal last_posted_ts
             try:
                 if blocks is None:
-                    say(text)
+                    resp = say(text)
                 else:
-                    say(text=text, blocks=blocks)
+                    resp = say(text=text, blocks=blocks)
+                if isinstance(resp, dict):
+                    last_posted_ts = resp.get("ts")
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("assistant post failed in %s: %s", channel, exc)
@@ -93,6 +99,9 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
 
         def turn_work() -> None:
             try:
+                # When advancing to a new turn, make previous turn choice buttons unavailable.
+                disable_previous_actions(client, store, team_id, channel, thread_ts)
+
                 # No-ops when there are no files. Pasted snippets come back
                 # as text so the backend sees paste provenance, not a fake
                 # "Untitled" file upload; attachments beyond the one-file-
@@ -141,7 +150,12 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
             opening_case_id = (
                 store.get(team_id, channel, thread_ts) if first_turn else None
             )
-            deliver_turn_result(post, result, case_id=opening_case_id)
+            delivered_blocks = deliver_turn_result(post, result, case_id=opening_case_id)
+            if hasattr(store, "set_last_action_ts"):
+                if has_actions_blocks(delivered_blocks) and last_posted_ts:
+                    store.set_last_action_ts(team_id, channel, thread_ts, last_posted_ts)
+                else:
+                    store.clear_last_action_ts(team_id, channel, thread_ts)
 
         # set_status shows the native "investigating" indicator immediately, so
         # the offloaded download/turn has visible feedback in front of it. It's

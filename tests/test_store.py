@@ -60,3 +60,19 @@ def test_concurrent_writes_are_safe(tmp_path):
         assert all(store.get("T", "C", f"ts{i}") == f"case{i}" for i in range(50))
     finally:
         store.close()
+
+
+def test_last_action_ts_tracking(tmp_path):
+    path = str(tmp_path / "cases.db")
+    store = CaseStore(path)
+    try:
+        store.put("T", "C", "ts", "case1")
+        assert store.get_last_action_ts("T", "C", "ts") is None
+
+        store.set_last_action_ts("T", "C", "ts", "123.456")
+        assert store.get_last_action_ts("T", "C", "ts") == "123.456"
+
+        store.clear_last_action_ts("T", "C", "ts")
+        assert store.get_last_action_ts("T", "C", "ts") is None
+    finally:
+        store.close()

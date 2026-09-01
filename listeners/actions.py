@@ -24,7 +24,9 @@ from store import CaseStore
 
 from ._turn import (
     CASE_GONE_TEXT,
+    _stripped_blocks,
     deliver_turn_result,
+    has_actions_blocks,
     retry_may_help,
     run_gated,
     turn_error_text,
@@ -53,22 +55,6 @@ def _plain(text: str) -> str:
     for ch in "*_~`":
         text = text.replace(ch, "")
     return text
-
-
-def _stripped_blocks(message: dict) -> tuple[list[dict], str]:
-    """The message's blocks without the ``actions`` block, plus fallback text.
-
-    Defensive: if the surface delivered a thinner message whose blocks carry no
-    section (so removing the ``actions`` block would leave the question blank),
-    rebuild a section from the message's fallback ``text`` — the question must
-    never vanish, leaving only the echoed choice with nothing it answered.
-    """
-
-    text = message.get("text") or "FaultMaven"
-    kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
-    if not any(b.get("type") == "section" for b in kept):
-        kept.insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": text}})
-    return kept, text
 
 
 def _rewrite(client: WebClient, body: dict, blocks: list[dict], text: str) -> None:
@@ -140,21 +126,53 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = message.get("thread_ts") or message["ts"]
         team_id = context.team_id or ""
 
+        # Stale action guard: if the thread has advanced to a newer turn, reject
+        # this click from an older turn so it doesn't cut in out of context.
+        active_action_ts = (
+            store.get_last_action_ts(team_id, channel, thread_ts)
+            if hasattr(store, "get_last_action_ts")
+            else None
+        )
+        if active_action_ts and message.get("ts") != active_action_ts:
+            user_id = (body.get("user") or {}).get("id")
+            try:
+                _disable_actions(client, body)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not disable stale actions in %s: %s", channel, exc)
+            if user_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user=user_id,
+                        text=":information_source: That choice was from a previous turn and is no longer available.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "could not post stale action notice to %s in %s: %s",
+                        user_id, channel, exc,
+                    )
+            return
+
+        last_posted_ts: str | None = None
+
         def post(text: str, blocks: list[dict] | None = None) -> bool:
             """Threaded post that reports failure instead of raising."""
-
+            nonlocal last_posted_ts
             try:
                 if blocks is None:
-                    client.chat_postMessage(
+                    resp = client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts, text=text
                     )
                 else:
-                    client.chat_postMessage(
+                    resp = client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
                         text=text,
                         blocks=blocks,
                     )
+                if isinstance(resp, dict):
+                    last_posted_ts = resp.get("ts")
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("post failed in %s: %s", channel, exc)
@@ -260,7 +278,12 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             # rendering guarded, blocks post, then escaped plain-text fallback
             # — a render failure must not skip the fallback or the button
             # strip below.
-            deliver_turn_result(post, result)
+            delivered_blocks = deliver_turn_result(post, result)
+            if hasattr(store, "set_last_action_ts"):
+                if has_actions_blocks(delivered_blocks) and last_posted_ts:
+                    store.set_last_action_ts(team_id, channel, thread_ts, last_posted_ts)
+                else:
+                    store.clear_last_action_ts(team_id, channel, thread_ts)
 
             # Settle the clicked message last: replace the transient "working…"
             # note with the clean stripped state (question kept, buttons gone

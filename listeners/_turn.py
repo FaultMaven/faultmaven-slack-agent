@@ -282,13 +282,84 @@ def plain_fallback(agent_response: str) -> str:
     return text
 
 
+def _stripped_blocks(message: dict) -> tuple[list[dict], str]:
+    """The message's blocks without the ``actions`` block, plus fallback text.
+
+    Defensive: if the surface delivered a thinner message whose blocks carry no
+    section (so removing the ``actions`` block would leave the question blank),
+    rebuild a section from the message's fallback ``text`` — the question must
+    never vanish, leaving only the echoed choice with nothing it answered.
+    """
+
+    text = message.get("text") or "FaultMaven"
+    kept = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
+    if not any(b.get("type") == "section" for b in kept):
+        kept.insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    return kept, text
+
+
+def has_actions_blocks(blocks: list[dict] | None) -> bool:
+    """True if the blocks contain interactive button actions."""
+
+    return bool(blocks and any(b.get("type") == "actions" for b in blocks))
+
+
+def disable_previous_actions(
+    client: WebClient,
+    store: CaseStore,
+    team_id: str,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Strip choice buttons off any previous turn message in this thread.
+
+    Called when the conversation advances to a new turn so stale choice buttons
+    do not remain clickable out of context. Best-effort: never raises.
+    """
+
+    if not hasattr(store, "get_last_action_ts"):
+        return
+    last_action_ts = None
+    try:
+        last_action_ts = store.get_last_action_ts(team_id, channel, thread_ts)
+        if not last_action_ts:
+            return
+        store.clear_last_action_ts(team_id, channel, thread_ts)
+        resp = client.conversations_replies(
+            channel=channel,
+            ts=thread_ts,
+            latest=last_action_ts,
+            oldest=last_action_ts,
+            inclusive=True,
+            limit=1,
+        )
+        for msg in resp.get("messages", []):
+            if msg.get("ts") == last_action_ts:
+                if any(b.get("type") == "actions" for b in msg.get("blocks", [])):
+                    kept, text = _stripped_blocks(msg)
+                    client.chat_update(
+                        channel=channel,
+                        ts=last_action_ts,
+                        blocks=kept,
+                        text=text,
+                    )
+                break
+    except Exception as exc:  # noqa: BLE001 — disabling old buttons is best-effort
+        logger.warning(
+            "could not disable previous action buttons in %s (ts=%s): %s",
+            channel,
+            last_action_ts or "?",
+            exc,
+        )
+
+
 def deliver_turn_result(
     post,
     result: TurnResult,
     *,
     case_id: str | None = None,
     decorate=None,
-) -> None:
+) -> list[dict] | None:
     """Render and post a COMMITTED turn via ``post(text, blocks) -> bool``.
 
     ``post`` must be guarded (log-and-return-False, never raise). The backend
@@ -296,7 +367,8 @@ def deliver_turn_result(
     failure, blocks rejected, plain retry — avoids "try again"; the last
     resort is a plain-text reply, and total posting failure is the caller's
     logs, never a retry prompt. ``decorate`` may mutate the built blocks
-    (addressing, intro notes) and is guarded with the rendering.
+    (addressing, intro notes) and is guarded with the rendering. Returns the
+    delivered blocks on success, or None on degradation.
     """
 
     blocks = None
@@ -307,8 +379,9 @@ def deliver_turn_result(
     except Exception as exc:  # noqa: BLE001 — rendering must not eat a committed turn
         logger.exception("rendering turn result failed: %s", exc)
     if blocks is not None and post(notification_text(result), blocks):
-        return
+        return blocks
     post(plain_fallback(result.agent_response), None)
+    return None
 
 
 def unlink_stale_case(
@@ -756,6 +829,9 @@ def run_turn_and_post(
         if placeholder_ts is None:
             return
 
+    # When advancing to a new turn, make previous turn choice buttons unavailable.
+    disable_previous_actions(client, store, team_id, channel, thread_ts)
+
     def update(text_: str, blocks_: list[dict] | None = None) -> bool:
         """chat_update that reports failure instead of raising (never strands
         the placeholder by letting an exception skip later recovery)."""
@@ -810,6 +886,11 @@ def run_turn_and_post(
                 }
             )
 
-    deliver_turn_result(
+    delivered_blocks = deliver_turn_result(
         update, result, case_id=opening_case_id, decorate=decorate
     )
+    if hasattr(store, "set_last_action_ts"):
+        if has_actions_blocks(delivered_blocks):
+            store.set_last_action_ts(team_id, channel, thread_ts, placeholder_ts)
+        else:
+            store.clear_last_action_ts(team_id, channel, thread_ts)

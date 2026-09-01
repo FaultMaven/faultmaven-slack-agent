@@ -330,9 +330,10 @@ class _FakeApp:
 
 
 class _LifecycleStore:
-    def __init__(self, case_id="c1", get_error=None) -> None:
+    def __init__(self, case_id="c1", get_error=None, last_action_ts="111.222") -> None:
         self.case_id = case_id
         self.get_error = get_error
+        self.last_action_ts = last_action_ts
         self.deleted: list[tuple] = []
 
     def get(self, team, channel, thread):
@@ -342,6 +343,15 @@ class _LifecycleStore:
 
     def delete(self, team, channel, thread):
         self.deleted.append((team, channel, thread))
+
+    def get_last_action_ts(self, team, channel, thread):
+        return self.last_action_ts
+
+    def set_last_action_ts(self, team, channel, thread, ts):
+        self.last_action_ts = ts
+
+    def clear_last_action_ts(self, team, channel, thread):
+        self.last_action_ts = None
 
 
 class _FailingFM:
@@ -495,3 +505,16 @@ def test_store_failure_still_settles_the_message():
     assert len(client.updates) >= 2, "the working note must be settled, not stranded"
     assert _has_buttons(client.updates[-1])  # a transient failure re-arms
     assert not _working_note(client.updates[-1])
+
+
+def test_stale_button_click_is_rejected_and_disabled():
+    """Clicking a button from an older turn must strip buttons and notify user ephemerally."""
+    fm = FakeFM()
+    # Store indicates active buttons are on a newer turn (e.g. ts=999.999), while clicked msg is 111.222
+    store = _LifecycleStore(last_action_ts="999.999")
+    client = _run_click(fm, store)
+
+    assert fm.turns == [], "Must not submit turn to backend"
+    assert len(client.updates) == 1
+    assert not _has_buttons(client.updates[0]), "Must disable stale buttons"
+    assert any("previous turn and is no longer available" in p.get("text", "") for p in client.posts)

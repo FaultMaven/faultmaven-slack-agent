@@ -7,8 +7,9 @@ from __future__ import annotations
 import importlib.util
 import sys
 
-from faultmaven.client import TurnResult
 from slack_sdk.errors import SlackApiError
+
+from faultmaven.client import TurnResult
 
 _seq = 0
 
@@ -25,8 +26,9 @@ def _load_turn():
 
 
 class FakeClient:
-    def __init__(self, *, fail_post: bool = False) -> None:
+    def __init__(self, *, fail_post: bool = False, replies: list | None = None) -> None:
         self.fail_post = fail_post
+        self.replies = replies or []
         self.posts: list = []
         self.updates: list = []
 
@@ -40,23 +42,28 @@ class FakeClient:
         self.updates.append(kw)
         return {"ok": True}
 
+    def conversations_replies(self, **kw):
+        return {"messages": self.replies}
+
 
 class FakeFM:
-    def __init__(self) -> None:
+    def __init__(self, result: TurnResult | None = None) -> None:
         self.turns: list = []
+        self.result = result or TurnResult(agent_response="on it")
 
     def create_case(self, *, title=None, initial_message=None):
         return "case_1"
 
     def submit_turn(self, case_id, **kwargs):
         self.turns.append((case_id, kwargs))
-        return TurnResult(agent_response="on it")
+        return self.result
 
 
 class FakeStore:
     def __init__(self) -> None:
         self.m: dict = {}
         self.seeded: set = set()
+        self.last_action: dict = {}
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
@@ -69,6 +76,18 @@ class FakeStore:
 
     def is_seeded(self, t, c, th):
         return (t, c, th) in self.seeded
+
+    def get_last_action_ts(self, t, c, th):
+        return self.last_action.get((t, c, th))
+
+    def set_last_action_ts(self, t, c, th, ts):
+        if ts is None:
+            self.last_action.pop((t, c, th), None)
+        else:
+            self.last_action[(t, c, th)] = ts
+
+    def clear_last_action_ts(self, t, c, th):
+        self.last_action.pop((t, c, th), None)
 
 
 _COMMON = dict(channel="C", thread_ts="TS", team_id="T")
@@ -147,3 +166,49 @@ def test_forwards_files_to_submit_turn():
     )
     _, kw = fm.turns[0]
     assert kw["files"] == files
+
+
+def test_disables_previous_turn_actions_when_new_turn_runs():
+    _turn = _load_turn()
+    prev_msg = {
+        "ts": "PREV_ACTION_TS",
+        "text": "Choose an option:",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Choose an option:"}},
+            {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Yes"}}]},
+        ],
+    }
+    client = FakeClient(replies=[prev_msg])
+    fm = FakeFM()
+    store = FakeStore()
+    store.put("T", "C", "TS", "case_1")
+    store.set_last_action_ts("T", "C", "TS", "PREV_ACTION_TS")
+
+    _turn.run_turn_and_post(client, fm, store, text="next turn query", **_COMMON)
+
+    # Verify previous message buttons were stripped
+    assert len(client.updates) >= 2
+    prev_update = client.updates[0]
+    assert prev_update["ts"] == "PREV_ACTION_TS"
+    assert not any(b["type"] == "actions" for b in prev_update["blocks"])
+    assert any("Choose an option:" in b["text"]["text"] for b in prev_update["blocks"] if b["type"] == "section")
+
+
+def test_records_last_action_ts_when_turn_has_decide_buttons():
+    _turn = _load_turn()
+    client = FakeClient()
+    result_with_buttons = TurnResult(
+        agent_response="Should I proceed?",
+        suggested_actions=[
+            {
+                "type": "DECIDE",
+                "label": "Yes proceed",
+                "payload": "yes",
+                "intent": {"type": "confirmation", "confirmation_value": True},
+            }
+        ],
+    )
+    fm = FakeFM(result=result_with_buttons)
+    store = FakeStore()
+    _turn.run_turn_and_post(client, fm, store, text="hello", placeholder_ts="PH_ACTION", **_COMMON)
+    assert store.get_last_action_ts("T", "C", "TS") == "PH_ACTION"

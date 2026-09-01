@@ -30,11 +30,12 @@ class CaseStore:
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS thread_cases (
-                team_id    TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                thread_ts  TEXT NOT NULL,
-                case_id    TEXT NOT NULL,
-                seeded     INTEGER NOT NULL DEFAULT 0,
+                team_id        TEXT NOT NULL,
+                channel_id     TEXT NOT NULL,
+                thread_ts      TEXT NOT NULL,
+                case_id        TEXT NOT NULL,
+                seeded         INTEGER NOT NULL DEFAULT 0,
+                last_action_ts TEXT,
                 PRIMARY KEY (team_id, channel_id, thread_ts)
             )
             """
@@ -48,6 +49,13 @@ class CaseStore:
             )
         except sqlite3.OperationalError:
             pass  # column already exists (fresh create above, or already migrated)
+        try:
+            self._conn.execute(
+                "ALTER TABLE thread_cases "
+                "ADD COLUMN last_action_ts TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     def get(self, team_id: str, channel_id: str, thread_ts: str) -> str | None:
@@ -102,6 +110,39 @@ class CaseStore:
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return bool(row and row[0])
+
+    def get_last_action_ts(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> str | None:
+        """Return the Slack ts of the last message in this thread with active buttons."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_action_ts FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_last_action_ts(
+        self, team_id: str, channel_id: str, thread_ts: str, action_ts: str | None
+    ) -> None:
+        """Record or clear the active action buttons message ts."""
+
+        with self._lock:
+            self._conn.execute(
+                "UPDATE thread_cases SET last_action_ts=? "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (action_ts, team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+
+    def clear_last_action_ts(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        """Clear the active action buttons message ts."""
+
+        self.set_last_action_ts(team_id, channel_id, thread_ts, None)
 
     def delete(self, team_id: str, channel_id: str, thread_ts: str) -> None:
         """Evict a mapping whose case no longer exists server-side.
