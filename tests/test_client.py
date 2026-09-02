@@ -456,14 +456,14 @@ def test_reauth_converges_on_one_token_without_blanking():
         return httpx.Response(200, json={})
 
     client = make_client(handler, dev="admin")
-    client._token = "stale"
+    client._default.token = "stale"
 
     barrier = threading.Barrier(2)
     results: list[str] = []
 
     def go() -> None:
         barrier.wait()
-        results.append(client._reauth("stale"))
+        results.append(client._reauth(client._default, "stale"))
 
     threads = [threading.Thread(target=go) for _ in range(2)]
     for t in threads:
@@ -472,8 +472,8 @@ def test_reauth_converges_on_one_token_without_blanking():
         t.join()
 
     assert len(set(results)) == 1  # both racers converge on the same token
-    assert client._token == results[0]  # and it's the one that got stored
-    assert client._token not in ("", "stale")  # never blanked; stale replaced
+    assert client._default.token == results[0]  # and it's the one that got stored
+    assert client._default.token not in ("", "stale")  # never blanked; stale replaced
 
 
 def test_current_token_converges_without_blanking_under_concurrency():
@@ -492,7 +492,7 @@ def test_current_token_converges_without_blanking_under_concurrency():
 
     def go() -> None:
         barrier.wait()
-        tokens.append(client._current_token())
+        tokens.append(client._current_token(client._default))
 
     threads = [threading.Thread(target=go) for _ in range(8)]
     for t in threads:
@@ -501,8 +501,8 @@ def test_current_token_converges_without_blanking_under_concurrency():
         t.join()
 
     assert len(set(tokens)) == 1  # all converge on one stored token
-    assert client._token == tokens[0]
-    assert client._token != ""
+    assert client._default.token == tokens[0]
+    assert client._default.token != ""
     assert 1 <= logins["n"] <= 8  # bounded herd — never serialized, never unbounded
 
 
@@ -515,7 +515,7 @@ def test_dev_login_404_raises_clear_error():
 def test_startup_is_non_fatal_when_auth_unavailable():
     client = make_client(lambda req: httpx.Response(404, json={}), dev="admin")
     client.startup()  # must not raise
-    assert client._token == ""
+    assert client._default.token == ""
 
 
 def test_ensure_token_errors_without_token_or_devlogin():

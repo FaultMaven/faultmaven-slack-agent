@@ -34,6 +34,7 @@ faultmaven-slack-agent/
 ├── app.py                # Bolt app builder (dual transport: http | socket)
 ├── web.py                # FastAPI host for the HTTP/OAuth transport (+ /health)
 ├── oauth_store.py        # multi-workspace OAuth Installation + state stores (Postgres)
+├── workspace_credentials.py  # Slack workspace → FaultMaven org/Team credential binding
 ├── config.py             # Settings + per-transport env validation (fail-fast)
 ├── store.py              # thread→case map (SQLite)
 ├── rendering.py          # TurnResult → Block Kit
@@ -77,6 +78,17 @@ How the agent authenticates to the FaultMaven backend, in precedence order:
 | `FAULTMAVEN_REFRESH_TOKEN` | Backend runs `AUTH_MODE=oauth` (cloud), where dev-login is not served. Provisioned on the backend with `fm-provision-service-account` (pass `-o <organization-id>` against a multi-tenant backend); the agent renews and rotates it automatically. See [docs/HOSTING.md](docs/HOSTING.md#service-account-credentials-oauth-mode-backends). |
 | `FAULTMAVEN_API_TOKEN` | A static bearer you supply. Cannot be renewed. |
 | `FAULTMAVEN_DEV_LOGIN_USERNAME` | Neither of the above set — bootstraps via `/api/v1/auth/dev-login` (local `AUTH_MODE` only). |
+
+**Multi-workspace (hosted) deployments** authenticate each turn as the FaultMaven
+`slack` service account bound to *that Slack workspace* (ADR-013 §D3), so its
+cases are owned in the right Organization and auto-share to the right Team. Those
+per-workspace credentials live beside the installations in `SLACK_DATABASE_URL`;
+the table above then describes only the fallback used by workspaces that have not
+been bound yet. Set **`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`** against a
+multi-tenant backend to refuse an unbound workspace instead: the fallback account
+carries one particular organization, so answering on it would file another
+customer's incident inside that tenant. See [docs/design.md](docs/design.md)
+§10.1.
 
 **Testing in a real workspace?** Follow the step-by-step runbook in
 [docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,

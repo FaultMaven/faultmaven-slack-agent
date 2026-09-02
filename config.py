@@ -132,6 +132,20 @@ class Settings(BaseSettings):
     credential_store_path: str = Field(
         default="data/credentials.db", validation_alias="CREDENTIAL_STORE_PATH"
     )
+    # Refuse a turn from a Slack workspace that has no FaultMaven credential
+    # bound to it (ADR-013 D3), instead of answering it as the process-wide
+    # default account.
+    #
+    # MUST be true against a multi-tenant (cloud) backend. There, the default
+    # account carries some *particular* organization in its token chain, so
+    # answering an unbound workspace does not degrade — it files that customer's
+    # incident inside another tenant. Off by default only so a deployment
+    # running today's single shared service account keeps working until its
+    # workspaces are bound; each fallback logs a warning naming the workspace.
+    faultmaven_require_workspace_binding: bool = Field(
+        default=False,
+        validation_alias="FAULTMAVEN_REQUIRE_WORKSPACE_BINDING",
+    )
 
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
@@ -201,6 +215,19 @@ class Settings(BaseSettings):
                     + ", ".join(missing)
                     + " (from the app's Basic Information → App Credentials)"
                 )
+
+        if (
+            self.faultmaven_require_workspace_binding
+            and self.slack_transport != "http"
+        ):
+            # Bindings live in the OAuth store, which only the HTTP transport
+            # has. Under Socket Mode nothing could ever be bound, so this would
+            # refuse every turn — a silent, total outage. Say so at boot.
+            raise ValueError(
+                "FAULTMAVEN_REQUIRE_WORKSPACE_BINDING needs SLACK_TRANSPORT=http: "
+                "per-workspace credentials live in the OAuth store, which Socket "
+                "Mode does not have, so every turn would be refused"
+            )
         return self
 
     @field_validator("faultmaven_api_url")

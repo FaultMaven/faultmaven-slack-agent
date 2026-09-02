@@ -34,6 +34,7 @@ from faultmaven import (
     FaultMavenCredentialError,
     FaultMavenRateLimitError,
     FaultMavenTimeoutError,
+    FaultMavenWorkspaceUnlinkedError,
     TurnResult,
 )
 from rendering import build_turn_blocks
@@ -96,6 +97,16 @@ CASE_BUSY_TEXT = (
 CREDENTIAL_ERROR_TEXT = (
     ":warning: I can't sign in to FaultMaven right now, so I can't work on "
     "this. This needs an admin to restore my access — retrying won't help."
+)
+# This workspace has no FaultMaven credential bound to it (ADR-013 D3), so there
+# is no organization its cases could correctly belong to. Deliberately says
+# "isn't connected" rather than reporting a fault: nothing is broken, the install
+# is simply not finished, and the fix belongs to a FaultMaven org admin rather
+# than to whoever is standing in the channel.
+WORKSPACE_UNLINKED_TEXT = (
+    ":link: This Slack workspace isn't connected to a FaultMaven organization "
+    "yet, so I can't open an investigation here. A FaultMaven admin for your "
+    "organization needs to finish linking it."
 )
 # The failure came from our own teardown, not the turn: say so.
 RESTARTING_TEXT = (
@@ -184,6 +195,13 @@ def turn_error_text(exc: Exception) -> str:
     # false promise.
     if isinstance(exc, FaultMavenCredentialError):
         return CREDENTIAL_ERROR_TEXT
+    # Above the shutdown override for the same reason as the credential rule: an
+    # unbound workspace stays unbound across our restart, so "resend in a minute"
+    # would be a false promise. Refusing is the designed behavior, not a fault —
+    # answering as the default account would file this workspace's case inside
+    # another tenant.
+    if isinstance(exc, FaultMavenWorkspaceUnlinkedError):
+        return WORKSPACE_UNLINKED_TEXT
     # Above the shutdown override for the credential rule's reason: a concluded
     # case is PERMANENT, so "resend it in a minute" is a promise the restart
     # cannot keep — the resend fails identically, forever. That is exactly what
@@ -246,7 +264,13 @@ def retry_may_help(exc: Exception) -> bool:
     """
 
     if isinstance(
-        exc, (FaultMavenTimeoutError, FaultMavenCredentialError, CaseTerminalError)
+        exc,
+        (
+            FaultMavenTimeoutError,
+            FaultMavenCredentialError,
+            FaultMavenWorkspaceUnlinkedError,
+            CaseTerminalError,
+        ),
     ):
         return False
     if _shutting_down.is_set():
@@ -725,9 +749,12 @@ def run_turn(
       Slack-forwarded alert from the same alert pasted into the Copilot.
     """
 
+    # ``team_id`` selects which FaultMaven service account owns this case and,
+    # through that account's Team membership, who the case auto-shares to
+    # (ADR-013 D3) — so it is passed on every call, not just used as a store key.
     case_id = store.get(team_id, channel_id, thread_ts)
     if case_id is None:
-        case_id = fm.create_case(title=None)
+        case_id = fm.create_case(title=None, team_id=team_id)
         # Map the thread immediately (unseeded) so the thread stays linked
         # even if this first submit fails: in-thread retries keep routing to
         # the case, and a timed-out-but-committed first turn stays reachable.
@@ -757,9 +784,10 @@ def run_turn(
                 observed_at=observed_at,
                 files=files or None,
                 input_type="paste" if pasted_content else None,
+                team_id=team_id,
             )
         else:
-            result = fm.submit_turn(case_id, query=text)
+            result = fm.submit_turn(case_id, query=text, team_id=team_id)
     except CaseNotFoundError:
         # Case deleted server-side (dashboard delete, DB reset) — evict the
         # stale mapping so the NEXT message starts fresh instead of routing

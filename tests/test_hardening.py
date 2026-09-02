@@ -244,7 +244,7 @@ def test_preset_token_is_never_wiped_on_401():
         client.create_case(title=None)
     assert err.value.status_code == 401
     assert calls["dev_logins"] == 0  # never tried to replace a preset token
-    assert client._token == "preset"  # kept: a transient 401 self-heals
+    assert client._default.token == "preset"  # kept: a transient 401 self-heals
 
 
 # -- turn_error_text mapping ------------------------------------------------------
@@ -379,7 +379,7 @@ class _FM:
         self.fail = fail
         self.turns: list = []
 
-    def create_case(self, *, title=None, initial_message=None):
+    def create_case(self, *, title=None, initial_message=None, team_id=None):
         return "case_1"
 
     def submit_turn(self, case_id, **kwargs):

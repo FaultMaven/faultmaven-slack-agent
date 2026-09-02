@@ -10,6 +10,7 @@ from .client import (
     FaultMavenCredentialError,
     FaultMavenError,
     FaultMavenTimeoutError,
+    FaultMavenWorkspaceUnlinkedError,
     TurnResult,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "FaultMavenCredentialError",
     "FaultMavenError",
     "FaultMavenTimeoutError",
+    "FaultMavenWorkspaceUnlinkedError",
     "TurnResult",
 ]

@@ -35,9 +35,17 @@ from ._turn import (
 
 
 def apply_action(
-    fm: FaultMavenClient, case_id: str, value_json: str
+    fm: FaultMavenClient, case_id: str, value_json: str, *, team_id: str
 ) -> TurnResult:
-    """Submit the turn encoded in a button's ``value`` and return the result."""
+    """Submit the turn encoded in a button's ``value`` and return the result.
+
+    ``team_id`` is required, not optional: a button click is a turn like any
+    other, so it must authenticate as its own workspace's service account
+    (ADR-013 D3). Defaulting it here would send the click under the process-wide
+    credential, which against a multi-tenant backend cannot see the workspace's
+    case at all — and the 404 that follows is mapped to ``CaseNotFoundError``,
+    whose handler unlinks a thread→case mapping that was never stale.
+    """
 
     value = json.loads(value_json)
     return fm.submit_turn(
@@ -45,6 +53,7 @@ def apply_action(
         query=value.get("q"),
         intent_type=value.get("it"),
         intent_data=value.get("id"),
+        team_id=team_id,
     )
 
 
@@ -252,7 +261,9 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                             "case. Please @mention me to continue."
                         )
                         return None
-                    return apply_action(fm, case_id, action["value"])
+                    return apply_action(
+                        fm, case_id, action["value"], team_id=team_id
+                    )
                 except CaseNotFoundError:
                     # Only apply_action raises this, so case_id is set.
                     unlink_stale_case(store, team_id, channel, thread_ts, case_id)

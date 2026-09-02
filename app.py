@@ -23,6 +23,7 @@ import logging
 import signal
 import time
 from pathlib import Path
+from typing import Any
 
 from slack_bolt import App
 from slack_bolt.oauth.oauth_settings import OAuthSettings
@@ -38,7 +39,7 @@ from credentials import CredentialStore
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
-from oauth_store import build_oauth_stores
+from oauth_store import OAuthStores, build_oauth_stores
 from store import CaseStore
 
 logger = logging.getLogger("faultmaven.slack")
@@ -59,11 +60,20 @@ _MAX_DISCONNECTED_SECONDS = 600.0
 _SHUTDOWN_DRAIN_HEADROOM_SECONDS = 10.0
 
 
-def make_fault_client(settings: Settings) -> FaultMavenClient:
+def make_fault_client(
+    settings: Settings, workspace_credentials: Any = None
+) -> FaultMavenClient:
     """Build the FaultMaven API client from settings.
 
     Shared by the runtime (:func:`build_app`) and the preflight doctor so the
     client wiring has one definition and can't drift between them.
+
+    ``workspace_credentials`` is the per-workspace binding store (ADR-013 D3).
+    When it is passed, a turn authenticates as the credential bound to its Slack
+    workspace and falls back to the credential below only while
+    ``FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`` is off — see
+    :class:`faultmaven.client.FaultMavenWorkspaceUnlinkedError` for why that
+    fallback is unsafe against a multi-tenant backend.
 
     The credential store is created when a refresh credential is configured, or
     when one has already been persisted and nothing more explicit is set — so a
@@ -99,6 +109,8 @@ def make_fault_client(settings: Settings) -> FaultMavenClient:
         refresh_token=settings.faultmaven_refresh_token,
         credential_store=credential_store,
         oauth_client_id=settings.faultmaven_oauth_client_id,
+        workspace_credentials=workspace_credentials,
+        require_workspace_binding=settings.faultmaven_require_workspace_binding,
     )
 
 
@@ -126,7 +138,9 @@ def make_web_client(token: str | None = None) -> WebClient:
     )
 
 
-def _build_core(settings: Settings) -> tuple[CaseStore, FaultMavenClient]:
+def _build_core(
+    settings: Settings, workspace_credentials: Any = None
+) -> tuple[CaseStore, FaultMavenClient]:
     """Build the transport-independent dependencies: FM client + case store.
 
     Does NOT call ``fm.startup()`` — the token bootstrap makes a (best-effort)
@@ -135,7 +149,7 @@ def _build_core(settings: Settings) -> tuple[CaseStore, FaultMavenClient]:
     HTTP, never blocks before uvicorn binds the port).
     """
 
-    fm = make_fault_client(settings)
+    fm = make_fault_client(settings, workspace_credentials)
 
     store = CaseStore(settings.case_store_path)
     # The store is the source of truth for thread→case; make its resolved
@@ -145,18 +159,18 @@ def _build_core(settings: Settings) -> tuple[CaseStore, FaultMavenClient]:
     return store, fm
 
 
-def _oauth_settings(settings: Settings) -> OAuthSettings:
+def _oauth_settings(settings: Settings, stores: OAuthStores) -> OAuthSettings:
     """Bolt OAuth config: per-team InstallationStore + CSRF state store.
 
     The scopes here mirror ``manifest.json`` (see :data:`DEFAULT_BOT_SCOPES`) —
     they are what the authorize URL requests; the redirect URI is derived from
     the request unless pinned via ``SLACK_OAUTH_REDIRECT_URI``.
+
+    Takes already-built ``stores`` rather than building them: the FM client needs
+    the workspace-credential store from the same engine, and building twice would
+    give the two halves of the process separate connection pools over one file.
     """
 
-    stores = build_oauth_stores(
-        database_url=settings.slack_database_url,
-        client_id=settings.slack_client_id,
-    )
     return OAuthSettings(
         client_id=settings.slack_client_id,
         client_secret=settings.slack_client_secret,
@@ -177,18 +191,26 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
 
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
-    store, fm = _build_core(settings)
 
     if settings.slack_transport == "http":
+        # Built before the core: the FM client authenticates per workspace off
+        # the credential store that rides this same engine (ADR-013 D3), so the
+        # stores have to exist before the client does.
+        stores = build_oauth_stores(
+            database_url=settings.slack_database_url,
+            client_id=settings.slack_client_id,
+        )
+        store, fm = _build_core(settings, stores.workspace_credentials)
         # Pass a tokenless base client so Bolt copies its retry handlers onto
         # the per-team clients it builds from InstallationStore tokens; the
         # oauth_settings drive per-request authorization, not this client.
         app = App(
             client=make_web_client(),
             signing_secret=settings.slack_signing_secret,
-            oauth_settings=_oauth_settings(settings),
+            oauth_settings=_oauth_settings(settings, stores),
         )
     else:
+        store, fm = _build_core(settings)
         app = App(
             client=make_web_client(settings.slack_bot_token),
             signing_secret=settings.slack_signing_secret or None,

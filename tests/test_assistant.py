@@ -34,7 +34,7 @@ class _FakeFM:
         self.turns: list = []
         self.result = result or TurnResult(agent_response="on it")
 
-    def create_case(self, *, title=None, initial_message=None):
+    def create_case(self, *, title=None, initial_message=None, team_id=None):
         return "case_1"
 
     def submit_turn(self, case_id, **kwargs):

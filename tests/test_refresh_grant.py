@@ -105,7 +105,7 @@ def test_renewal_posts_the_refresh_grant():
 
     client = make_client(handler)
 
-    assert client._current_token() == "at-1"
+    assert client._current_token(client._default) == "at-1"
     assert seen["url"] == "http://test/api/v1/auth/oauth/token"
     assert seen["body"]["grant_type"] == "refresh_token"
     assert seen["body"]["refresh_token"] == "seed-rt"
@@ -121,8 +121,8 @@ def test_access_token_is_reused_until_it_nears_expiry():
 
     client = make_client(handler)
 
-    assert client._current_token() == "at-1"
-    assert client._current_token() == "at-1"
+    assert client._current_token(client._default) == "at-1"
+    assert client._current_token(client._default) == "at-1"
     assert calls["n"] == 1
 
 
@@ -136,8 +136,8 @@ def test_short_lived_access_token_is_renewed_on_next_use():
 
     client = make_client(handler)
 
-    assert client._current_token() == "at-1"
-    assert client._current_token() == "at-2"
+    assert client._current_token(client._default) == "at-1"
+    assert client._current_token(client._default) == "at-2"
 
 
 # -- rotation persistence -----------------------------------------------------
@@ -145,10 +145,10 @@ def test_rotated_token_is_persisted():
     store = FakeStore(token="stored-rt")
     client = make_client(lambda r: token_response(refresh="rt-next"), store=store)
 
-    client._current_token()
+    client._current_token(client._default)
 
     assert store.puts == ["rt-next"]
-    assert client._refresh_token == "rt-next"
+    assert client._default.refresh_token == "rt-next"
 
 
 def test_persisted_credential_wins_over_the_configured_seed():
@@ -157,7 +157,7 @@ def test_persisted_credential_wins_over_the_configured_seed():
     store = FakeStore(token="rotated-rt")
     client = make_client(lambda r: token_response(), refresh_token="seed-rt", store=store)
 
-    assert client._refresh_token == "rotated-rt"
+    assert client._default.refresh_token == "rotated-rt"
 
 
 def test_configured_seed_is_written_to_an_empty_store():
@@ -184,7 +184,7 @@ def test_concurrent_renewals_issue_exactly_one_request():
     results: list[str] = []
 
     threads = [
-        threading.Thread(target=lambda: results.append(client._current_token()))
+        threading.Thread(target=lambda: results.append(client._current_token(client._default)))
         for _ in range(8)
     ]
     for t in threads:
@@ -218,7 +218,7 @@ def test_rejected_credential_names_the_recovery_step(status):
     )
 
     with pytest.raises(FaultMavenCredentialError) as exc:
-        client._current_token()
+        client._current_token(client._default)
 
     assert "provision_service_account" in str(exc.value)
 
@@ -236,7 +236,7 @@ def test_the_refusal_reaches_the_operator_in_the_rfc_shape():
     client = make_client(lambda r: httpx.Response(400, json=REJECTED_GRANT))
 
     with pytest.raises(FaultMavenCredentialError) as exc:
-        client._current_token()
+        client._current_token(client._default)
 
     message = str(exc.value)
     assert "invalid_grant" in message
@@ -252,7 +252,7 @@ def test_a_detail_body_is_still_read():
     )
 
     with pytest.raises(FaultMavenCredentialError) as exc:
-        client._current_token()
+        client._current_token(client._default)
 
     assert "something else entirely" in str(exc.value)
 
@@ -272,7 +272,7 @@ def test_rejected_stored_credential_falls_back_to_a_fresh_seed():
     store = FakeStore(token="dead-rt")
     client = make_client(handler, refresh_token="fresh-seed", store=store)
 
-    assert client._current_token() == "at-1"
+    assert client._current_token(client._default) == "at-1"
     assert presented == ["dead-rt", "fresh-seed"]
 
 
@@ -287,7 +287,7 @@ def test_rejected_credential_with_no_alternative_does_not_retry():
     client = make_client(handler, refresh_token="same-rt", store=store)
 
     with pytest.raises(FaultMavenCredentialError):
-        client._current_token()
+        client._current_token(client._default)
     assert calls["n"] == 1
 
 
@@ -299,7 +299,7 @@ def test_renewal_without_a_rotated_token_is_an_error():
     )
 
     with pytest.raises(FaultMavenError, match="no refresh_token"):
-        client._current_token()
+        client._current_token(client._default)
 
 
 # -- interaction with the request path ---------------------------------------
@@ -331,7 +331,7 @@ def test_refresh_grant_takes_precedence_over_dev_login():
         return token_response()
 
     client = make_client(handler, dev_login_username="slack-agent")
-    client._current_token()
+    client._current_token(client._default)
 
     assert paths == ["/api/v1/auth/oauth/token"]
 
@@ -340,15 +340,15 @@ def test_refresh_grant_takes_precedence_over_dev_login():
 def test_credential_is_due_for_renewal_near_expiry():
     client = make_client(lambda r: token_response())
 
-    client._refresh_token = jwt_with_exp(time.time() + 3600)
-    assert client._refresh_credential_is_due() is True
+    client._default.refresh_token = jwt_with_exp(time.time() + 3600)
+    assert client._refresh_credential_is_due(client._default) is True
 
 
 def test_credential_is_not_due_when_the_window_is_wide_open():
     client = make_client(lambda r: token_response())
 
-    client._refresh_token = jwt_with_exp(time.time() + 7 * 24 * 3600)
-    assert client._refresh_credential_is_due() is False
+    client._default.refresh_token = jwt_with_exp(time.time() + 7 * 24 * 3600)
+    assert client._refresh_credential_is_due(client._default) is False
 
 
 def test_jwt_expiry_reads_exp_and_tolerates_junk():
@@ -417,7 +417,7 @@ def test_client_factory_wires_the_credential_store(monkeypatch, tmp_path):
     client = make_fault_client(settings)
 
     assert client._credential_store is not None
-    assert client._refresh_token == "seed"
+    assert client._default.refresh_token == "seed"
     client.close()
 
 
@@ -445,7 +445,7 @@ def test_client_factory_uses_an_existing_store_without_the_seed(monkeypatch, tmp
     settings = _agent_settings(monkeypatch, tmp_path)
     client = make_fault_client(settings)
 
-    assert client._refresh_token == "rotated-rt"
+    assert client._default.refresh_token == "rotated-rt"
     client.close()
 
 
@@ -461,10 +461,10 @@ def test_keepalive_renews_even_with_a_live_access_token():
         return token_response(access=f"at-{calls['n']}", refresh=f"rt-{calls['n']}")
 
     client = make_client(handler)
-    client._current_token()  # a live access token, good for ~15 minutes
+    client._current_token(client._default)  # a live access token, good for ~15 minutes
     assert calls["n"] == 1
 
-    client._renew(force=True)
+    client._renew(client._default, force=True)
 
     assert calls["n"] == 2
 
@@ -485,7 +485,7 @@ def test_persist_failure_does_not_burn_the_configured_seed():
     store = FakeStore(token="stored-rt", fail_on_put=True)
     client = make_client(handler, refresh_token="fresh-seed", store=store)
 
-    client._current_token()
+    client._current_token(client._default)
 
     assert presented == ["stored-rt"]
 
@@ -498,22 +498,22 @@ def test_persist_failure_keeps_the_rotated_token_in_play():
     store = FakeStore(token="stored-rt", fail_on_put=True)
     client = make_client(lambda r: token_response(refresh="rt-next"), store=store)
 
-    assert client._current_token() == "at-1"
-    assert client._refresh_token == "rt-next"
-    assert client._credential_unpersisted is True
+    assert client._current_token(client._default) == "at-1"
+    assert client._default.refresh_token == "rt-next"
+    assert client._default.unpersisted is True
 
 
 def test_a_pending_write_is_retried_and_heals():
     """Once the volume recovers, the credential lands on disk without a restart."""
     store = FakeStore(token="stored-rt", fail_on_put=True)
     client = make_client(lambda r: token_response(refresh="rt-next"), store=store)
-    client._current_token()
+    client._current_token(client._default)
 
     store.fail_on_put = False  # disk recovers
-    client._retry_pending_persist()
+    client._retry_pending_persist(client._default)
 
     assert store.puts == ["rt-next"]
-    assert client._credential_unpersisted is False
+    assert client._default.unpersisted is False
 
 
 # -- out-of-band rotation -----------------------------------------------------
@@ -534,7 +534,7 @@ def test_rejected_credential_falls_back_to_the_store():
     client = make_client(handler, refresh_token="", store=store)
     store.token = "rotated-by-preflight"  # another process moved it on
 
-    assert client._current_token() == "at-1"
+    assert client._current_token(client._default) == "at-1"
     assert presented == ["stale-rt", "rotated-by-preflight"]
 
 
@@ -552,7 +552,7 @@ def test_store_then_seed_are_both_tried_before_declaring_lockout():
     client = make_client(handler, refresh_token="good-seed", store=store)
     store.token = "dead-b"
 
-    assert client._current_token() == "at-1"
+    assert client._current_token(client._default) == "at-1"
     assert presented == ["dead-a", "dead-b", "good-seed"]
 
 
@@ -565,7 +565,7 @@ def test_lockout_is_still_reported_when_nothing_works():
     )
 
     with pytest.raises(FaultMavenCredentialError):
-        client._current_token()
+        client._current_token(client._default)
 
 
 # -- renewal is reachable from every path -------------------------------------
@@ -584,7 +584,7 @@ def test_mid_poll_401_renews_under_the_refresh_grant():
         return httpx.Response(200, json={"agent_response": "done"})
 
     client = make_client(handler, dev_login_username="")
-    resp = client._poll("/api/v1/cases/c1/turns/1")
+    resp = client._poll("/api/v1/cases/c1/turns/1", cred=client._default)
 
     assert resp.status_code == 200
     assert calls["token"] == 2
@@ -605,7 +605,7 @@ def test_close_waits_for_an_in_flight_renewal():
     store = FakeStore(token="rt-0")
     client = make_client(handler, store=store)
 
-    renewal = threading.Thread(target=client._current_token)
+    renewal = threading.Thread(target=lambda: client._current_token(client._default))
     renewal.start()
     started.wait(timeout=5)
 
@@ -648,7 +648,7 @@ def test_explicit_preset_token_is_not_shadowed_by_a_leftover_store(
     client = make_fault_client(settings)
 
     assert client._credential_store is None
-    assert client._refresh_token == ""
-    assert client._token == "preset-tok"
+    assert client._default.refresh_token == ""
+    assert client._default.token == "preset-tok"
     assert client.auth_mode == "preset token"
     client.close()

@@ -188,7 +188,7 @@ def test_shortcut_core_seeds_case_with_extracted_message():
     calls: dict = {}
 
     class FakeFM:
-        def create_case(self, *, title=None, initial_message=None):
+        def create_case(self, *, title=None, initial_message=None, team_id=None):
             calls["create"] = (title, initial_message)
             return "case_1"
 
@@ -244,7 +244,7 @@ def test_pasted_content_is_sent_on_an_existing_case_too():
         def __init__(self):
             self.creates = 0
 
-        def create_case(self, *, title=None, initial_message=None):
+        def create_case(self, *, title=None, initial_message=None, team_id=None):
             self.creates += 1
             return "case_1"
 
@@ -288,7 +288,7 @@ def test_run_turn_forwards_files_even_without_text_evidence():
     turns: list = []
 
     class FakeFM:
-        def create_case(self, *, title=None, initial_message=None):
+        def create_case(self, *, title=None, initial_message=None, team_id=None):
             return "case_1"
 
         def submit_turn(self, case_id, **kwargs):
@@ -334,7 +334,7 @@ class _RecordingFM:
     def __init__(self):
         self.turns: list = []
 
-    def create_case(self, *, title=None, initial_message=None):
+    def create_case(self, *, title=None, initial_message=None, team_id=None):
         return "case_1"
 
     def submit_turn(self, case_id, **kwargs):
