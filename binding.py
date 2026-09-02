@@ -25,6 +25,13 @@ authority (the bind needs both ``ORG_MANAGE_USERS`` and ``ORG_MANAGE_SETTINGS``)
 It is never written down: not to the credential store, not to a cookie, not to a
 log. What is persisted is only the workspace service account's own refresh
 token, which is scoped to that account.
+
+**Both sides of the join must consent.** The FaultMaven side is covered by that
+organization authority. The *Slack* side is not: without a check, a FaultMaven
+organization admin who is an ordinary member of a workspace could admit that
+workspace's investigations into their organization on their own, with nobody who
+administers the workspace involved. :func:`installer_authority` closes that —
+the flow is offered only to a Workspace Owner or Admin.
 """
 
 from __future__ import annotations
@@ -32,7 +39,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+from enum import Enum
 from urllib.parse import urlencode
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 from faultmaven import FaultMavenClient, WorkspaceBindError
 from pending_binds import PendingBind
@@ -210,3 +221,66 @@ def bind_failure_message(exc: Exception) -> str:
         "Something went wrong finishing the connection to FaultMaven. "
         "Re-install the app to try again."
     )
+
+
+class InstallerAuthority(Enum):
+    """Whether the person who installed the app may bind this workspace."""
+
+    #: A Workspace Owner or Admin — the bind may be offered.
+    ADMIN = "admin"
+    #: Slack answered, and this person administers nothing.
+    NOT_ADMIN = "not_admin"
+    #: Slack did not answer (missing scope, rate limit, network, deleted user).
+    #: Distinct from NOT_ADMIN because it is a different thing to tell someone
+    #: and a different thing to fix.
+    UNKNOWN = "unknown"
+
+
+def installer_authority(client: WebClient, user_id: str) -> InstallerAuthority:
+    """Whether ``user_id`` administers the workspace they just installed into.
+
+    Reads ``users.info`` (needs the ``users:read`` bot scope, granted by the
+    same install whose token is used here — so an app whose Slack configuration
+    predates that scope returns :data:`~InstallerAuthority.UNKNOWN` until the
+    manifest is pushed and the app reinstalled).
+
+    ``is_primary_owner`` and ``is_owner`` are checked alongside ``is_admin``
+    rather than assumed to imply it: they are independent booleans in the
+    payload, and an Owner who somehow lacks the admin flag is unambiguously
+    entitled to this decision.
+
+    Never raises. Every failure is :data:`~InstallerAuthority.UNKNOWN`, which
+    the caller refuses on — the safe direction, since the alternative is
+    admitting a workspace on an authority nobody established.
+    """
+
+    if not user_id:
+        # Slack gave us an installation with no installer (an org-wide Grid
+        # install is the case that produces it). There is no one to check.
+        return InstallerAuthority.UNKNOWN
+    try:
+        response = client.users_info(user=user_id)
+    except SlackApiError as exc:
+        logger.warning(
+            "Could not check whether installer %s administers this workspace: "
+            "users.info returned %s. The bind will not be offered.",
+            user_id,
+            exc.response.get("error"),
+        )
+        return InstallerAuthority.UNKNOWN
+    except Exception as exc:  # noqa: BLE001 — network, DNS, a broken client
+        logger.warning(
+            "Could not reach Slack to check installer %s: %s. The bind will "
+            "not be offered.",
+            user_id,
+            exc,
+        )
+        return InstallerAuthority.UNKNOWN
+
+    user = response.get("user") or {}
+    if any(
+        user.get(flag)
+        for flag in ("is_admin", "is_owner", "is_primary_owner")
+    ):
+        return InstallerAuthority.ADMIN
+    return InstallerAuthority.NOT_ADMIN

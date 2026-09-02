@@ -57,7 +57,8 @@
         "groups:history",
         "im:history",
         "incoming-webhook",
-        "reactions:write"
+        "reactions:write",
+        "users:read"
       ]
     },
     "pkce_enabled": false

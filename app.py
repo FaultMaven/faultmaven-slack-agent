@@ -42,7 +42,7 @@ from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
 import install_pages
-from binding import authorize_url
+from binding import InstallerAuthority, authorize_url, installer_authority
 from oauth_store import OAuthStores, build_oauth_stores
 from pending_binds import BIND_COOKIE_NAME, PENDING_BIND_TTL_SECONDS, PendingBindStore
 from store import CaseStore
@@ -236,6 +236,33 @@ def _install_callbacks(
                 status=200,
                 headers=_install_html_headers(args),
                 body=install_pages.unavailable_page(),
+            )
+
+        # Both sides of the join must consent. The FaultMaven leg is gated on
+        # organization authority; this is the Slack leg. Without it a FaultMaven
+        # org admin who is an ordinary member here could admit this workspace on
+        # their own. Checked before the pending record is created, so a refusal
+        # leaves no state behind.
+        authority = installer_authority(
+            make_web_client(installation.bot_token), installation.user_id or ""
+        )
+        if authority is not InstallerAuthority.ADMIN:
+            logger.warning(
+                "Not offering the FaultMaven bind for workspace %s: installer "
+                "%s is %s",
+                team_id,
+                installation.user_id or "unknown",
+                authority.value,
+            )
+            page = (
+                install_pages.not_admin_page
+                if authority is InstallerAuthority.NOT_ADMIN
+                else install_pages.authority_unknown_page
+            )
+            return BoltResponse(
+                status=200,
+                headers=_install_html_headers(args),
+                body=page(workspace_name=workspace_name),
             )
 
         record = pending_binds.create(

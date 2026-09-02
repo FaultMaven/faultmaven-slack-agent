@@ -22,13 +22,21 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 
 import install_pages
 from app import _bind_cookie
-from binding import authorize_url, code_challenge_for, complete_bind
+import app as app_module
+from binding import (
+    InstallerAuthority,
+    authorize_url,
+    code_challenge_for,
+    complete_bind,
+    installer_authority,
+)
 from faultmaven import WorkspaceBindError, WorkspaceBinding
 from pending_binds import BIND_COOKIE_NAME, PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
@@ -524,3 +532,155 @@ def test_expired_records_are_purged_so_spent_secrets_do_not_accumulate(tmp_path)
     assert pending.purge_expired() == 1
     # The live one is untouched and still redeemable.
     assert pending.consume(state=fresh.state, bind_id=fresh.bind_id) is not None
+
+
+class _RecordingPendingBinds:
+    """Counts records created, so a refusal that leaves state behind is visible."""
+
+    def __init__(self):
+        self.created = 0
+
+    def create(self, **kwargs):
+        self.created += 1
+        return SimpleNamespace(
+            bind_id="b1", state="s1", code_verifier="v1",
+            team_id=kwargs.get("team_id", "T1"),
+            team_name=kwargs.get("team_name", "Acme"),
+            enterprise_id=kwargs.get("enterprise_id", ""),
+        )
+
+# -- the installer must administer the workspace (users:read / users.info) ----
+#
+# Both sides of the join have to consent. The FaultMaven leg is gated on
+# organization authority; without this the *Slack* leg is gated on nothing, and
+# a FaultMaven organization admin who happens to be an ordinary member of a
+# workspace could admit that workspace's investigations into their organization
+# with nobody who administers the workspace involved.
+
+
+
+class _UsersInfoClient:
+    """A WebClient stand-in whose ``users.info`` answers however a test needs."""
+
+    def __init__(self, *, user=None, error=None):
+        self._user = user
+        self._error = error
+        self.asked = []
+
+    def users_info(self, *, user):
+        self.asked.append(user)
+        if self._error is not None:
+            raise self._error
+        return {"ok": True, "user": self._user}
+
+
+def test_a_workspace_admin_may_bind():
+    client = _UsersInfoClient(user={"id": "U1", "is_admin": True})
+    assert installer_authority(client, "U1") is InstallerAuthority.ADMIN
+    assert client.asked == ["U1"]
+
+
+def test_an_owner_without_the_admin_flag_may_bind():
+    """``is_owner`` / ``is_primary_owner`` are independent booleans in the
+    payload, not implied by ``is_admin`` — and an Owner is unambiguously
+    entitled to this decision."""
+    for flag in ("is_owner", "is_primary_owner"):
+        client = _UsersInfoClient(user={"id": "U1", flag: True})
+        assert installer_authority(client, "U1") is InstallerAuthority.ADMIN
+
+
+def test_an_ordinary_member_may_not_bind():
+    client = _UsersInfoClient(user={"id": "U1", "is_admin": False})
+    assert installer_authority(client, "U1") is InstallerAuthority.NOT_ADMIN
+
+
+def test_a_missing_scope_is_unknown_not_a_refusal():
+    """``missing_scope`` is what an app installed before ``users:read`` looks
+    like. It is not evidence about this person, so it must not be reported as
+    'you are not an admin' — the fix is a reinstall, not finding an admin."""
+    from slack_sdk.errors import SlackApiError
+
+    client = _UsersInfoClient(
+        error=SlackApiError("missing_scope", {"ok": False, "error": "missing_scope"})
+    )
+    assert installer_authority(client, "U1") is InstallerAuthority.UNKNOWN
+
+
+def test_an_unreachable_slack_is_unknown():
+    client = _UsersInfoClient(error=RuntimeError("connection reset"))
+    assert installer_authority(client, "U1") is InstallerAuthority.UNKNOWN
+
+
+def test_no_installer_is_unknown():
+    """An Enterprise Grid org-wide install carries no installer to check."""
+    client = _UsersInfoClient(user={"is_admin": True})
+    assert installer_authority(client, "") is InstallerAuthority.UNKNOWN
+    assert client.asked == []
+
+
+def _success_callback(monkeypatch, authority, pending_binds):
+    """The real ``on_success``, with the authority check answering as told."""
+
+    monkeypatch.setattr(app_module, "installer_authority", lambda _c, _u: authority)
+    monkeypatch.setattr(app_module, "make_web_client", lambda *_a, **_k: object())
+    settings = SimpleNamespace(
+        install_binding_enabled=True,
+        faultmaven_dashboard_url="https://dash.example",
+        faultmaven_oauth_client_id="faultmaven-slack-agent",
+        faultmaven_oauth_redirect_uri="https://slack.example/faultmaven/callback",
+    )
+    return app_module._install_callbacks(settings, pending_binds).success
+
+
+def _success_args():
+    installation = SimpleNamespace(
+        team_id="T1", team_name="Acme", enterprise_id=None, user_id="U1",
+        bot_token="xoxb-1",
+    )
+    oauth_settings = SimpleNamespace(
+        state_utils=SimpleNamespace(
+            build_set_cookie_for_deletion=lambda: "slack-app-oauth-state=; Max-Age=0"
+        )
+    )
+    return SimpleNamespace(
+        installation=installation, settings=oauth_settings, request=None, default=None
+    )
+
+
+def test_the_bind_is_offered_to_an_admin(monkeypatch):
+    """The positive path: an admin gets the confirm page and a pending record."""
+    binds = _RecordingPendingBinds()
+    on_success = _success_callback(monkeypatch, InstallerAuthority.ADMIN, binds)
+
+    response = on_success(_success_args())
+
+    assert response.status == 200
+    assert "Connect this Slack workspace" in response.body
+    assert binds.created == 1
+
+
+def test_a_non_admin_is_told_who_can_finish_and_leaves_no_pending_bind(monkeypatch):
+    """Refused before the record is created, so nothing is left behind."""
+    binds = _RecordingPendingBinds()
+    on_success = _success_callback(monkeypatch, InstallerAuthority.NOT_ADMIN, binds)
+
+    response = on_success(_success_args())
+
+    assert response.status == 200
+    assert "Workspace Owner or Admin" in response.body
+    assert "Connect this Slack workspace" not in response.body
+    assert binds.created == 0
+
+
+def test_an_unknown_authority_refuses_too_but_says_something_different(monkeypatch):
+    """Fail closed: admitting a workspace on an authority nobody established is
+    the one direction that cannot be undone by reading a page."""
+    binds = _RecordingPendingBinds()
+    on_success = _success_callback(monkeypatch, InstallerAuthority.UNKNOWN, binds)
+
+    response = on_success(_success_args())
+
+    assert response.status == 200
+    assert "could not confirm" in response.body
+    assert "Workspace Owner or Admin" not in response.body
+    assert binds.created == 0
