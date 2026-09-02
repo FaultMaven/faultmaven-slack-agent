@@ -35,6 +35,7 @@ from faultmaven.client import (
     FaultMavenClient,
     FaultMavenCredentialError,
     FaultMavenWorkspaceUnlinkedError,
+    WorkspaceBindError,
 )
 from workspace_credentials import WorkspaceCredentialStore
 
@@ -709,3 +710,265 @@ def test_a_credential_less_deployment_still_says_so_at_boot(caplog):
         client.startup()
 
     assert any("auth deferred" in r.message for r in caplog.records)
+
+
+# -- the composite-key migration ----------------------------------------------
+def _legacy_table(engine):
+    """The table exactly as the first shipped version created it."""
+    from sqlalchemy import Column, DateTime, MetaData, String, Table, Text
+
+    md = MetaData()
+    t = Table(
+        "fm_workspace_credentials",
+        md,
+        Column("enterprise_id", String(32), primary_key=True),
+        Column("team_id", String(32), primary_key=True),
+        Column("organization_id", String(64), nullable=False),
+        Column("faultmaven_team_id", String(64), nullable=True),
+        Column("refresh_token", Text, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
+    )
+    md.create_all(engine)
+    return t
+
+
+def test_an_existing_composite_key_table_is_migrated(tmp_path):
+    """`create_all` is checkfirst and no-ops on an existing table, so a database
+    that already ran the first version would silently keep the old key and the
+    Grid fix would never take effect."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine, inspect
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
+    legacy = _legacy_table(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            legacy.insert().values(
+                enterprise_id="", team_id="T1", organization_id="org-a",
+                refresh_token="rt-1", updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+    store = WorkspaceCredentialStore(engine)
+
+    pk = inspect(engine).get_pk_constraint("fm_workspace_credentials")
+    assert pk["constrained_columns"] == ["team_id"]
+    assert store.get("T1").refresh_token == "rt-1", "the binding survived"
+
+
+def test_the_migration_keeps_the_most_recent_row_for_a_workspace(tmp_path):
+    """A workspace could hold rows under both "" and a Grid id. Collapsing them
+    must keep the live binding, not an arbitrary one — and must leave exactly
+    one row, since the new WHERE team_id=? would otherwise write a rotated token
+    into a row bound to a different organization."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
+    legacy = _legacy_table(engine)
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(
+            legacy.insert().values(
+                enterprise_id="", team_id="T1", organization_id="org-old",
+                refresh_token="rt-old", updated_at=now - timedelta(days=2),
+            )
+        )
+        conn.execute(
+            legacy.insert().values(
+                enterprise_id="E1", team_id="T1", organization_id="org-new",
+                refresh_token="rt-new", updated_at=now,
+            )
+        )
+
+    store = WorkspaceCredentialStore(engine)
+
+    assert store.team_ids() == ["T1"], "collapsed to exactly one row"
+    record = store.get("T1")
+    assert record.organization_id == "org-new"
+    assert record.refresh_token == "rt-new"
+
+
+def test_the_migration_is_idempotent(tmp_path):
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
+    _legacy_table(engine)
+    WorkspaceCredentialStore(engine)
+    store = WorkspaceCredentialStore(engine)  # second boot must be a no-op
+
+    store.bind(team_id="T9", organization_id="org-a", refresh_token="rt-9")
+    assert store.get("T9") is not None
+
+
+def test_an_unrecognised_table_shape_is_refused_not_rewritten(tmp_path):
+    """Migrating a table we do not recognise would be destructive on a guess."""
+    from sqlalchemy import Column, MetaData, String, Table, create_engine
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
+    md = MetaData()
+    Table(
+        "fm_workspace_credentials",
+        md,
+        Column("something_else", String(32), primary_key=True),
+    )
+    md.create_all(engine)
+
+    with pytest.raises(RuntimeError, match="unexpected primary key"):
+        WorkspaceCredentialStore(engine)
+
+
+# -- the binding HTTP calls ---------------------------------------------------
+def bind_client_for(handler, **kwargs):
+    client = FaultMavenClient("http://test", **kwargs)
+    client._http = httpx.Client(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    )
+    return client
+
+
+def test_the_code_exchange_sends_the_verifier_and_client_id():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"access_token": "at", "refresh_token": "rt"}
+        )
+
+    client = bind_client_for(handler, oauth_client_id="faultmaven-slack-agent")
+    access, refresh = client.exchange_authorization_code(
+        code="c", code_verifier="v", redirect_uri="https://slack.x/cb"
+    )
+
+    assert (access, refresh) == ("at", "rt")
+    assert seen["body"]["grant_type"] == "authorization_code"
+    assert seen["body"]["code_verifier"] == "v"
+    assert seen["body"]["redirect_uri"] == "https://slack.x/cb"
+    assert seen["body"]["client_id"] == "faultmaven-slack-agent"
+
+
+def test_a_non_json_exchange_body_is_a_typed_failure():
+    """A gateway page on a 200 must not surface as a bare ValueError."""
+    client = bind_client_for(lambda r: httpx.Response(200, text="<html>nope"))
+
+    with pytest.raises(WorkspaceBindError, match="non-JSON"):
+        client.exchange_authorization_code(
+            code="c", code_verifier="v", redirect_uri="https://x/cb"
+        )
+
+
+def test_the_bind_carries_the_admin_bearer_and_names_no_organization():
+    """The organization is taken from the token's own claim server-side. Sending
+    one would be a way to bind into a tenant the admin does not administer."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "slack_team_id": "T1", "organization_id": "org-a",
+                "team_id": "fmteam", "team_name": "Ops",
+                "service_account_username": "slack-T1",
+                "refresh_token": "sa-rt",
+                "account_created": True, "team_created": False,
+            },
+        )
+
+    client = bind_client_for(handler)
+    binding = client.bind_workspace(
+        admin_access_token="admin-at", slack_team_id="T1", team_name="Ops"
+    )
+
+    assert seen["auth"] == "Bearer admin-at"
+    assert "organization_id" not in seen["body"]
+    assert binding.refresh_token == "sa-rt"
+    assert binding.account_created is True
+
+
+def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
+    """The id Slack will present is ours; a divergent echo would file the
+    credential under a key no event ever looks up."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "slack_team_id": "t1-normalised-differently",
+                "organization_id": "org-a", "team_id": "fmteam",
+                "refresh_token": "sa-rt",
+            },
+        )
+
+    binding = bind_client_for(handler).bind_workspace(
+        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+    )
+
+    assert binding.slack_team_id == "T1"
+
+
+@pytest.mark.parametrize(
+    ("status", "fragment", "retryable"),
+    [
+        (403, "manage users", False),
+        (409, "already bound", False),
+        (503, "not configured", True),
+        (500, "refused the bind", True),
+        (400, "refused the bind", False),
+    ],
+)
+def test_each_bind_refusal_is_typed_and_advises_correctly(status, fragment, retryable):
+    """`retryable` decides whether a person is told to try again — wrong on the
+    403 (the likeliest failure) would send an admin round a loop forever."""
+    client = bind_client_for(
+        lambda r: httpx.Response(status, json={"detail": "because"})
+    )
+
+    with pytest.raises(WorkspaceBindError) as caught:
+        client.bind_workspace(
+            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        )
+
+    assert fragment in str(caught.value)
+    assert caught.value.status_code == status
+    assert caught.value.retryable is retryable
+
+
+@pytest.mark.parametrize("missing", ["refresh_token", "organization_id", "team_id"])
+def test_an_incomplete_bind_response_is_reported_as_unrecoverable(missing):
+    """The server has already created the account and Team by now, and the
+    credential is issued once — so a retry is refused as already-bound. The
+    message must not invite one."""
+    full = {
+        "slack_team_id": "T1", "organization_id": "org-a",
+        "team_id": "fmteam", "refresh_token": "sa-rt",
+    }
+    body = {k: v for k, v in full.items() if k != missing}
+    client = bind_client_for(lambda r: httpx.Response(200, json=body))
+
+    with pytest.raises(WorkspaceBindError, match="re-issue"):
+        client.bind_workspace(
+            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        )
+
+
+def test_revoke_reports_whether_the_server_accepted_it():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = bind_client_for(handler)
+    assert client.revoke_token("tok", token_type_hint="refresh_token") is True
+    assert calls[0]["token_type_hint"] == "refresh_token"
+    assert calls[0]["token"] == "tok"
+
+    failing = bind_client_for(lambda r: httpx.Response(400, json={"e": "x"}))
+    assert failing.revoke_token("tok", token_type_hint="access_token") is False
+    # An empty token is nothing to revoke, not a failure.
+    assert failing.revoke_token("", token_type_hint="access_token") is True

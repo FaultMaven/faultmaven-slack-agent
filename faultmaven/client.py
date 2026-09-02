@@ -1401,7 +1401,15 @@ class FaultMavenClient:
                 f"({resp.status_code}): {self._error_detail(resp)}",
                 status_code=resp.status_code,
             )
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            # A 200 whose body is not JSON is a proxy or gateway page, not the
+            # token endpoint. Typed like every other failure here so the caller
+            # renders a page instead of a bare ValueError.
+            raise WorkspaceBindError(
+                f"code exchange returned a non-JSON body: {exc}"
+            ) from exc
         access, refresh = body.get("access_token", ""), body.get("refresh_token", "")
         if not access:
             raise WorkspaceBindError("code exchange returned no access_token")
@@ -1474,12 +1482,41 @@ class FaultMavenClient:
                 retryable=resp.status_code >= 500,
             )
 
-        body = resp.json()
-        refresh = body.get("refresh_token", "")
-        if not refresh:
-            raise WorkspaceBindError("bind returned no refresh_token for the account")
+        # Past this point the server has ALREADY created the account, the team
+        # and the memberships, and minted a once-only credential. Anything we
+        # reject from here is unrecoverable by retry — the next attempt gets a
+        # 409 — so every field the caller depends on is checked here, where the
+        # error can still name what happened, rather than deeper where it would
+        # surface as an AttributeError on a half-built binding.
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise WorkspaceBindError(
+                "The workspace was created in FaultMaven, but its response could "
+                "not be read, so the credential is lost. An administrator must "
+                "re-issue it.",
+                status_code=resp.status_code,
+            ) from exc
+
+        missing = [
+            name
+            for name in ("refresh_token", "organization_id", "team_id")
+            if not body.get(name)
+        ]
+        if missing:
+            raise WorkspaceBindError(
+                "The workspace was created in FaultMaven, but its response was "
+                f"missing {', '.join(missing)}, so it cannot be used here. An "
+                "administrator must re-issue the workspace credential.",
+                status_code=resp.status_code,
+            )
+        refresh = body["refresh_token"]
         return WorkspaceBinding(
-            slack_team_id=body.get("slack_team_id", slack_team_id),
+            # The Slack workspace id is OURS — the one the completed install
+            # established — not whatever the server echoes. They should agree;
+            # if they ever did not, storing the echo would file the credential
+            # under a key no Slack event ever looks up.
+            slack_team_id=slack_team_id,
             organization_id=body.get("organization_id", ""),
             team_id=body.get("team_id", ""),
             team_name=body.get("team_name", team_name),

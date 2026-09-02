@@ -53,6 +53,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    inspect,
     select,
 )
 from sqlalchemy.engine import Engine
@@ -112,7 +113,76 @@ class WorkspaceCredentialStore:
             Column("refresh_token", Text, nullable=False),
             Column("updated_at", DateTime, nullable=False),
         )
+        self._migrate_from_composite_key(engine)
         self._metadata.create_all(engine)
+
+    # -- migration ----------------------------------------------------------
+    def _migrate_from_composite_key(self, engine: Engine) -> None:
+        """Re-key an existing table from ``(enterprise_id, team_id)`` to ``team_id``.
+
+        The first shipped version of this table keyed on both columns. That
+        diverges from the server, which binds on the workspace alone and records
+        the Grid id without keying on it — so a workspace joining a Grid would
+        stop resolving here while the server still considered it bound.
+
+        ``create_all`` is ``checkfirst`` and silently no-ops on an existing
+        table, so without this an already-deployed database would keep the old
+        shape forever and the fix would appear to have been applied. Worse, the
+        new ``WHERE team_id = ?`` writes could match two rows there and put one
+        workspace's rotated token into a row bound to a different organization.
+
+        Idempotent: it inspects the live primary key and returns immediately
+        unless the old shape is actually present.
+        """
+
+        inspector = inspect(engine)
+        if not inspector.has_table(self._table.name):
+            return
+        pk = set(
+            inspector.get_pk_constraint(self._table.name).get(
+                "constrained_columns", []
+            )
+        )
+        if pk == {"team_id"}:
+            return
+        if "enterprise_id" not in pk:
+            # Some other shape entirely — not ours to rewrite. Say so rather
+            # than silently proceeding against a table we do not recognise.
+            raise RuntimeError(
+                f"{self._table.name} has an unexpected primary key {sorted(pk)}; "
+                "refusing to migrate it automatically"
+            )
+
+        legacy = f"{self._table.name}__legacy"
+        logger.warning(
+            "Migrating %s from a composite (enterprise_id, team_id) key to "
+            "team_id, to match the server's binding key",
+            self._table.name,
+        )
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"ALTER TABLE {self._table.name} RENAME TO {legacy}"
+            )
+            self._table.create(conn)
+            # A workspace could have rows under both "" and a Grid id. Keep the
+            # most recently written one: it is the live binding, and the other
+            # is a leftover from before the conversion.
+            conn.exec_driver_sql(
+                f"""
+                INSERT INTO {self._table.name}
+                    (team_id, enterprise_id, organization_id,
+                     faultmaven_team_id, refresh_token, updated_at)
+                SELECT team_id, enterprise_id, organization_id,
+                       faultmaven_team_id, refresh_token, updated_at
+                FROM {legacy} l
+                WHERE l.updated_at = (
+                    SELECT MAX(l2.updated_at) FROM {legacy} l2
+                    WHERE l2.team_id = l.team_id
+                )
+                """
+            )
+            conn.exec_driver_sql(f"DROP TABLE {legacy}")
+        logger.info("Migration of %s complete", self._table.name)
 
     # -- reads --------------------------------------------------------------
     def get(self, team_id: str) -> WorkspaceCredential | None:

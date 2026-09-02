@@ -44,7 +44,10 @@ logger = logging.getLogger("faultmaven.slack.binding")
 #: — so this is descriptive text, not a constraint. Written honestly anyway: it
 #: is the one sentence the dashboard shows, and a client that lies here is
 #: lying to the person deciding.
-BIND_SCOPE = "openid profile email"
+BIND_SCOPE = (
+    "openid profile email "
+    "slack:bind-workspace(create-service-account,create-team,add-members)"
+)
 
 
 def code_challenge_for(verifier: str) -> str:
@@ -106,15 +109,45 @@ def complete_bind(
             team_name=record.team_name,
             slack_enterprise_id=record.enterprise_id or None,
         )
-        # Persisted before we report success: the credential is issued once, so
-        # losing it here would need the whole flow run again.
-        workspace_credentials.bind(
-            team_id=binding.slack_team_id,
-            organization_id=binding.organization_id,
-            refresh_token=binding.refresh_token,
-            enterprise_id=record.enterprise_id or "",
-            faultmaven_team_id=binding.team_id,
-        )
+        # Keyed on the RECORD's workspace id — the one the completed Slack
+        # install established, and the one Slack events will present. Storing a
+        # server-echoed value instead would risk a row no lookup ever finds.
+        try:
+            workspace_credentials.bind(
+                team_id=record.team_id,
+                organization_id=binding.organization_id,
+                refresh_token=binding.refresh_token,
+                enterprise_id=record.enterprise_id or "",
+                faultmaven_team_id=binding.team_id,
+            )
+        except Exception as exc:
+            # The server-side bind already succeeded and its credential is
+            # issued once, so this is not a retryable failure: the next attempt
+            # is refused as already-bound. Say exactly that, loudly, instead of
+            # letting the caller tell an admin "nothing was changed".
+            logger.error(
+                "Workspace %s was bound in FaultMaven (organization %s, team %s) "
+                "but its credential could not be stored locally: %s. The "
+                "credential is issued once and is now lost; re-issue it for "
+                "service account %s.",
+                record.team_id,
+                binding.organization_id,
+                binding.team_id,
+                exc,
+                binding.service_account_username,
+            )
+            raise WorkspaceBindError(
+                "This workspace was connected in FaultMaven, but the agent could "
+                "not store its credential — so it cannot be used yet, and "
+                "re-installing will not fix it. Ask a FaultMaven administrator "
+                "to re-issue the workspace credential.",
+            ) from exc
+
+        # The client caches a credential per workspace, and a re-bind replaces
+        # the row underneath it. Without this, turns keep authenticating as the
+        # PREVIOUS service account — filing cases in the previous organization —
+        # until that token happens to be rejected.
+        fm.forget_workspace(record.team_id)
         logger.info(
             "Bound Slack workspace %s to organization %s (team %s, account %s, "
             "account_created=%s team_created=%s)",
@@ -145,15 +178,34 @@ def complete_bind(
             )
 
 
+#: Bind failures whose message is written for a browser. Every other
+#: ``WorkspaceBindError`` embeds up to 300 characters of the backend's raw
+#: response — useful in a log, wrong on a page, and capable of naming another
+#: tenant's organization on the 409.
+_BROWSER_SAFE_BIND_STATUSES = frozenset({403, 503})
+
+
 def bind_failure_message(exc: Exception) -> str:
     """What to show the admin in the browser when a bind fails.
 
     Deliberately says what to do next rather than what went wrong internally:
-    the reader is an administrator in a browser, not an operator with logs.
+    the reader is an administrator in a browser, not an operator with logs. The
+    detail is not lost — the caller logs the exception itself.
     """
 
     if isinstance(exc, WorkspaceBindError):
-        return str(exc)
+        if exc.status_code in _BROWSER_SAFE_BIND_STATUSES or exc.status_code == 0:
+            return str(exc)
+        if exc.status_code == 409:
+            return (
+                "This Slack workspace is already connected to a FaultMaven "
+                "organization. If that is not the one you expect, a FaultMaven "
+                "administrator has to disconnect it first."
+            )
+        return (
+            "FaultMaven could not connect this workspace. Ask a FaultMaven "
+            "administrator to check the server logs for the reason."
+        )
     return (
         "Something went wrong finishing the connection to FaultMaven. "
         "Re-install the app to try again."

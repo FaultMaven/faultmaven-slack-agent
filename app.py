@@ -188,6 +188,30 @@ def _bind_cookie(bind_id: str) -> str:
     )
 
 
+def _install_html_headers(args: SuccessArgs, *extra_cookies: str) -> dict:
+    """Headers for an install page, keeping Bolt's own state-cookie deletion.
+
+    Replacing Bolt's success response wholesale silently drops the
+    ``Set-Cookie`` that expires the spent Slack OAuth ``state`` — leaving it in
+    the installer's browser for the rest of its lifetime. Bolt emits it on every
+    default success; so must we.
+
+    ``no-store`` matters here specifically: this page is served on the OAuth
+    redirect (its URL carries Slack's ``code``) and its body embeds the bind
+    ``state``. Neither belongs in a disk or back/forward cache on a shared
+    machine.
+    """
+
+    cookies = [args.settings.state_utils.build_set_cookie_for_deletion()]
+    cookies.extend(extra_cookies)
+    return {
+        "content-type": ["text/html; charset=utf-8"],
+        "cache-control": ["no-store"],
+        "referrer-policy": ["no-referrer"],
+        "set-cookie": cookies,
+    }
+
+
 def _install_callbacks(
     settings: Settings, pending_binds: PendingBindStore
 ) -> CallbackOptions:
@@ -210,7 +234,7 @@ def _install_callbacks(
             # install honestly rather than starting a flow that cannot finish.
             return BoltResponse(
                 status=200,
-                headers={"content-type": ["text/html; charset=utf-8"]},
+                headers=_install_html_headers(args),
                 body=install_pages.unavailable_page(),
             )
 
@@ -227,15 +251,14 @@ def _install_callbacks(
             record=record,
         )
         logger.info(
-            "Slack install complete for workspace %s; offering FaultMaven bind",
+            "Slack install complete for workspace %s by installer %s; offering "
+            "FaultMaven bind",
             team_id,
+            installation.user_id or "unknown",
         )
         return BoltResponse(
             status=200,
-            headers={
-                "content-type": ["text/html; charset=utf-8"],
-                "set-cookie": [_bind_cookie(record.bind_id)],
-            },
+            headers=_install_html_headers(args, _bind_cookie(record.bind_id)),
             body=install_pages.confirm_page(
                 workspace_name=workspace_name, team_id=team_id, authorize_url=url
             ),
@@ -272,7 +295,7 @@ def _oauth_settings(settings: Settings, stores: OAuthStores) -> OAuthSettings:
     )
 
 
-def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
+def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings, OAuthStores | None]:
     """Build the Bolt app and its dependencies for the configured transport.
 
     HTTP mode wires multi-workspace OAuth (no static bot token — per-team tokens
@@ -282,6 +305,7 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
 
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
+    stores: OAuthStores | None = None
 
     if settings.slack_transport == "http":
         # Built before the core: the FM client authenticates per workspace off
@@ -300,8 +324,7 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
             signing_secret=settings.slack_signing_secret,
             oauth_settings=_oauth_settings(settings, stores),
         )
-        # The HTTP transport's callback route needs these same instances.
-        app._fm_oauth_stores = stores  # noqa: SLF001 — our own attribute
+
     else:
         store, fm = _build_core(settings)
         app = App(
@@ -310,7 +333,11 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
         )
     register_listeners(app, fm, store)
 
-    return app, store, fm, settings
+    # Returned rather than attached to the Bolt app: the callback route needs
+    # these exact instances (one engine, one pending-bind table), and a private
+    # attribute on a third-party object is a dependency nothing type-checks and
+    # a library release could break silently.
+    return app, store, fm, settings, stores
 
 
 def shutdown_runtime(store: CaseStore, fm: FaultMavenClient) -> None:

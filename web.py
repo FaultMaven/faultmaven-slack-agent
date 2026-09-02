@@ -92,7 +92,7 @@ def create_fastapi_app() -> FastAPI:
     bootstrap runs in the lifespan startup below, off the critical path.
     """
 
-    bolt_app, store, fm, settings = build_app()
+    bolt_app, store, fm, settings, stores = build_app()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -117,12 +117,15 @@ def create_fastapi_app() -> FastAPI:
             await run_in_threadpool(shutdown_runtime, store, fm)
 
     api = FastAPI(lifespan=lifespan)
-    # The OAuth stores are built inside build_app(); the callback route needs
-    # the same instances (one engine, one pending-bind table), so they travel on
-    # the Bolt app rather than being rebuilt here against a second pool.
-    stores = getattr(bolt_app, "_fm_oauth_stores", None)
-    if stores is not None and settings.install_binding_enabled:
+    binding_enabled = stores is not None and settings.install_binding_enabled
+    if binding_enabled:
         logger.info("Install-time workspace binding enabled")
+        # Spent records hold a live PKCE verifier and a state secret. Nothing
+        # else deletes them, so a long-running process would accumulate expired
+        # OAuth secrets in the shared database indefinitely.
+        purged = stores.pending_binds.purge_expired()
+        if purged:
+            logger.info("Purged %d expired pending bind(s) at startup", purged)
 
     async def _dispatch_event(req: Request) -> Response:
         """POST callbacks → Bolt dispatch, off the event loop."""
@@ -170,8 +173,7 @@ def create_fastapi_app() -> FastAPI:
         into the organization of whoever they forwarded it to.
         """
 
-        stores = getattr(bolt_app, "_fm_oauth_stores", None)
-        if stores is None:
+        if not binding_enabled:
             return _html(install_pages.unavailable_page(), status=404)
 
         code = req.query_params.get("code", "")

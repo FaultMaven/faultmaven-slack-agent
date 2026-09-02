@@ -53,7 +53,11 @@ class FakeFM:
         self.exchanged: list[tuple] = []
         self.bound: list[dict] = []
         self.revoked: list[tuple[str, str]] = []
+        self.forgotten: list[str] = []
         self.revoke_ok = True
+
+    def forget_workspace(self, team_id):
+        self.forgotten.append(team_id)
 
     def exchange_authorization_code(self, *, code, code_verifier, redirect_uri):
         self.exchanged.append((code, code_verifier, redirect_uri))
@@ -363,13 +367,23 @@ def test_the_callback_refuses_an_unknown_cookie(bind_client):
     assert resp.status_code == 400
 
 
-def test_a_declined_consent_reports_plainly_and_spends_the_link(bind_client):
-    """No ``code`` means the admin said no (or FaultMaven refused). Say so, and
-    do not leave a redeemable record behind."""
-    resp = bind_client.get("/faultmaven/callback", params={"state": "s"})
+def test_a_declined_consent_reports_plainly_and_spends_the_link(bind_client, tmp_path):
+    """No ``code`` on a LIVE record means the admin declined on the consent
+    screen. Needs a real record and its cookie — without them the request lands
+    on the no-record branch instead and this proves nothing."""
+    pending = PendingBindStore(create_engine(f"sqlite:///{tmp_path / 'oauth.db'}"))
+    record = pending.create(
+        team_id="T-DECLINED", enterprise_id="", installer_user_id="U1",
+        team_name="Acme Ops",
+    )
 
-    assert resp.status_code == 400  # no live record either way
-    assert "no longer valid" in resp.text
+    bind_client.cookies.set(BIND_COOKIE_NAME, record.bind_id)
+    resp = bind_client.get("/faultmaven/callback", params={"state": record.state})
+
+    assert resp.status_code == 200
+    assert "access was not granted" in resp.text
+    # The link is spent: declining must not leave a redeemable record behind.
+    assert pending.consume(state=record.state, bind_id=record.bind_id) is None
 
 
 def test_the_callback_never_leaks_its_query_string_onward(bind_client):
@@ -416,3 +430,97 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
     assert seen["team_id"] == "T-REAL", "the workspace came from the record"
     assert seen["code"] == "good-code"
     assert seen["redirect_uri"] == "https://slack.faultmaven.ai/faultmaven/callback"
+
+
+def test_a_rebind_drops_the_cached_credential(tmp_path):
+    """The client caches a credential per workspace and a re-bind replaces the
+    row underneath it. Without invalidation, turns keep authenticating as the
+    PREVIOUS service account — filing cases in the previous organization — until
+    that token happens to be rejected. ``forget_workspace`` exists for this."""
+    pending, creds = make_stores(tmp_path)
+    r = open_bind(pending, team_id="T-REBOUND")
+    record = pending.consume(state=r.state, bind_id=r.bind_id)
+    fm = FakeFM()
+
+    complete_bind(
+        fm=fm, workspace_credentials=creds, record=record,
+        code="c", redirect_uri="https://x/cb",
+    )
+
+    assert fm.forgotten == ["T-REBOUND"]
+
+
+def test_a_local_store_failure_after_the_server_bind_is_reported_as_final(tmp_path):
+    """The server-side bind already succeeded and its credential is issued once,
+    so this is NOT retryable — the next attempt is refused as already-bound.
+    Telling the admin 'nothing was changed, try again' would be false and a dead
+    end."""
+    pending, creds = make_stores(tmp_path)
+    r = open_bind(pending, team_id="T-LOST")
+    record = pending.consume(state=r.state, bind_id=r.bind_id)
+    fm = FakeFM()
+
+    def explode(**kwargs):
+        raise OSError("disk full")
+
+    creds.bind = explode
+
+    with pytest.raises(WorkspaceBindError) as caught:
+        complete_bind(
+            fm=fm, workspace_credentials=creds, record=record,
+            code="c", redirect_uri="https://x/cb",
+        )
+
+    message = str(caught.value)
+    assert "re-installing will not fix it" in message
+    assert "re-issue" in message
+    # And the borrowed admin authority is still given back.
+    assert ("admin-refresh", "refresh_token") in fm.revoked
+
+
+def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
+    """`bind_workspace` embeds up to 300 chars of the backend's raw response,
+    which on a cross-org conflict can name another tenant's organization. That
+    belongs in the log, not in a browser."""
+    from binding import bind_failure_message
+
+    exc = WorkspaceBindError(
+        "This Slack workspace is already bound elsewhere: organization "
+        "org-someone-else team 'Their Secret Project'",
+        status_code=409,
+    )
+
+    message = bind_failure_message(exc)
+
+    assert "org-someone-else" not in message
+    assert "Their Secret Project" not in message
+    assert "already connected" in message
+
+
+def test_the_consent_scope_names_what_the_grant_actually_does():
+    """The module's own comment: 'a client that lies here is lying to the person
+    deciding'. The token is used to create a service account and a team, so
+    identity-only scopes would understate it on the one screen that shows it."""
+    from binding import BIND_SCOPE
+
+    assert "service-account" in BIND_SCOPE
+    assert "create-team" in BIND_SCOPE
+
+
+def test_expired_records_are_purged_so_spent_secrets_do_not_accumulate(tmp_path):
+    """Every row holds a live PKCE verifier and a state secret. Nothing else
+    deletes them, so without this a long-running process retains spent OAuth
+    secrets indefinitely in the same database as the installation store."""
+    pending, _ = make_stores(tmp_path)
+    stale = open_bind(pending, team_id="T-OLD")
+    fresh = open_bind(pending, team_id="T-NEW")
+    with pending._engine.begin() as conn:
+        conn.execute(
+            pending._table.update()
+            .where(pending._table.c.bind_id == stale.bind_id)
+            .values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+
+    assert pending.purge_expired() == 1
+    # The live one is untouched and still redeemable.
+    assert pending.consume(state=fresh.state, bind_id=fresh.bind_id) is not None

@@ -191,7 +191,13 @@ class PendingBindStore:
         )
 
     def purge_expired(self) -> int:
-        """Delete records past their TTL. Consumed rows go too — they are spent."""
+        """Delete records past their TTL. Consumed rows go too — they are spent.
+
+        Each row holds a live PKCE verifier and a state secret, so leaving spent
+        ones behind means retaining OAuth secrets indefinitely in a database
+        shared with the installation store. Called at startup; a process that
+        runs for months is the case this exists for.
+        """
 
         with self._engine.begin() as conn:
             result = conn.execute(
@@ -199,7 +205,10 @@ class PendingBindStore:
                     self._table.c.expires_at <= datetime.now(timezone.utc)
                 )
             )
-        return result.rowcount or 0
+        removed = result.rowcount or 0
+        if removed:
+            logger.info("Purged %d expired pending bind(s)", removed)
+        return removed
 
     def close(self) -> None:
         """No-op: the engine belongs to :mod:`oauth_store`, which outlives this."""
