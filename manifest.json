@@ -2,7 +2,7 @@
   "display_information": {
     "name": "FaultMaven",
     "description": "AI troubleshooting copilot that runs the investigation, not just answers.",
-    "long_description": "FaultMaven is an AI troubleshooting copilot that works a problem the way a seasoned engineer does — and never forgets what it learns.\n\nHand it an error, a log, or a config and it doesn't just answer — it runs the investigation: triages the symptom, forms hypotheses, asks for the specific evidence that will confirm or eliminate each one, and keeps going until the root cause is found and the fix is verified.\n\nHow it works a case:\n• Goal-driven — every turn moves the case toward a solution, not just a reply\n• Methodical — triage, hypotheses, targeted evidence requests, verified fix; no jumping to conclusions\n• Evidence-based — it reads your logs, errors, and configs, draws on your runbooks and past fixes, and shows the evidence behind every step\n• Self-learning — when a case is resolved, it can capture the fix as a runbook, turning the experience into knowledge the next investigation starts from\n\nYou stay in command: it suggests, you approve and execute. And it only joins where you invite it — @mention it in a channel thread, run \"Ask FaultMaven\" on any alert or error message, or start a direct conversation. Once it's in a thread, just reply to keep the investigation going; each problem gets its own thread, so separate investigations stay separate.\n\nIMPORTANT — AI ACCURACY: FaultMaven is powered by large language models. Its output — including its triage, hypotheses, evidence requests, and proposed fixes — may be incomplete, misleading, or inaccurate, and it can be confidently wrong. Treat every response as a suggestion to verify, not an authoritative answer, and review it before acting on production systems. FaultMaven proposes; you approve and execute.\n\nIMPORTANT — PAID SLACK PLAN REQUIRED FOR THE AI AGENT CONTAINER: Slack's AI agent container (the dedicated assistant panel that opens alongside your conversation) is a paid Slack feature, so reaching FaultMaven there requires a paid Slack subscription (Pro, Business+, or Enterprise Grid). FaultMaven's other surfaces do not depend on it: @mentioning FaultMaven in a channel thread and the \"Ask FaultMaven\" message shortcut work on any Slack plan, including free — so a free workspace can still run full investigations.",
+    "long_description": "FaultMaven is an AI troubleshooting copilot that works a problem the way a seasoned engineer does \u2014 and never forgets what it learns.\n\nHand it an error, a log, or a config and it doesn't just answer \u2014 it runs the investigation: triages the symptom, forms hypotheses, asks for the specific evidence that will confirm or eliminate each one, and keeps going until the root cause is found and the fix is verified.\n\nHow it works a case:\n\u2022 Goal-driven \u2014 every turn moves the case toward a solution, not just a reply\n\u2022 Methodical \u2014 triage, hypotheses, targeted evidence requests, verified fix; no jumping to conclusions\n\u2022 Evidence-based \u2014 it reads your logs, errors, and configs, draws on your runbooks and past fixes, and shows the evidence behind every step\n\u2022 Self-learning \u2014 when a case is resolved, it can capture the fix as a runbook, turning the experience into knowledge the next investigation starts from\n\nYou stay in command: it suggests, you approve and execute. And it only joins where you invite it \u2014 @mention it in a channel thread, run \"Ask FaultMaven\" on any alert or error message, or start a direct conversation. Once it's in a thread, just reply to keep the investigation going; each problem gets its own thread, so separate investigations stay separate.\n\nIMPORTANT \u2014 AI ACCURACY: FaultMaven is powered by large language models. Its output \u2014 including its triage, hypotheses, evidence requests, and proposed fixes \u2014 may be incomplete, misleading, or inaccurate, and it can be confidently wrong. Treat every response as a suggestion to verify, not an authoritative answer, and review it before acting on production systems. FaultMaven proposes; you approve and execute.\n\nIMPORTANT \u2014 PAID SLACK PLAN REQUIRED FOR THE AI AGENT CONTAINER: Slack's AI agent container (the dedicated assistant panel that opens alongside your conversation) is a paid Slack feature, so reaching FaultMaven there requires a paid Slack subscription (Pro, Business+, or Enterprise Grid). FaultMaven's other surfaces do not depend on it: @mentioning FaultMaven in a channel thread and the \"Ask FaultMaven\" message shortcut work on any Slack plan, including free \u2014 so a free workspace can still run full investigations.",
     "background_color": "#1a1a2e"
   },
   "app_directory": {
@@ -30,7 +30,7 @@
       "always_online": true
     },
     "assistant_view": {
-      "assistant_description": "I find a problem's root cause the way a seasoned engineer would — triage, hypotheses, targeted evidence, a verified fix — grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
+      "assistant_description": "I find a problem's root cause the way a seasoned engineer would \u2014 triage, hypotheses, targeted evidence, a verified fix \u2014 grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
       "suggested_prompts": []
     },
     "shortcuts": [
@@ -71,7 +71,9 @@
         "message.im",
         "message.channels",
         "message.groups",
-        "app_mention"
+        "app_mention",
+        "app_uninstalled",
+        "tokens_revoked"
       ]
     },
     "interactivity": {

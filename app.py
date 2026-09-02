@@ -331,7 +331,9 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings, OAuthStores
             client=make_web_client(settings.slack_bot_token),
             signing_secret=settings.slack_signing_secret or None,
         )
-    register_listeners(app, fm, store)
+    register_listeners(
+        app, fm, store, stores.workspace_credentials if stores else None
+    )
 
     # Returned rather than attached to the Bolt app: the callback route needs
     # these exact instances (one engine, one pending-bind table), and a private
