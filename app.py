@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any
 
 from slack_bolt import App
+from slack_bolt.oauth.callback_options import CallbackOptions, FailureArgs, SuccessArgs
 from slack_bolt.oauth.oauth_settings import OAuthSettings
+from slack_bolt.response import BoltResponse
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
 from slack_sdk.http_retry.builtin_handlers import (
@@ -39,7 +41,10 @@ from credentials import CredentialStore
 from faultmaven import FaultMavenClient
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
+import install_pages
+from binding import authorize_url
 from oauth_store import OAuthStores, build_oauth_stores
+from pending_binds import BIND_COOKIE_NAME, PENDING_BIND_TTL_SECONDS, PendingBindStore
 from store import CaseStore
 
 logger = logging.getLogger("faultmaven.slack")
@@ -159,6 +164,91 @@ def _build_core(
     return store, fm
 
 
+def _bind_cookie(bind_id: str) -> str:
+    """The ``Set-Cookie`` header pinning a pending bind to this browser.
+
+    Every attribute is doing a job:
+
+    * ``__Host-`` forbids a ``Domain``, so a sibling host under ``faultmaven.ai``
+      cannot set or overwrite this cookie. Cookie-tossing from a neighbouring
+      subdomain is precisely how an attacker would supply the half of the pair
+      they do not have.
+    * ``HttpOnly`` keeps it away from script; ``Secure`` is required by the
+      prefix anyway.
+    * ``SameSite=Lax`` still arrives on the top-level GET that FaultMaven
+      redirects back to us — a ``Strict`` cookie would not, and the callback
+      would refuse every legitimate bind.
+    * ``Max-Age`` matches the record's own TTL so a stale cookie cannot outlive
+      the row it addresses.
+    """
+
+    return (
+        f"{BIND_COOKIE_NAME}={bind_id}; Path=/; Max-Age={PENDING_BIND_TTL_SECONDS}; "
+        "HttpOnly; Secure; SameSite=Lax"
+    )
+
+
+def _install_callbacks(
+    settings: Settings, pending_binds: PendingBindStore
+) -> CallbackOptions:
+    """What the browser sees when a Slack install finishes.
+
+    Bolt's default is a bare "success" page. We replace it because the install is
+    only half the story: the workspace still has no FaultMaven organization, and
+    the installer is the one person positioned to say which one it belongs to.
+    """
+
+    def on_success(args: SuccessArgs) -> BoltResponse:
+        installation = args.installation
+        team_id = installation.team_id or ""
+        workspace_name = installation.team_name or team_id
+
+        if not settings.install_binding_enabled or not team_id:
+            # Nothing to offer: either this deployment binds workspaces out of
+            # band, or Slack gave us an org-wide install with no workspace to
+            # name (Enterprise Grid — see docs/design.md §10.1). Report the
+            # install honestly rather than starting a flow that cannot finish.
+            return BoltResponse(
+                status=200,
+                headers={"content-type": ["text/html; charset=utf-8"]},
+                body=install_pages.unavailable_page(),
+            )
+
+        record = pending_binds.create(
+            team_id=team_id,
+            enterprise_id=installation.enterprise_id or "",
+            installer_user_id=installation.user_id or "",
+            team_name=workspace_name,
+        )
+        url = authorize_url(
+            dashboard_url=settings.faultmaven_dashboard_url,
+            client_id=settings.faultmaven_oauth_client_id,
+            redirect_uri=settings.faultmaven_oauth_redirect_uri,
+            record=record,
+        )
+        logger.info(
+            "Slack install complete for workspace %s; offering FaultMaven bind",
+            team_id,
+        )
+        return BoltResponse(
+            status=200,
+            headers={
+                "content-type": ["text/html; charset=utf-8"],
+                "set-cookie": [_bind_cookie(record.bind_id)],
+            },
+            body=install_pages.confirm_page(
+                workspace_name=workspace_name, team_id=team_id, authorize_url=url
+            ),
+        )
+
+    def on_failure(args: FailureArgs) -> BoltResponse:
+        # Bolt's own reason (denied consent, bad state) — do not dress it up.
+        logger.warning("Slack install failed: %s", args.reason)
+        return args.default.failure(args)
+
+    return CallbackOptions(success=on_success, failure=on_failure)
+
+
 def _oauth_settings(settings: Settings, stores: OAuthStores) -> OAuthSettings:
     """Bolt OAuth config: per-team InstallationStore + CSRF state store.
 
@@ -178,6 +268,7 @@ def _oauth_settings(settings: Settings, stores: OAuthStores) -> OAuthSettings:
         installation_store=stores.installation_store,
         state_store=stores.state_store,
         redirect_uri=settings.slack_oauth_redirect_uri or None,
+        callback_options=_install_callbacks(settings, stores.pending_binds),
     )
 
 
@@ -209,6 +300,8 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings]:
             signing_secret=settings.slack_signing_secret,
             oauth_settings=_oauth_settings(settings, stores),
         )
+        # The HTTP transport's callback route needs these same instances.
+        app._fm_oauth_stores = stores  # noqa: SLF001 — our own attribute
     else:
         store, fm = _build_core(settings)
         app = App(

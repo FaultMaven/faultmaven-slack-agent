@@ -91,13 +91,22 @@ class WorkspaceCredentialStore:
         self._table = Table(
             "fm_workspace_credentials",
             self._metadata,
-            # Composite from the start: an Enterprise Grid install surfaces its
-            # workspaces under an enterprise, and widening a primary key on a
-            # live table holding credentials is a migration worth not needing.
-            # Grid itself is out of scope here (an org-wide install has no
-            # team_id at install time — see docs/design.md §10.1).
-            Column("enterprise_id", String(32), primary_key=True),
+            # Keyed on team_id ALONE, matching the server's binding key
+            # (faultmaven-cloud `POST /api/v1/admin/integrations/slack/
+            # workspaces`, whose service account username derives from the
+            # workspace id and whose `slack_enterprise_id` is explicitly
+            # "recorded but not part of the binding key, so a workspace that
+            # later joins a Grid keeps its binding").
+            #
+            # A composite (enterprise_id, team_id) key would diverge from that
+            # the moment a customer converts to an Enterprise Grid: Slack starts
+            # sending an enterprise_id, the server still holds one binding under
+            # the team id, and this store would miss the row — turning a bound
+            # workspace into an unbound one on an event we do not control.
             Column("team_id", String(32), primary_key=True),
+            # Recorded, not keyed: worth knowing which Grid a workspace belongs
+            # to, never worth failing a lookup over.
+            Column("enterprise_id", String(32), nullable=False, server_default=""),
             Column("organization_id", String(64), nullable=False),
             Column("faultmaven_team_id", String(64), nullable=True),
             Column("refresh_token", Text, nullable=False),
@@ -106,10 +115,12 @@ class WorkspaceCredentialStore:
         self._metadata.create_all(engine)
 
     # -- reads --------------------------------------------------------------
-    def get(
-        self, team_id: str, *, enterprise_id: str = NO_ENTERPRISE
-    ) -> WorkspaceCredential | None:
-        """The workspace's binding, or None if it has never been bound."""
+    def get(self, team_id: str) -> WorkspaceCredential | None:
+        """The workspace's binding, or None if it has never been bound.
+
+        Takes no ``enterprise_id``: the binding is keyed on the workspace alone,
+        so a workspace keeps its binding when it joins or leaves a Grid.
+        """
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -120,10 +131,7 @@ class WorkspaceCredentialStore:
                     self._table.c.enterprise_id,
                     self._table.c.faultmaven_team_id,
                     self._table.c.updated_at,
-                ).where(
-                    self._table.c.team_id == team_id,
-                    self._table.c.enterprise_id == enterprise_id,
-                )
+                ).where(self._table.c.team_id == team_id)
             ).first()
         if row is None:
             return None
@@ -137,25 +145,16 @@ class WorkspaceCredentialStore:
         )
 
     def team_ids(self) -> list[str]:
-        """Every bound workspace this client can actually resolve.
+        """Every bound workspace, for preflight and diagnostics.
 
-        Restricted to non-Grid rows, matching what :meth:`get` is asked for
-        today: a caller holding only a ``team_id`` looks up
-        ``enterprise_id=NO_ENTERPRISE``, so listing a Grid-keyed row here would
-        report a workspace as bound that then resolves to nothing — a
-        credential check that silently passes on the wrong principal. Lifting
-        this is part of the Grid work, alongside a caller that carries the
-        enterprise id.
+        Needs no Grid filter now that the key is the workspace alone: every row
+        listed here is a row :meth:`get` can resolve.
         """
 
         with self._engine.connect() as conn:
             return [
                 row.team_id
-                for row in conn.execute(
-                    select(self._table.c.team_id)
-                    .where(self._table.c.enterprise_id == NO_ENTERPRISE)
-                    .distinct()
-                ).all()
+                for row in conn.execute(select(self._table.c.team_id)).all()
             ]
 
     # -- writes -------------------------------------------------------------
@@ -185,10 +184,7 @@ class WorkspaceCredentialStore:
 
         with self._engine.begin() as conn:
             conn.execute(
-                self._table.delete().where(
-                    self._table.c.team_id == team_id,
-                    self._table.c.enterprise_id == enterprise_id,
-                )
+                self._table.delete().where(self._table.c.team_id == team_id)
             )
             conn.execute(
                 self._table.insert().values(
@@ -206,9 +202,7 @@ class WorkspaceCredentialStore:
             organization_id,
         )
 
-    def put_refresh_token(
-        self, team_id: str, refresh_token: str, *, enterprise_id: str = NO_ENTERPRISE
-    ) -> None:
+    def put_refresh_token(self, team_id: str, refresh_token: str) -> None:
         """Commit a rotated refresh token, before the agent relies on it.
 
         Callers rely on this being durable on return: the token it replaces is
@@ -224,10 +218,7 @@ class WorkspaceCredentialStore:
         with self._engine.begin() as conn:
             result = conn.execute(
                 self._table.update()
-                .where(
-                    self._table.c.team_id == team_id,
-                    self._table.c.enterprise_id == enterprise_id,
-                )
+                .where(self._table.c.team_id == team_id)
                 .values(
                     refresh_token=refresh_token,
                     updated_at=datetime.now(timezone.utc),
@@ -236,7 +227,7 @@ class WorkspaceCredentialStore:
         if result.rowcount == 0:
             raise KeyError(f"no FaultMaven credential bound for workspace {team_id}")
 
-    def unbind(self, team_id: str, *, enterprise_id: str = NO_ENTERPRISE) -> None:
+    def unbind(self, team_id: str) -> None:
         """Drop a workspace's binding (uninstall / token revocation).
 
         The workspace's *cases* are unaffected — they are Team artifacts owned by
@@ -245,10 +236,7 @@ class WorkspaceCredentialStore:
 
         with self._engine.begin() as conn:
             conn.execute(
-                self._table.delete().where(
-                    self._table.c.team_id == team_id,
-                    self._table.c.enterprise_id == enterprise_id,
-                )
+                self._table.delete().where(self._table.c.team_id == team_id)
             )
 
     def close(self) -> None:

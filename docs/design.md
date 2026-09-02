@@ -798,6 +798,57 @@ particular organization, so answering would file one customer's incident inside
 another tenant. The default account remains the right answer where there is
 exactly one tenant to be wrong about: Socket Mode and self-hosted.
 
+### 10.1a Install-time binding — joining two OAuth flows safely
+
+Binding chains **two** OAuth flows: Slack's install, then FaultMaven's admin
+consent. Neither is remarkable; the seam between them is where the risk lives.
+
+**The attack the design exists to stop.** An attacker installs the app into
+*their own* workspace — entirely legitimate — and gets a FaultMaven authorize
+URL. They forward it to an admin of a **victim** organization. The dashboard's
+consent screen renders the client name and a *caller-supplied* scope string, so
+it names no workspace and nothing on it looks wrong; the victim approves. If the
+callback trusted `state` alone, the attacker's workspace would be bound into the
+victim's tenant — a service account on a Team inside their organization,
+carrying the attacker's Slack traffic.
+
+**What stops it.** A pending-bind record is addressed by **two independent
+secrets**: `state`, which travels in the URL, and a record id in a `__Host-`
+prefixed cookie, which exists only in the installing admin's browser. The
+callback requires both to name the same live record. A forwarded URL carries one
+and not the other. The `__Host-` prefix is load-bearing rather than decorative:
+it forbids a `Domain` attribute, so no sibling host under `faultmaven.ai` can
+toss us the cookie half.
+
+Three supporting properties:
+
+- **`slack_team_id` is read from the record, never from the request.** Taking it
+  from a query parameter would hand the same attack straight back.
+- **Single-use, including on failure.** The record is claimed by an atomic
+  `UPDATE` before the exchange, so a refused bind cannot be retried against a
+  record that is still redeemable.
+- **The PKCE verifier never leaves the server** — not in the cookie, not in
+  `state` — which is what makes a leaked code (an access log, a `Referer`)
+  unredeemable by whoever it leaked to.
+
+**The confirmation page comes before the FaultMaven leg, not after.** The consent
+screen cannot describe this grant, so the agent names the workspace itself. Doing
+it first also means the admin's bearer never survives a request boundary: it is
+obtained, used once, and revoked inside a single handler.
+
+**The admin's token is borrowed, not held.** The bind needs both
+`ORG_MANAGE_USERS` **and** `ORG_MANAGE_SETTINGS` (the second because it creates a
+Team) — so an admin holding only the first consents happily and is refused at the
+bind. Both tokens are revoked on every path, that one included. What is persisted
+is only the workspace service account's own refresh token.
+
+**What is still not solved.** FaultMaven cannot verify Slack-side authority:
+anyone Slack permits to install apps in a workspace can bind it into an
+organization *they* administer. The globally unique service-account username then
+locks the rightful organization out until an operator intervenes. Checking the
+installer is a Slack admin (`users.info`, needing `users:read`) would narrow
+this; it is not implemented.
+
 **Not covered: Enterprise Grid.** An org-wide install (`is_enterprise_install`)
 carries no `team_id` at install time — its workspaces surface at first event,
 when no admin is present to authorize a binding. Binding must therefore also be

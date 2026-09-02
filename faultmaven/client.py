@@ -238,6 +238,38 @@ class _CredentialRejected(FaultMavenCredentialError):
     """
 
 
+class WorkspaceBindError(FaultMavenError):
+    """The workspace could not be bound to a FaultMaven Team.
+
+    ``retryable`` is False for the refusals a person cannot fix by trying again
+    — chiefly the authority one. The bind needs BOTH ``ORG_MANAGE_USERS`` and
+    ``ORG_MANAGE_SETTINGS`` (the second because it creates a Team), and an admin
+    holding only the first completes the OAuth consent happily and is refused
+    here. That path has to be told what is wrong, not offered a retry.
+    """
+
+    def __init__(
+        self, message: str, *, status_code: int = 0, retryable: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceBinding:
+    """What the server created for a workspace, as the agent needs it."""
+
+    slack_team_id: str
+    organization_id: str
+    team_id: str
+    team_name: str
+    service_account_username: str
+    refresh_token: str = field(repr=False)
+    account_created: bool = False
+    team_created: bool = False
+
+
 class FaultMavenWorkspaceUnlinkedError(FaultMavenError):
     """This Slack workspace has no FaultMaven credential bound to it.
 
@@ -1331,6 +1363,156 @@ class FaultMavenClient:
         except (TypeError, ValueError):
             return None
         return seconds if seconds >= 0 else None
+
+    # -- workspace binding (ADR-013 D3) -------------------------------------
+    def exchange_authorization_code(
+        self, *, code: str, code_verifier: str, redirect_uri: str
+    ) -> tuple[str, str]:
+        """Exchange an admin's authorization code for ``(access, refresh)``.
+
+        The verifier is held server-side and sent only here, which is what makes
+        a code that leaks (an access log line, a ``Referer``) unredeemable by
+        whoever it leaked to.
+
+        ``redirect_uri`` must be byte-identical to the one sent to ``/authorize``
+        — the server compares the two strings directly, so a trailing slash that
+        differs is an ``invalid_grant``, not a near miss.
+        """
+
+        try:
+            resp = self._http.post(
+                "/api/v1/auth/oauth/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "code_verifier": code_verifier,
+                    "redirect_uri": redirect_uri,
+                    "client_id": self._oauth_client_id,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise WorkspaceBindError(
+                f"could not reach FaultMaven to exchange the code: {exc}",
+                retryable=True,
+            ) from exc
+        if resp.status_code != 200:
+            raise WorkspaceBindError(
+                f"FaultMaven refused the authorization code "
+                f"({resp.status_code}): {self._error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        body = resp.json()
+        access, refresh = body.get("access_token", ""), body.get("refresh_token", "")
+        if not access:
+            raise WorkspaceBindError("code exchange returned no access_token")
+        return access, refresh
+
+    def bind_workspace(
+        self,
+        *,
+        admin_access_token: str,
+        slack_team_id: str,
+        team_name: str,
+        slack_enterprise_id: str | None = None,
+    ) -> WorkspaceBinding:
+        """Bind a Slack workspace to a Team, as the authenticated admin.
+
+        The organization is taken from ``admin_access_token``'s own claim
+        server-side; there is deliberately no way to name one here, so this
+        cannot bind a workspace into a tenant the admin does not administer.
+
+        The returned refresh token is the workspace service account's, issued
+        once. The admin's bearer is a *parameter*, never stored on this client:
+        it carries org-admin authority far beyond this call, so it lives only as
+        long as the caller's stack frame.
+        """
+
+        payload: dict[str, Any] = {
+            "slack_team_id": slack_team_id,
+            "team_name": team_name,
+        }
+        if slack_enterprise_id:
+            payload["slack_enterprise_id"] = slack_enterprise_id
+
+        try:
+            resp = self._http.post(
+                "/api/v1/admin/integrations/slack/workspaces",
+                json=payload,
+                headers=self._auth_header(admin_access_token),
+            )
+        except httpx.HTTPError as exc:
+            raise WorkspaceBindError(
+                f"could not reach FaultMaven to bind the workspace: {exc}",
+                retryable=True,
+            ) from exc
+
+        if resp.status_code == 403:
+            raise WorkspaceBindError(
+                "Your FaultMaven account can sign in but is not allowed to bind a "
+                "workspace. This needs both 'manage users' and 'manage settings' "
+                "in your organization — ask an organization owner.",
+                status_code=403,
+            )
+        if resp.status_code == 409:
+            raise WorkspaceBindError(
+                f"This Slack workspace is already bound elsewhere: "
+                f"{self._error_detail(resp)}",
+                status_code=409,
+            )
+        if resp.status_code == 503:
+            raise WorkspaceBindError(
+                "FaultMaven is not configured for team management, so this "
+                "workspace cannot be bound yet.",
+                status_code=503,
+                retryable=True,
+            )
+        if resp.status_code >= 400:
+            raise WorkspaceBindError(
+                f"FaultMaven refused the bind ({resp.status_code}): "
+                f"{self._error_detail(resp)}",
+                status_code=resp.status_code,
+                retryable=resp.status_code >= 500,
+            )
+
+        body = resp.json()
+        refresh = body.get("refresh_token", "")
+        if not refresh:
+            raise WorkspaceBindError("bind returned no refresh_token for the account")
+        return WorkspaceBinding(
+            slack_team_id=body.get("slack_team_id", slack_team_id),
+            organization_id=body.get("organization_id", ""),
+            team_id=body.get("team_id", ""),
+            team_name=body.get("team_name", team_name),
+            service_account_username=body.get("service_account_username", ""),
+            refresh_token=refresh,
+            account_created=bool(body.get("account_created")),
+            team_created=bool(body.get("team_created")),
+        )
+
+    def revoke_token(self, token: str, *, token_type_hint: str) -> bool:
+        """Revoke a token, returning whether the server confirmed it.
+
+        Best-effort by contract, but the two tokens differ in how much a failure
+        matters: an access token dies on its own within minutes, while a live
+        refresh token is a standing org-admin credential. Callers log the first
+        and shout about the second.
+        """
+
+        if not token:
+            return True
+        try:
+            resp = self._http.post(
+                "/api/v1/auth/oauth/revoke",
+                json={
+                    "token": token,
+                    "token_type_hint": token_type_hint,
+                    "client_id": self._oauth_client_id,
+                },
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Token revocation request failed: %s", exc)
+            return False
+        return resp.status_code < 400
 
     # -- core calls ---------------------------------------------------------
     def create_case(

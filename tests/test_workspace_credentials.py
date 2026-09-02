@@ -658,21 +658,28 @@ def test_a_restored_credential_is_aged_from_when_it_was_stored(tmp_path):
     assert client._refresh_credential_is_due(cred) is True
 
 
-def test_a_grid_keyed_row_is_not_reported_as_a_resolvable_binding(tmp_path):
-    """``get()`` looks up enterprise_id='' today, so listing a Grid row would
-    report a workspace as bound that then resolves to nothing."""
+def test_a_workspace_keeps_its_binding_when_it_joins_a_grid(tmp_path):
+    """The server keys the binding on the workspace alone and says so: an
+    Enterprise Grid id is "recorded but not part of the binding key, so a
+    workspace that later joins a Grid keeps its binding". Keying this store on
+    (enterprise_id, team_id) would diverge the moment a customer converts —
+    Slack starts sending an enterprise id, the lookup misses, and a bound
+    workspace silently reads as unbound."""
     store = make_store(tmp_path)
     store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+
+    # The workspace converts to a Grid; the binding is re-recorded with one.
     store.bind(
-        team_id="T-grid",
+        team_id="T1",
         organization_id="org-a",
-        refresh_token="rt-g",
+        refresh_token="rt-1",
         enterprise_id="E1",
     )
 
-    assert store.team_ids() == ["T1"]
-    assert store.get("T-grid") is None
-    assert store.get("T-grid", enterprise_id="E1") is not None
+    record = store.get("T1")
+    assert record is not None, "resolvable by workspace id, Grid or not"
+    assert record.enterprise_id == "E1", "the Grid is recorded"
+    assert store.team_ids() == ["T1"], "and listed exactly once"
 
 
 def test_a_token_with_no_organization_claim_is_flagged(tmp_path, caplog):

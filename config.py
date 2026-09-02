@@ -146,6 +146,32 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="FAULTMAVEN_REQUIRE_WORKSPACE_BINDING",
     )
+    # Where the installing admin authorizes the bind. This is the DASHBOARD's
+    # origin, not the API's: the consent screen is a dashboard page that calls
+    # the API behind it. Empty disables install-time binding entirely — the
+    # workspace is then bound by an operator instead.
+    faultmaven_dashboard_url: str = Field(
+        default="", validation_alias="FAULTMAVEN_DASHBOARD_URL"
+    )
+    # Our own OAuth callback, which must be BYTE-IDENTICAL to the value in the
+    # backend's OAUTH_REDIRECT_URI_PATTERNS: the token exchange compares the two
+    # strings directly, so a trailing slash that differs is an invalid_grant.
+    faultmaven_oauth_redirect_uri: str = Field(
+        default="", validation_alias="FAULTMAVEN_OAUTH_REDIRECT_URI"
+    )
+
+    @property
+    def install_binding_enabled(self) -> bool:
+        """Whether an install can offer to bind the workspace itself.
+
+        Both halves are required, and neither has a safe default: without the
+        dashboard origin there is nowhere to send the admin, and without our
+        exact redirect the exchange cannot succeed. A deployment missing either
+        falls back to operator-provisioned binding rather than starting a flow
+        it cannot finish.
+        """
+
+        return bool(self.faultmaven_dashboard_url and self.faultmaven_oauth_redirect_uri)
 
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 

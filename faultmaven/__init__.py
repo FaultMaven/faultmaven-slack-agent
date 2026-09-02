@@ -12,6 +12,8 @@ from .client import (
     FaultMavenTimeoutError,
     FaultMavenWorkspaceUnlinkedError,
     TurnResult,
+    WorkspaceBinding,
+    WorkspaceBindError,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "FaultMavenTimeoutError",
     "FaultMavenWorkspaceUnlinkedError",
     "TurnResult",
+    "WorkspaceBindError",
+    "WorkspaceBinding",
 ]
