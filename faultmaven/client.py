@@ -43,6 +43,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -61,6 +62,10 @@ _KEEPALIVE_INTERVAL_SECONDS = 3600.0
 _REFRESH_RENEW_MARGIN_SECONDS = 2 * 24 * 3600.0
 # Fallback cadence when the refresh token's expiry can't be read.
 _REFRESH_BLIND_RENEW_SECONDS = 24 * 3600.0
+# How long past the request timeout ``close()`` waits for ONE credential's
+# in-flight renewal. Named rather than inlined so the per-credential budget is
+# testable without a five-second test.
+_CLOSE_DRAIN_HEADROOM_SECONDS = 5.0
 
 
 def _jwt_claims(token: str) -> dict[str, Any] | None:
@@ -91,6 +96,24 @@ def _jwt_expiry(token: str) -> float | None:
     claims = _jwt_claims(token)
     exp = claims.get("exp") if claims else None
     return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def _monotonic_at(when: datetime | None) -> float:
+    """A monotonic stamp corresponding to a wall-clock instant in the past.
+
+    Credential ages are compared against ``time.monotonic()`` (immune to clock
+    steps), but a credential loaded from storage knows only when it was written.
+    Projecting that wall-clock age back onto the monotonic clock keeps a
+    restored credential's age honest. A future or missing timestamp yields
+    "now", which is the conservative direction — it renews sooner, never later.
+    """
+
+    if when is None:
+        return time.monotonic()
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - when).total_seconds()
+    return time.monotonic() - max(age, 0.0)
 
 
 def _as_list(value: Any) -> list:
@@ -417,9 +440,17 @@ class FaultMavenClient:
             self._start_keepalive()
         if self._default.token:
             return
-        if not (self._default.refresh_token or self._default.dev_login_username):
+        if (
+            self._workspace_credentials is not None
+            and not self._default.refresh_token
+            and not self._default.dev_login_username
+        ):
             # Hosted, per-workspace-only: there is no default principal to
             # bootstrap, and that is the intended posture — not a failure.
+            # Conditioned on the workspace store: WITHOUT it, no credential at
+            # all is a misconfiguration, and swallowing it here would boot the
+            # process silently and surface the problem as a generic error in
+            # front of the first user.
             return
         try:
             self._ensure_token()
@@ -447,12 +478,17 @@ class FaultMavenClient:
         # drained — a rotation lost on one workspace locks out that workspace.
         with self._workspaces_lock:
             credentials = [self._default, *self._workspaces.values()]
-        deadline = time.monotonic() + self._timeout + 5.0
+        # Per credential, NOT one shared deadline: a renewal is one request, and
+        # each credential's is independent. Sharing a budget means the first slow
+        # renewal spends it and every later credential gets acquire(timeout=0.0)
+        # — which returns False immediately on a held lock — so the HTTP client
+        # is closed underneath their in-flight rotations. The presented token is
+        # already revoked by then, so that is a lockout per workspace.
+        budget = self._timeout + _CLOSE_DRAIN_HEADROOM_SECONDS
         held = []
         try:
             for cred in credentials:
-                remaining = max(deadline - time.monotonic(), 0.0)
-                if cred.renew_lock.acquire(timeout=remaining):
+                if cred.renew_lock.acquire(timeout=budget):
                     held.append(cred)
                 else:
                     logger.warning(
@@ -470,6 +506,24 @@ class FaultMavenClient:
                 cred.renew_lock.release()
 
     @property
+    def authenticates_per_workspace(self) -> bool:
+        """True when turns authenticate as per-workspace credentials only.
+
+        A predicate rather than a string comparison against :attr:`auth_mode`,
+        which is a human-readable diagnostic label: rewording it must not
+        silently change what preflight checks.
+        """
+
+        if self._workspace_credentials is None:
+            return False
+        if self._require_workspace_binding:
+            return True
+        default = self._default
+        return not (
+            default.refresh_token or default.token or default.dev_login_username
+        )
+
+    @property
     def auth_mode(self) -> str:
         """How the default principal authenticates, for diagnostics.
 
@@ -479,7 +533,7 @@ class FaultMavenClient:
         having no credential at all.
         """
 
-        if self._workspace_credentials is not None and self._require_workspace_binding:
+        if self.authenticates_per_workspace:
             return "per-workspace refresh grants"
         cred = self._default
         if cred.refresh_token:
@@ -488,8 +542,6 @@ class FaultMavenClient:
             return "preset token"
         if cred.dev_login_username:
             return "dev-login bootstrap"
-        if self._workspace_credentials is not None:
-            return "per-workspace refresh grants"
         return "no credential configured"
 
     def health(self) -> dict[str, Any]:
@@ -537,7 +589,11 @@ class FaultMavenClient:
         never used.
         """
 
-        cred = self._credential_for(team_id)
+        # The default principal is addressed directly rather than through
+        # ``_credential_for``: for a *turn* an absent team_id is a refusal under
+        # require_workspace_binding, but for a diagnostic it means "check the
+        # default", which is a question preflight is entitled to ask.
+        cred = self._credential_for(team_id) if team_id else self._default
         token = self._current_token(cred)
         try:
             resp = self._http.get(
@@ -573,7 +629,24 @@ class FaultMavenClient:
         direction and not an over-strict one.
         """
 
-        if not team_id or self._workspace_credentials is None:
+        if self._workspace_credentials is None:
+            return self._default
+
+        if not team_id:
+            # Slack sent no workspace id (every listener derives
+            # ``context.team_id or ""``, and an Enterprise Grid org-wide install
+            # is the case that really produces it). An unidentifiable workspace
+            # cannot be checked against a binding, so under
+            # require_workspace_binding it is refused for exactly the reason a
+            # *known* unbound workspace is: serving it on the default account
+            # would file the case in whatever tenant that account carries. This
+            # arm must stay ABOVE the fallback below — reversing them is a
+            # silent bypass of the guard.
+            if self._require_workspace_binding:
+                raise FaultMavenWorkspaceUnlinkedError(
+                    "Slack sent no workspace id for this turn, so it cannot be "
+                    "matched to a FaultMaven organization"
+                )
             return self._default
 
         with self._workspaces_lock:
@@ -613,6 +686,13 @@ class FaultMavenClient:
                 key=team_id,
                 refresh_token=record.refresh_token,
                 organization_id=record.organization_id,
+                # Aged from when the token was STORED, not from now. The blind
+                # renew cadence (used when a token's expiry can't be read) is
+                # measured from this, so stamping it at cache time would restart
+                # the clock on every process restart and cache miss — a
+                # redeployed-daily agent would never reach the threshold and its
+                # opaque credentials would age out to expiry unrenewed.
+                obtained_at=_monotonic_at(record.updated_at),
             )
             self._workspaces[team_id] = cred
             return cred
@@ -628,16 +708,53 @@ class FaultMavenClient:
             self._credential_store.put(refresh_token)
 
     def _stored_refresh_token(self, cred: _Credential) -> str | None:
-        """Whatever the durable store holds for this credential right now."""
+        """Whatever the durable store holds for this credential right now.
 
-        if cred.key:
-            if self._workspace_credentials is None:
+        For a workspace credential this also **reconciles the binding**: the
+        cached ``_Credential`` outlives a re-bind, and its stale
+        ``organization_id`` would then make :meth:`_assert_expected_org` reject
+        the very token the re-bind provisioned — failing every turn until the
+        process restarted, while blaming the backend for minting the wrong
+        tenant. The store is the source of truth for a binding, so a changed
+        organization is adopted here rather than fought.
+        """
+
+        if not cred.key:
+            if self._credential_store is None:
                 return None
-            record = self._workspace_credentials.get(cred.key)
-            return record.refresh_token if record else None
-        if self._credential_store is None:
+            return self._credential_store.get()
+
+        if self._workspace_credentials is None:
             return None
-        return self._credential_store.get()
+        record = self._workspace_credentials.get(cred.key)
+        if record is None:
+            # The binding is gone (uninstall). Nothing to fall back to, and the
+            # caller must not keep serving this workspace off a cached token.
+            self.forget_workspace(cred.key)
+            return None
+        if record.organization_id != cred.organization_id:
+            logger.warning(
+                "Workspace %s was re-bound from organization %s to %s; adopting "
+                "the stored binding",
+                cred.key,
+                cred.organization_id or "(none)",
+                record.organization_id,
+            )
+            cred.organization_id = record.organization_id
+        return record.refresh_token
+
+    def forget_workspace(self, team_id: str) -> None:
+        """Drop a workspace's cached credential, so the next turn re-resolves it.
+
+        The cache exists to give a workspace ONE renew lock per process; it is
+        not a source of truth. An uninstall or a re-bind changes the binding
+        underneath it, and continuing to serve turns from the cached copy would
+        outlive the binding that authorized them.
+        """
+
+        with self._workspaces_lock:
+            self._workspaces.pop(team_id, None)
+        self._warned_unbound.discard(team_id)
 
     # -- auth ---------------------------------------------------------------
     def _ensure_token(self) -> None:
@@ -771,7 +888,21 @@ class FaultMavenClient:
         if claims is None:
             return
         actual = claims.get("organization_id")
-        if actual is None or actual == cred.organization_id:
+        if actual == cred.organization_id:
+            return
+        if actual is None:
+            # A decodable JWT that simply does not name a tenant is NOT the
+            # opaque-token case above: the backend is speaking JWT and is not
+            # saying which organization this is for, so the only cross-tenant
+            # check in the system has nothing to compare. Treating that as a
+            # pass is the safe direction (the backend still enforces its own
+            # scoping), but it must not be silent — a claim rename upstream
+            # would otherwise disable this guard permanently and invisibly.
+            logger.warning(
+                "FaultMaven minted a token for %s carrying no organization "
+                "claim; the cross-tenant check cannot run on it",
+                cred.label,
+            )
             return
         raise FaultMavenCredentialError(
             f"FaultMaven minted a token for organization {actual!r}, but "
@@ -894,10 +1025,43 @@ class FaultMavenClient:
         self._keepalive = thread
         thread.start()
 
+    def _live_credentials(self) -> list[_Credential]:
+        """Every credential whose refresh window this process must keep sliding.
+
+        Resolved from the durable bindings, not just the in-process cache: the
+        cache is populated by traffic and is empty at boot, so a bound workspace
+        that has not taken a turn since the last restart would never be renewed
+        — and a workspace quiet for longer than the server's refresh window is
+        exactly the lockout the keepalive exists to prevent.
+        """
+
+        credentials = [self._default]
+        seen = set()
+        for team_id in self.bound_workspaces():
+            if team_id in seen:
+                continue
+            seen.add(team_id)
+            try:
+                credentials.append(self._credential_for(team_id))
+            except Exception as exc:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "Could not resolve the credential for workspace %s: %s",
+                    team_id,
+                    exc,
+                )
+        with self._workspaces_lock:
+            for cred in self._workspaces.values():
+                if cred.key not in seen:
+                    credentials.append(cred)
+        return credentials
+
     def _keepalive_loop(self) -> None:
         while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
-            with self._workspaces_lock:
-                credentials = [self._default, *self._workspaces.values()]
+            try:
+                credentials = self._live_credentials()
+            except Exception as exc:  # noqa: BLE001 — a daemon must not die
+                logger.warning("Could not enumerate FaultMaven credentials: %s", exc)
+                continue
             for cred in credentials:
                 if not cred.refresh_token:
                     continue

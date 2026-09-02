@@ -493,3 +493,212 @@ def test_an_unlinked_workspace_never_reaches_the_backend(tmp_path):
         cases.close()
 
     assert reached == [], "no case may be opened for an unbound workspace"
+
+
+# -- regressions from the #59 review ------------------------------------------
+def test_the_keepalive_covers_a_workspace_that_has_not_taken_a_turn(tmp_path):
+    """The cache is filled by traffic and is empty at boot, so keying the
+    keepalive off it means a bound-but-quiet workspace never has its refresh
+    window slid — the exact lockout the keepalive exists to prevent."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T-quiet", organization_id="org-a", refresh_token="rt-quiet")
+
+    client = make_client(lambda r: token_response(), workspaces=store)
+    assert client._workspaces == {}, "nothing has taken a turn yet"
+
+    keys = {c.key for c in client._live_credentials()}
+    assert "T-quiet" in keys
+
+
+def test_a_turnless_workspace_is_actually_renewed_by_the_keepalive(tmp_path):
+    store = make_store(tmp_path)
+    store.bind(team_id="T-quiet", organization_id="org-a", refresh_token="rt-quiet")
+    presented: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        presented.append(json.loads(request.content)["refresh_token"])
+        return token_response(refresh="rt-slid")
+
+    client = make_client(handler, workspaces=store)
+    for cred in client._live_credentials():
+        if cred.refresh_token:
+            client._renew(cred, force=True)
+
+    assert presented == ["rt-quiet"]
+    assert store.get("T-quiet").refresh_token == "rt-slid"
+
+
+def test_a_turn_with_no_workspace_id_is_refused_not_defaulted(tmp_path):
+    """Every listener derives ``context.team_id or ""``, so an empty id really
+    reaches here. Serving it on the default account is the same cross-tenant
+    misroute as serving a known-unbound workspace."""
+    store = make_store(tmp_path)
+    client = make_client(
+        lambda r: token_response(),
+        workspaces=store,
+        refresh_token="default-rt",
+        require=True,
+    )
+
+    with pytest.raises(FaultMavenWorkspaceUnlinkedError):
+        client.create_case(team_id="")
+
+
+def test_close_gives_every_credential_its_own_drain_budget(tmp_path, monkeypatch):
+    """One shared deadline means the first slow renewal spends it and every
+    later credential gets acquire(timeout=0.0) — which fails instantly on a held
+    lock — so the HTTP client is torn down under their in-flight rotations, and
+    a rotation lost there is a lockout for that workspace."""
+    from faultmaven import client as client_mod
+
+    monkeypatch.setattr(client_mod, "_CLOSE_DRAIN_HEADROOM_SECONDS", 0.2)
+
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T2", organization_id="org-b", refresh_token="rt-t2")
+
+    client = make_client(lambda r: token_response(), workspaces=store, timeout=0.05)
+    first, second = client._credential_for("T1"), client._credential_for("T2")
+    budget = 0.25  # timeout + headroom
+
+    # T1 outlasts its own budget, so close() gives up on it. T2 is released
+    # after a SHARED clock would already be exhausted but well inside its own
+    # budget — so it is drained iff the budget is per-credential.
+    first.renew_lock.acquire()
+    second.renew_lock.acquire()
+    threading.Timer(budget * 1.4, second.renew_lock.release).start()
+
+    undrained: list[str] = []
+    real_warning = client_mod.logger.warning
+
+    def capture(msg, *args):
+        if "renewal still in flight" in msg:
+            undrained.append(args[0])
+        else:
+            real_warning(msg, *args)
+
+    monkeypatch.setattr(client_mod.logger, "warning", capture)
+
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    closer.join(timeout=5)
+    first.renew_lock.release()
+
+    assert not closer.is_alive()
+    assert undrained == [first.label], (
+        "T2 must get its own budget, not the remainder of a shared one "
+        f"(undrained={undrained})"
+    )
+
+
+def test_a_rebound_workspace_adopts_its_new_organization(tmp_path):
+    """The cached credential outlives a re-bind. Without reconciliation its
+    stale organization makes the cross-tenant guard reject the very token the
+    re-bind provisioned — every turn failing until a restart, while blaming the
+    backend for minting the wrong tenant."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-old")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            presented = json.loads(request.content)["refresh_token"]
+            if presented == "rt-old":
+                return httpx.Response(401, json={"detail": "revoked"})
+            return token_response(access=jwt_with_org("org-b"), refresh="rt-new2")
+        return httpx.Response(200, json={"case_id": "case_abc"})
+
+    client = make_client(handler, workspaces=store)
+    client._credential_for("T1")  # cache it against org-a
+
+    store.bind(team_id="T1", organization_id="org-b", refresh_token="rt-new")
+
+    assert client.create_case(team_id="T1") == "case_abc"
+    assert client._credential_for("T1").organization_id == "org-b"
+
+
+def test_an_unbound_workspace_drops_its_cached_credential(tmp_path):
+    """After an uninstall the cached copy must not keep serving turns that the
+    binding no longer authorizes."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    client = make_client(
+        lambda r: httpx.Response(401, json={"detail": "revoked"}), workspaces=store
+    )
+    cred = client._credential_for("T1")
+    store.unbind("T1")
+
+    with pytest.raises(FaultMavenCredentialError):
+        client._renew(cred)
+    assert "T1" not in client._workspaces
+
+
+def test_a_restored_credential_is_aged_from_when_it_was_stored(tmp_path):
+    """Stamping the age at cache time restarts the blind-renew clock on every
+    restart, so an opaque credential ages out to expiry unrenewed."""
+    import time as _time
+    from datetime import datetime, timedelta, timezone
+
+    from faultmaven.client import _REFRESH_BLIND_RENEW_SECONDS
+
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="opaque-token")
+    # Backdate the row past the blind-renew threshold.
+    with store._engine.begin() as conn:
+        conn.execute(
+            store._table.update().values(
+                updated_at=datetime.now(timezone.utc)
+                - timedelta(seconds=_REFRESH_BLIND_RENEW_SECONDS + 3600)
+            )
+        )
+
+    client = make_client(lambda r: token_response(), workspaces=store)
+    cred = client._credential_for("T1")
+
+    assert cred.obtained_at < _time.monotonic() - _REFRESH_BLIND_RENEW_SECONDS
+    assert client._refresh_credential_is_due(cred) is True
+
+
+def test_a_grid_keyed_row_is_not_reported_as_a_resolvable_binding(tmp_path):
+    """``get()`` looks up enterprise_id='' today, so listing a Grid row would
+    report a workspace as bound that then resolves to nothing."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+    store.bind(
+        team_id="T-grid",
+        organization_id="org-a",
+        refresh_token="rt-g",
+        enterprise_id="E1",
+    )
+
+    assert store.team_ids() == ["T1"]
+    assert store.get("T-grid") is None
+    assert store.get("T-grid", enterprise_id="E1") is not None
+
+
+def test_a_token_with_no_organization_claim_is_flagged(tmp_path, caplog):
+    """A decodable JWT that names no tenant is not the opaque-token case: the
+    guard has nothing to compare, and a claim rename upstream would otherwise
+    disable it permanently and invisibly."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return token_response(access=jwt_with_org(None))
+        return httpx.Response(200, json={"case_id": "case_abc"})
+
+    client = make_client(handler, workspaces=store)
+    with caplog.at_level("WARNING"):
+        assert client.create_case(team_id="T1") == "case_abc"
+
+    assert any("no organization claim" in r.message for r in caplog.records)
+
+
+def test_a_credential_less_deployment_still_says_so_at_boot(caplog):
+    """Without a workspace store, no credential at all is a misconfiguration —
+    booting silently defers it to the first user in the first channel."""
+    client = make_client(lambda r: token_response(), refresh_token="")
+    with caplog.at_level("WARNING"):
+        client.startup()
+
+    assert any("auth deferred" in r.message for r in caplog.records)

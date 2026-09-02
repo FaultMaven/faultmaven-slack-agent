@@ -278,21 +278,30 @@ def test_apply_action_submits_decide_intent():
                    "user_confirmed": True},
         }
     )
-    result = apply_action(fm, "c1", value)
+    result = apply_action(fm, "c1", value, team_id="T1")
     assert result.agent_response == "next"
     case_id, kwargs = fm.turns[0]
     assert case_id == "c1"
     assert kwargs["query"] == "fixed"
     assert kwargs["intent_type"] == "status_transition"
     assert kwargs["intent_data"]["to_state"] == "resolved"
+    # A button click is a turn like any other: it must authenticate as its own
+    # workspace's service account, not the process-wide default (ADR-013 D3).
+    assert kwargs["team_id"] == "T1"
 
 
 def test_apply_action_submits_free_speech_without_intent_data():
     fm = FakeFM()
-    apply_action(fm, "c1", json.dumps({"q": "tell me more", "it": "conversation"}))
+    apply_action(
+        fm,
+        "c1",
+        json.dumps({"q": "tell me more", "it": "conversation"}),
+        team_id="T1",
+    )
     _, kwargs = fm.turns[0]
     assert kwargs["intent_type"] == "conversation"
     assert kwargs.get("intent_data") is None
+    assert kwargs["team_id"] == "T1"
 
 
 # -- the click lifecycle: hide → submit → settle -------------------------------

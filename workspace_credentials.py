@@ -20,6 +20,16 @@ credential provisioned against the wrong organization. That is why
 minted access token (``FaultMavenClient._assert_expected_org``) — this row is the
 only place the intended tenant is written down.
 
+**Lifecycle is operator-driven for now.** Nothing in the agent calls
+:meth:`~WorkspaceCredentialStore.bind` or
+:meth:`~WorkspaceCredentialStore.unbind` yet — there is no install hook, and no
+``app_uninstalled`` / ``tokens_revoked`` listener. Until those land a workspace
+is bound and unbound by an operator, and a credential outlives an uninstall
+until one removes it. That is a known gap, not an oversight; the write API and
+its guards exist so the hook is a caller rather than a redesign. The client
+re-reads this store whenever a credential is rejected, so an operator's change
+takes effect on a running process without a restart.
+
 **Rotation across replicas.** The refresh grant rotates: presenting a token
 revokes it. A client serializes its own renewals per credential, but that lock is
 per-process, so two replicas renewing the *same* workspace credential can still
@@ -66,6 +76,10 @@ class WorkspaceCredential:
     #: for the install-time provisioning flow; the agent itself never sends it —
     #: sharing is resolved server-side from the service account's membership.
     faultmaven_team_id: str | None = None
+    #: When this row was last written. The client ages a restored credential
+    #: from this rather than from when it happened to load it, so the renewal
+    #: cadence is not reset by a restart.
+    updated_at: datetime | None = None
 
 
 class WorkspaceCredentialStore:
@@ -105,6 +119,7 @@ class WorkspaceCredentialStore:
                     self._table.c.refresh_token,
                     self._table.c.enterprise_id,
                     self._table.c.faultmaven_team_id,
+                    self._table.c.updated_at,
                 ).where(
                     self._table.c.team_id == team_id,
                     self._table.c.enterprise_id == enterprise_id,
@@ -118,15 +133,29 @@ class WorkspaceCredentialStore:
             refresh_token=row.refresh_token,
             enterprise_id=row.enterprise_id,
             faultmaven_team_id=row.faultmaven_team_id,
+            updated_at=row.updated_at,
         )
 
     def team_ids(self) -> list[str]:
-        """Every bound workspace, for preflight and diagnostics."""
+        """Every bound workspace this client can actually resolve.
+
+        Restricted to non-Grid rows, matching what :meth:`get` is asked for
+        today: a caller holding only a ``team_id`` looks up
+        ``enterprise_id=NO_ENTERPRISE``, so listing a Grid-keyed row here would
+        report a workspace as bound that then resolves to nothing — a
+        credential check that silently passes on the wrong principal. Lifting
+        this is part of the Grid work, alongside a caller that carries the
+        enterprise id.
+        """
 
         with self._engine.connect() as conn:
             return [
                 row.team_id
-                for row in conn.execute(select(self._table.c.team_id)).all()
+                for row in conn.execute(
+                    select(self._table.c.team_id)
+                    .where(self._table.c.enterprise_id == NO_ENTERPRISE)
+                    .distinct()
+                ).all()
             ]
 
     # -- writes -------------------------------------------------------------
@@ -223,4 +252,11 @@ class WorkspaceCredentialStore:
             )
 
     def close(self) -> None:
-        """No-op: the engine is owned by :mod:`oauth_store`, which closes it."""
+        """No-op: this store does not own its engine.
+
+        The engine is created by :func:`oauth_store.build_oauth_stores` and is
+        shared with Bolt's installation and state stores, which outlive any one
+        client — so disposing it here would pull the pool out from under them.
+        Whoever built it disposes it (``scripts/preflight.py`` does; the long
+        running server holds it for the process lifetime by design).
+        """

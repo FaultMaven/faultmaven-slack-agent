@@ -173,14 +173,20 @@ def check_oauth_db(settings: Settings):
     )
 
 
-def check_workspace_bindings(fm: FaultMavenClient, settings: Settings) -> bool:
-    """Verify each bound workspace's own credential (ADR-013 D3).
+def check_workspace_bindings(
+    fm: FaultMavenClient, settings: Settings, *, authenticate: bool = False
+) -> bool:
+    """Report the workspace bindings (ADR-013 D3), and with ``--full`` test them.
 
     ``check_backend_auth`` proves the *default* principal works, which in a
-    hosted deployment may be the one credential no turn ever uses. A workspace
-    whose credential has expired fails on its first real turn otherwise — and,
-    because tenancy travels only in the token chain, so does one provisioned
-    against the wrong organization.
+    hosted deployment may be the one credential no turn ever uses.
+
+    Authenticating is gated behind ``--full`` because under the refresh grant it
+    is **not** a read-only probe: presenting a refresh token consumes it, and the
+    rotation revokes the copy every running replica is holding. Doing that once
+    per bound workspace on an ordinary health check would fire N credential
+    rejections across the fleet, each recovering only by failing a real turn
+    first. Without ``--full`` this reports the bindings and checks nothing.
     """
 
     print("\nFaultMaven per-workspace credentials")
@@ -198,6 +204,14 @@ def check_workspace_bindings(fm: FaultMavenClient, settings: Settings) -> bool:
             "unsafe against a multi-tenant backend (see docs/design.md §10.1).",
         )
 
+    if not authenticate:
+        return _ok(
+            f"{len(bound)} workspace(s) bound",
+            f"{', '.join(bound[:5])}"
+            + (f" (+{len(bound) - 5} more)" if len(bound) > 5 else "")
+            + " — re-run with --full to authenticate each (rotates credentials)",
+        )
+
     failures: list[str] = []
     for team_id in bound:
         try:
@@ -205,9 +219,11 @@ def check_workspace_bindings(fm: FaultMavenClient, settings: Settings) -> bool:
         except FaultMavenError as exc:
             failures.append(f"{team_id}: {exc}")
     if failures:
+        shown = "; ".join(failures[:3])
+        if len(failures) > 3:
+            shown += f"; (+{len(failures) - 3} more not shown)"
         return _fail(
-            f"{len(failures)}/{len(bound)} workspace credentials rejected",
-            "; ".join(failures[:3]),
+            f"{len(failures)}/{len(bound)} workspace credentials rejected", shown
         )
     return _ok(f"{len(bound)} workspace credential(s) accepted", ", ".join(bound))
 
@@ -241,7 +257,7 @@ def check_backend(fm: FaultMavenClient) -> bool:
 
 def check_backend_auth(fm: FaultMavenClient) -> bool:
     print("\nFaultMaven auth")
-    if fm.auth_mode == "per-workspace refresh grants":
+    if fm.authenticates_per_workspace:
         # Nothing to check here: this deployment authenticates each turn as its
         # own workspace's service account, and check_workspace_bindings verifies
         # those. A default principal would only be the fallback this posture
@@ -334,7 +350,9 @@ def main() -> int:
         results.append(check_backend(fm))
         results.append(check_backend_auth(fm))
         if stores is not None:
-            results.append(check_workspace_bindings(fm, settings))
+            results.append(
+                check_workspace_bindings(fm, settings, authenticate=args.full)
+            )
         if args.full:
             results.append(check_turn_contract(fm))
     finally:
