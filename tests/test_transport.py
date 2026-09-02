@@ -251,7 +251,7 @@ def test_build_app_http_wires_oauth_flow_and_rate_limit_retry(monkeypatch, tmp_p
     try:
         from app import build_app
 
-        bolt_app, store, fm, settings = build_app()
+        bolt_app, store, fm, settings, _stores = build_app()
         try:
             assert settings.slack_transport == "http"
             assert bolt_app.oauth_flow is not None
@@ -299,7 +299,7 @@ def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
     try:
         from app import build_app
 
-        bolt_app, store, fm, settings = build_app()
+        bolt_app, store, fm, settings, _stores = build_app()
         try:
             assert settings.slack_transport == "socket"
             assert bolt_app.oauth_flow is None

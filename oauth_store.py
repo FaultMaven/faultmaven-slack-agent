@@ -28,6 +28,7 @@ from slack_sdk.oauth.state_store.sqlalchemy import SQLAlchemyOAuthStateStore
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 
+from pending_binds import PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
 
 logger = logging.getLogger("faultmaven.slack.oauth")
@@ -53,6 +54,7 @@ class OAuthStores:
     installation_store: SQLAlchemyInstallationStore
     state_store: SQLAlchemyOAuthStateStore
     workspace_credentials: WorkspaceCredentialStore
+    pending_binds: PendingBindStore
 
 
 def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
@@ -93,6 +95,7 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     state_store.metadata.create_all(engine)
 
     workspace_credentials = WorkspaceCredentialStore(engine)
+    pending_binds = PendingBindStore(engine)
 
     logger.info(
         "OAuth stores ready (%s)",
@@ -103,4 +106,5 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
         installation_store=installation_store,
         state_store=state_store,
         workspace_credentials=workspace_credentials,
+        pending_binds=pending_binds,
     )
