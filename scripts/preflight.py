@@ -138,7 +138,14 @@ def check_slack_app(settings: Settings) -> bool:
     return _ok("apps.connections.open passed", "Socket Mode reachable")
 
 
-def check_oauth_db(settings: Settings) -> bool:
+def check_oauth_db(settings: Settings):
+    """Verify the OAuth store, returning ``(ok, stores)``.
+
+    The stores are handed back rather than disposed: the FM client authenticates
+    per workspace off the credential store that rides this same engine, so
+    preflight has to check the credentials it will actually use.
+    """
+
     print("\nOAuth store (HTTP transport)")
     try:
         # Building the stores opens the engine and creates the tables, so this
@@ -151,14 +158,58 @@ def check_oauth_db(settings: Settings) -> bool:
             database_url=settings.slack_database_url,
             client_id=settings.slack_client_id,
         )
-        stores.engine.dispose()
     except Exception as exc:  # noqa: BLE001 — driver missing / DB unreachable
-        return _fail(
-            f"could not open the OAuth store: {exc}",
-            "check SLACK_DATABASE_URL is reachable and its driver is installed "
-            "(postgresql:// needs psycopg2, in requirements.txt).",
+        return (
+            _fail(
+                f"could not open the OAuth store: {exc}",
+                "check SLACK_DATABASE_URL is reachable and its driver is "
+                "installed (postgresql:// needs psycopg2, in requirements.txt).",
+            ),
+            None,
         )
-    return _ok("OAuth store reachable", "installation + state tables ready")
+    return (
+        _ok("OAuth store reachable", "installation + credential tables ready"),
+        stores,
+    )
+
+
+def check_workspace_bindings(fm: FaultMavenClient, settings: Settings) -> bool:
+    """Verify each bound workspace's own credential (ADR-013 D3).
+
+    ``check_backend_auth`` proves the *default* principal works, which in a
+    hosted deployment may be the one credential no turn ever uses. A workspace
+    whose credential has expired fails on its first real turn otherwise — and,
+    because tenancy travels only in the token chain, so does one provisioned
+    against the wrong organization.
+    """
+
+    print("\nFaultMaven per-workspace credentials")
+    bound = fm.bound_workspaces()
+    if not bound:
+        if settings.faultmaven_require_workspace_binding:
+            return _fail(
+                "no Slack workspace is bound to a FaultMaven organization",
+                "FAULTMAVEN_REQUIRE_WORKSPACE_BINDING is on, so every turn will "
+                "be refused until a workspace is bound.",
+            )
+        return _warn(
+            "no per-workspace credentials bound",
+            "every workspace will be answered as the default service account — "
+            "unsafe against a multi-tenant backend (see docs/design.md §10.1).",
+        )
+
+    failures: list[str] = []
+    for team_id in bound:
+        try:
+            fm.verify_auth(team_id)
+        except FaultMavenError as exc:
+            failures.append(f"{team_id}: {exc}")
+    if failures:
+        return _fail(
+            f"{len(failures)}/{len(bound)} workspace credentials rejected",
+            "; ".join(failures[:3]),
+        )
+    return _ok(f"{len(bound)} workspace credential(s) accepted", ", ".join(bound))
 
 
 def check_backend(fm: FaultMavenClient) -> bool:
@@ -190,6 +241,12 @@ def check_backend(fm: FaultMavenClient) -> bool:
 
 def check_backend_auth(fm: FaultMavenClient) -> bool:
     print("\nFaultMaven auth")
+    if fm.auth_mode == "per-workspace refresh grants":
+        # Nothing to check here: this deployment authenticates each turn as its
+        # own workspace's service account, and check_workspace_bindings verifies
+        # those. A default principal would only be the fallback this posture
+        # exists to remove.
+        return _ok("no default credential", "authenticating per workspace")
     try:
         # verify_auth() obtains a token (refresh grant, preset, or dev-login)
         # AND confirms the backend accepts it — so a stale credential fails here
@@ -262,20 +319,28 @@ def main() -> int:
     # Slack checks don't need the backend, and vice-versa — run all, report all.
     # The Slack-side checks differ by transport: Socket Mode verifies the static
     # bot + app tokens; HTTP verifies the OAuth store (no static bot token exists).
+    stores = None
     if settings.slack_transport == "socket":
         results.append(check_slack_bot(settings))
         results.append(check_slack_app(settings))
     else:  # http
-        results.append(check_oauth_db(settings))
+        oauth_ok, stores = check_oauth_db(settings)
+        results.append(oauth_ok)
 
-    fm = make_fault_client(settings)
+    fm = make_fault_client(
+        settings, stores.workspace_credentials if stores is not None else None
+    )
     try:
         results.append(check_backend(fm))
         results.append(check_backend_auth(fm))
+        if stores is not None:
+            results.append(check_workspace_bindings(fm, settings))
         if args.full:
             results.append(check_turn_contract(fm))
     finally:
         fm.close()
+        if stores is not None:
+            stores.engine.dispose()
 
     return _summarize(results)
 

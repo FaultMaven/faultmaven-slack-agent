@@ -28,6 +28,8 @@ from slack_sdk.oauth.state_store.sqlalchemy import SQLAlchemyOAuthStateStore
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 
+from workspace_credentials import WorkspaceCredentialStore
+
 logger = logging.getLogger("faultmaven.slack.oauth")
 
 # How long an in-flight OAuth ``state`` stays valid between /slack/install and
@@ -39,11 +41,18 @@ _STATE_EXPIRATION_SECONDS = 600
 
 @dataclass(slots=True)
 class OAuthStores:
-    """The pair of stores Bolt's ``OAuthSettings`` needs, plus their engine."""
+    """The stores Bolt's ``OAuthSettings`` needs, plus their engine.
+
+    ``workspace_credentials`` rides the same engine deliberately: a workspace's
+    FaultMaven credential is per-install state, exactly like its bot token, so it
+    belongs in the database that is shared across replicas rather than on one
+    pod's volume (see :mod:`workspace_credentials`).
+    """
 
     engine: Engine
     installation_store: SQLAlchemyInstallationStore
     state_store: SQLAlchemyOAuthStateStore
+    workspace_credentials: WorkspaceCredentialStore
 
 
 def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
@@ -83,6 +92,8 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     installation_store.metadata.create_all(engine)
     state_store.metadata.create_all(engine)
 
+    workspace_credentials = WorkspaceCredentialStore(engine)
+
     logger.info(
         "OAuth stores ready (%s)",
         engine.url.render_as_string(hide_password=True),
@@ -91,4 +102,5 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
         engine=engine,
         installation_store=installation_store,
         state_store=state_store,
+        workspace_credentials=workspace_credentials,
     )

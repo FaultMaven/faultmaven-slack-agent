@@ -32,7 +32,7 @@ class FakeFM:
         self.creates: list[tuple] = []
         self.turns: list[tuple] = []
 
-    def create_case(self, *, title=None, initial_message=None) -> str:
+    def create_case(self, *, title=None, initial_message=None, team_id=None) -> str:
         self.creates.append((title, initial_message))
         return f"case{len(self.creates)}"
 

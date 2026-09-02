@@ -748,10 +748,62 @@ workspace).
   `OAuthSettings` with a **Postgres-backed `InstallationStore`** and
   `OAuthStateStore` (the template's `FileInstallationStore` is dev-only).
 - Yields the per-team bot token (`xoxb`), `team_id`, installer identity.
-- During install, the installing **admin links the workspace to a FaultMaven
-  Team** (within the customer's Organization; a one-time FaultMaven OAuth/admin
-  step), establishing `team_id → faultmaven_team_id` (and thereby the owning
-  `org_id`).
+- The installing **admin links the workspace to a FaultMaven Team** (within the
+  customer's Organization; a one-time FaultMaven OAuth/admin step), establishing
+  `team_id → faultmaven_team_id` (and thereby the owning `org_id`).
+
+> **Link, never create.** The Organization is a **precondition**, not something
+> this flow provisions. It is the RLS tenant and the billing boundary, its rows
+> are written by an operator holding the RLS-owning database role (see
+> `fm-provision-sso-org`), and FaultMaven deliberately has **no just-in-time
+> tenant provisioning** — an unmapped IdP organization fails a login closed
+> rather than minting a tenant. A Slack install auto-creating one would be that
+> rejected pattern, driven by an admin who has not authenticated to FaultMaven
+> at all. The **Team** is different: a Team is not a tenant, so find-or-create
+> inside an already-mapped Organization is legitimate, and mirrors what SSO
+> already does for users and org membership.
+>
+> **Ordering (ADR-013).** Organization (precondition) → Team (find-or-create) →
+> the `slack` service account → its **Organization** membership → its **Team**
+> membership. The org membership is not optional plumbing: team-membership
+> writes reject a target who is not already an org member, and it is the Team
+> membership that makes `_auto_share_slack_case` resolve to anything at all.
+
+**Where the credential lives.** Each bound workspace's FaultMaven refresh
+credential is stored beside its installation, in `SLACK_DATABASE_URL`
+(`workspace_credentials.py`) — not on a pod volume, because the binding is
+per-install state shared across replicas, exactly like the bot token. Every turn
+authenticates as its own workspace's credential (`FaultMavenClient` resolves it
+from Bolt's `context.team_id`), so the case is owned in the right Organization
+and auto-shares to the right Team.
+
+**Tenancy is carried only by the token.** The backend's `users` table has no
+organization column: `/auth/refresh` re-attaches whatever `organization_id` the
+presented refresh token held, and the request's org context is bound from that
+claim. Two consequences the agent is built around:
+
+1. Nothing needs to *send* an org id — holding the right credential is the whole
+   mechanism.
+2. Nothing server-side contradicts a credential minted against the **wrong**
+   organization. So the binding records the organization it was provisioned for
+   and the client refuses any access token whose claim disagrees; otherwise the
+   mistake stays invisible until a customer finds their incidents in another
+   tenant.
+
+**An unbound workspace is refused, not absorbed.** With
+`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` (**required against a multi-tenant
+backend**) a turn from a workspace with no binding is declined in-thread rather
+than answered as the process-wide default account — that account carries some
+particular organization, so answering would file one customer's incident inside
+another tenant. The default account remains the right answer where there is
+exactly one tenant to be wrong about: Socket Mode and self-hosted.
+
+**Not covered: Enterprise Grid.** An org-wide install (`is_enterprise_install`)
+carries no `team_id` at install time — its workspaces surface at first event,
+when no admin is present to authorize a binding. Binding must therefore also be
+possible lazily, keyed `(enterprise_id, team_id)`. The credential table is keyed
+that way already so the schema need not change, but the lazy-binding flow itself
+is out of scope here.
 
 ### 10.2 FaultMaven account linking (per user)
 

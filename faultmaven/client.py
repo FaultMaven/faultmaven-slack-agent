@@ -63,13 +63,14 @@ _REFRESH_RENEW_MARGIN_SECONDS = 2 * 24 * 3600.0
 _REFRESH_BLIND_RENEW_SECONDS = 24 * 3600.0
 
 
-def _jwt_expiry(token: str) -> float | None:
-    """The ``exp`` claim of a JWT as a POSIX timestamp, or None.
+def _jwt_claims(token: str) -> dict[str, Any] | None:
+    """A JWT's claims, or None if it isn't a decodable JWT.
 
-    Decode only — no signature check, and none is wanted: this reads the expiry
-    of a token we already hold to decide *when* to renew it. The backend remains
-    the only authority on whether it is valid. Hand-rolled rather than pulling
-    in a JWT library for one claim.
+    Decode only — no signature check, and none is wanted: this reads claims off
+    a token we already hold, to decide *when* to renew it and to check that the
+    backend minted it for the tenant we expect. The backend remains the only
+    authority on whether it is valid. Hand-rolled rather than pulling in a JWT
+    library for two claims.
     """
 
     parts = token.split(".")
@@ -81,7 +82,14 @@ def _jwt_expiry(token: str) -> float | None:
         claims = json.loads(base64.urlsafe_b64decode(payload))
     except (ValueError, binascii.Error):
         return None
-    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return claims if isinstance(claims, dict) else None
+
+
+def _jwt_expiry(token: str) -> float | None:
+    """The ``exp`` claim of a JWT as a POSIX timestamp, or None."""
+
+    claims = _jwt_claims(token)
+    exp = claims.get("exp") if claims else None
     return float(exp) if isinstance(exp, (int, float)) else None
 
 
@@ -207,6 +215,23 @@ class _CredentialRejected(FaultMavenCredentialError):
     """
 
 
+class FaultMavenWorkspaceUnlinkedError(FaultMavenError):
+    """This Slack workspace has no FaultMaven credential bound to it.
+
+    Under a multi-tenant (cloud) backend this is a **refusal, not a fallback**.
+    A workspace's cases are owned by *its* ``slack`` service account, and the
+    organization those cases land in travels only in that account's token chain
+    (ADR-013 D3; the backend's ``users`` table has no organization column). So
+    answering an unbound workspace on the process-wide default credential would
+    not degrade gracefully — it would file one customer's incident inside
+    whatever organization that credential happens to carry. Refusing is the only
+    safe direction; the fix is to bind the workspace.
+
+    The process-wide default credential stays legitimate where there is exactly
+    one tenant to be wrong about: Socket Mode and self-hosted deployments.
+    """
+
+
 class FaultMavenTimeoutError(FaultMavenError):
     """The client gave up waiting, but the backend may still complete the turn.
 
@@ -241,6 +266,68 @@ class TurnResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _Credential:
+    """One principal's credential, and the access token it is currently good for.
+
+    A hosted deployment holds one of these **per Slack workspace**: ADR-013 maps
+    a workspace to a Team inside the customer's Organization, and the agent
+    authenticates as that workspace's ``slack`` service account so its cases are
+    owned there and auto-share to the right Team.
+
+    Only the *credential* is per-workspace. The HTTP connection pool and the
+    keepalive scheduler are shared, because neither is tenanted — giving every
+    workspace its own client would multiply threads and pools by the number of
+    installs, and would need an eviction policy whose every eviction races the
+    rotation below.
+
+    Both locks are per-credential, preserving the disciplines the single-client
+    version established while letting two *different* workspaces renew in
+    parallel:
+
+    * ``renew_lock`` is held ACROSS the refresh exchange. Presenting a refresh
+      token consumes it, so two concurrent renewals of the SAME credential would
+      each revoke the other's and lock this workspace out.
+    * ``token_lock`` guards only the read-modify-write of the cached access
+      token, so a racing thread can never observe a transiently blank bearer.
+    """
+
+    #: The Slack workspace (Bolt's ``team_id``) this credential authenticates
+    #: as. ``""`` is the process-wide default: Socket Mode, self-hosted, and any
+    #: deployment that has not bound per-workspace credentials.
+    key: str = ""
+    refresh_token: str = ""
+    #: The configured one-time seed, kept for the documented lockout recovery —
+    #: an operator who re-runs provisioning and restarts must not be defeated by
+    #: the dead token still sitting in the store. See :meth:`_renew`.
+    bootstrap_refresh_token: str = ""
+    token: str = ""
+    token_is_preset: bool = False
+    dev_login_username: str = ""
+    #: The FaultMaven organization this credential is expected to act within,
+    #: recorded when the workspace was bound. Tenancy travels ONLY in the token
+    #: chain, so nothing in the backend's database contradicts a credential
+    #: minted against the wrong organization — this is the one place that can.
+    #: See :meth:`FaultMavenClient._assert_expected_org`.
+    organization_id: str = ""
+    access_expires_at: float = 0.0
+    #: When the credential we hold was obtained, for the keepalive's fallback
+    #: cadence when a token's expiry can't be read.
+    obtained_at: float = field(default_factory=time.monotonic)
+    #: True when the live credential is newer than what is stored (a write
+    #: failed). The keepalive retries the write, so a transient volume problem
+    #: heals instead of becoming a restart-time lockout.
+    unpersisted: bool = False
+    renew_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    token_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def label(self) -> str:
+        """How this credential is named in an operator-facing log line."""
+
+        return f"workspace {self.key}" if self.key else "the default credential"
+
+
 class FaultMavenClient:
     """Sync facade over the FaultMaven core API."""
 
@@ -254,53 +341,61 @@ class FaultMavenClient:
         refresh_token: str = "",
         credential_store: Any = None,
         oauth_client_id: str = "faultmaven-slack-agent",
+        workspace_credentials: Any = None,
+        require_workspace_binding: bool = False,
     ) -> None:
         # --- refresh-grant credential (ADR-012 D10) ---------------------------
         # The persisted credential wins over the configured one: rotation makes
         # the configured value a one-time seed that is revoked the moment it is
         # first used, so after the first renewal only the store is current.
-        # ``_bootstrap_refresh_token`` is kept so that an operator who re-runs
+        # ``bootstrap_refresh_token`` is kept so that an operator who re-runs
         # provisioning (the documented lockout recovery) and restarts the agent
         # is not defeated by the dead token still sitting in the store — see
         # :meth:`_renew`.
         self._credential_store = credential_store
-        self._bootstrap_refresh_token = refresh_token
         stored = credential_store.get() if credential_store is not None else None
-        self._refresh_token = stored or refresh_token
         self._oauth_client_id = oauth_client_id
-        self._access_expires_at = 0.0
-        # True when the live credential is newer than what's on disk (a write
-        # failed). The keepalive retries the write, so a transient volume
-        # problem heals instead of becoming a restart-time lockout.
-        self._credential_unpersisted = False
-        # When the credential we hold was obtained, for the keepalive's fallback
-        # cadence when a token's expiry can't be read.
-        self._credential_obtained_at = time.monotonic()
-        # Held ACROSS the renewal request, unlike the token lock below. Renewal
-        # is single-use: two concurrent renewals with the same credential mean
-        # the second presents a token the first already revoked. Serializing
-        # costs one request's latency; not serializing costs a lockout.
-        self._renew_lock = threading.Lock()
         self._keepalive_stop = threading.Event()
         self._keepalive: threading.Thread | None = None
-        if self._refresh_token and credential_store is not None and not stored:
+
+        default_refresh = stored or refresh_token
+        if default_refresh and credential_store is not None and not stored:
             # Seed the store from config on first boot, so the next restart
             # reads the rotated credential rather than the revoked seed.
-            credential_store.put(self._refresh_token)
+            credential_store.put(default_refresh)
 
-        self._token = "" if self._refresh_token else token
-        # A preset token can't be re-acquired: never wipe it on a 401 (a
-        # transient auth blip would otherwise discard it and every later
-        # request would fail into a misleading dev-login error). Under the
-        # refresh grant the access token IS re-acquirable, so it is not preset.
-        self._token_is_preset = bool(token) and not self._refresh_token
-        self._dev_login_username = dev_login_username
+        # The process-wide default principal. In Socket Mode and self-hosted
+        # deployments it is the only one; in a hosted multi-workspace deployment
+        # it is the pre-binding fallback, and ``require_workspace_binding``
+        # withdraws even that (see :class:`FaultMavenWorkspaceUnlinkedError`).
+        self._default = _Credential(
+            key="",
+            refresh_token=default_refresh,
+            bootstrap_refresh_token=refresh_token,
+            # A preset token can't be re-acquired: never wipe it on a 401 (a
+            # transient auth blip would otherwise discard it and every later
+            # request would fail into a misleading dev-login error). Under the
+            # refresh grant the access token IS re-acquirable, so it is not
+            # preset.
+            token="" if default_refresh else token,
+            token_is_preset=bool(token) and not default_refresh,
+            dev_login_username=dev_login_username,
+        )
+
+        # --- per-workspace credentials (ADR-013 D3) --------------------------
+        # ``workspace_credentials`` is the durable binding store; ``_workspaces``
+        # is only its in-process cache, so a credential's rotation state (and
+        # its renew lock) has one home per process. Guarded because turns for
+        # different workspaces land on different threads.
+        self._workspace_credentials = workspace_credentials
+        self._require_workspace_binding = require_workspace_binding
+        self._workspaces: dict[str, _Credential] = {}
+        self._workspaces_lock = threading.Lock()
+        # Workspaces already warned about falling back to the default principal,
+        # so a busy unbound workspace says it once rather than once per turn.
+        self._warned_unbound: set[str] = set()
+
         self._timeout = timeout
-        # The gate is per-thread but this client is shared, so concurrent turns
-        # on different Slack threads race token acquisition/reauth. Serialize
-        # the read-modify-write of ``self._token`` so one thread can't blank a
-        # token another is about to send (empty bearer → spurious 401).
-        self._token_lock = threading.Lock()
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
 
     # -- lifecycle ----------------------------------------------------------
@@ -315,15 +410,22 @@ class FaultMavenClient:
         surface as an uncaught traceback in the daemon.
         """
 
-        if self._refresh_token:
+        # Per-workspace credentials are refresh-grant by construction, so a
+        # hosted deployment needs the keepalive even when the default principal
+        # is a dev-login or has no credential at all.
+        if self._default.refresh_token or self._workspace_credentials is not None:
             self._start_keepalive()
-        if self._token:
+        if self._default.token:
+            return
+        if not (self._default.refresh_token or self._default.dev_login_username):
+            # Hosted, per-workspace-only: there is no default principal to
+            # bootstrap, and that is the intended posture — not a failure.
             return
         try:
             self._ensure_token()
             logger.info(
                 "Bootstrapped FaultMaven token via %s",
-                "refresh grant" if self._refresh_token else "dev-login",
+                "refresh grant" if self._default.refresh_token else "dev-login",
             )
         except Exception as exc:  # noqa: BLE001 — best-effort bootstrap, never fatal
             logger.warning("FaultMaven auth deferred: %s", exc)
@@ -341,23 +443,35 @@ class FaultMavenClient:
         # is a lockout. A renewal is one request, bounded by the request
         # timeout; the keepalive join is not (it can be mid-request when the
         # stop event is set), which is why this waits separately.
-        acquired = self._renew_lock.acquire(timeout=self._timeout + 5.0)
+        # Every credential renews independently, so every one of them has to be
+        # drained — a rotation lost on one workspace locks out that workspace.
+        with self._workspaces_lock:
+            credentials = [self._default, *self._workspaces.values()]
+        deadline = time.monotonic() + self._timeout + 5.0
+        held = []
         try:
-            if not acquired:
-                logger.warning(
-                    "Closing the FaultMaven client with a renewal still in "
-                    "flight; a rotated credential may be lost"
-                )
+            for cred in credentials:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if cred.renew_lock.acquire(timeout=remaining):
+                    held.append(cred)
+                else:
+                    logger.warning(
+                        "Closing the FaultMaven client with a renewal still in "
+                        "flight for %s; a rotated credential may be lost",
+                        cred.label,
+                    )
             self._http.close()
             if self._credential_store is not None:
                 self._credential_store.close()
+            if self._workspace_credentials is not None:
+                self._workspace_credentials.close()
         finally:
-            if acquired:
-                self._renew_lock.release()
+            for cred in held:
+                cred.renew_lock.release()
 
     @property
     def auth_mode(self) -> str:
-        """How this client authenticates, for diagnostics.
+        """How the default principal authenticates, for diagnostics.
 
         Read off the client's own state rather than re-derived from settings:
         the steady state after bootstrap is a persisted credential with the
@@ -365,12 +479,17 @@ class FaultMavenClient:
         having no credential at all.
         """
 
-        if self._refresh_token:
+        if self._workspace_credentials is not None and self._require_workspace_binding:
+            return "per-workspace refresh grants"
+        cred = self._default
+        if cred.refresh_token:
             return "refresh grant"
-        if self._token_is_preset:
+        if cred.token_is_preset:
             return "preset token"
-        if self._dev_login_username:
+        if cred.dev_login_username:
             return "dev-login bootstrap"
+        if self._workspace_credentials is not None:
+            return "per-workspace refresh grants"
         return "no credential configured"
 
     def health(self) -> dict[str, Any]:
@@ -401,8 +520,8 @@ class FaultMavenClient:
             )
         return body
 
-    def verify_auth(self) -> None:
-        """Confirm the current bearer token is actually accepted by the backend.
+    def verify_auth(self, team_id: str | None = None) -> None:
+        """Confirm a principal's bearer token is actually accepted by the backend.
 
         ``_ensure_token`` only *obtains* a token (and short-circuits entirely
         when one is preset), so it can't catch a stale or wrong
@@ -411,11 +530,19 @@ class FaultMavenClient:
         can fail fast instead. Raises :class:`FaultMavenError`; a message
         containing ``401`` means the token was rejected, any other status means
         the check was inconclusive (e.g. the endpoint isn't present).
+
+        ``team_id`` checks one workspace's credential; omitted, it checks the
+        default principal. Preflight iterates the bound workspaces, because a
+        hosted deployment's default principal may be the one credential that is
+        never used.
         """
 
-        self._ensure_token()
+        cred = self._credential_for(team_id)
+        token = self._current_token(cred)
         try:
-            resp = self._http.get("/api/v1/auth/me", headers=self._headers())
+            resp = self._http.get(
+                "/api/v1/auth/me", headers=self._auth_header(token)
+            )
         except httpx.HTTPError as exc:
             raise FaultMavenError(f"auth check request failed: {exc}") from exc
         if resp.status_code == 401:
@@ -425,29 +552,118 @@ class FaultMavenClient:
                 f"auth check inconclusive (HTTP {resp.status_code} from /auth/me)"
             )
 
+    # -- principals ---------------------------------------------------------
+    def bound_workspaces(self) -> list[str]:
+        """The Slack workspaces that have a FaultMaven credential bound.
+
+        For preflight and diagnostics; reads the durable store, not the cache.
+        """
+
+        if self._workspace_credentials is None:
+            return []
+        return list(self._workspace_credentials.team_ids())
+
+    def _credential_for(self, team_id: str | None) -> _Credential:
+        """Resolve the principal a turn from ``team_id`` must authenticate as.
+
+        Falls back to the process-wide default when the workspace has no binding
+        — except under ``require_workspace_binding``, where an unbound workspace
+        is refused rather than answered as the wrong tenant. See
+        :class:`FaultMavenWorkspaceUnlinkedError` for why that is the safe
+        direction and not an over-strict one.
+        """
+
+        if not team_id or self._workspace_credentials is None:
+            return self._default
+
+        with self._workspaces_lock:
+            cached = self._workspaces.get(team_id)
+            if cached is not None:
+                return cached
+
+        # Read outside the lock (it's I/O), then commit under it so two threads
+        # racing a cold workspace still end up sharing ONE credential object —
+        # two would mean two renew locks, which is the double-rotation lockout.
+        record = self._workspace_credentials.get(team_id)
+
+        with self._workspaces_lock:
+            cached = self._workspaces.get(team_id)
+            if cached is not None:
+                return cached
+            if record is None:
+                if self._require_workspace_binding:
+                    raise FaultMavenWorkspaceUnlinkedError(
+                        f"Slack workspace {team_id} is not linked to a FaultMaven "
+                        "organization"
+                    )
+                if team_id not in self._warned_unbound:
+                    self._warned_unbound.add(team_id)
+                    logger.warning(
+                        "Slack workspace %s has no FaultMaven credential bound; "
+                        "answering it as the default service account. Against a "
+                        "multi-tenant backend this files the workspace's cases "
+                        "in whatever organization that account carries — bind "
+                        "the workspace, and set "
+                        "FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true to refuse "
+                        "instead of guessing.",
+                        team_id,
+                    )
+                return self._default
+            cred = _Credential(
+                key=team_id,
+                refresh_token=record.refresh_token,
+                organization_id=record.organization_id,
+            )
+            self._workspaces[team_id] = cred
+            return cred
+
+    def _persist(self, cred: _Credential, refresh_token: str) -> None:
+        """Commit a rotated refresh token to the store that owns it."""
+
+        if cred.key:
+            if self._workspace_credentials is not None:
+                self._workspace_credentials.put_refresh_token(cred.key, refresh_token)
+            return
+        if self._credential_store is not None:
+            self._credential_store.put(refresh_token)
+
+    def _stored_refresh_token(self, cred: _Credential) -> str | None:
+        """Whatever the durable store holds for this credential right now."""
+
+        if cred.key:
+            if self._workspace_credentials is None:
+                return None
+            record = self._workspace_credentials.get(cred.key)
+            return record.refresh_token if record else None
+        if self._credential_store is None:
+            return None
+        return self._credential_store.get()
+
     # -- auth ---------------------------------------------------------------
     def _ensure_token(self) -> None:
-        """Acquire a token if we don't have one (idempotent, thread-safe)."""
+        """Acquire a token for the default principal (idempotent, thread-safe)."""
 
-        self._current_token()
+        self._current_token(self._default)
 
-    def _current_token(self) -> str:
+    def _current_token(self, cred: _Credential) -> str:
         """The bearer token, renewing or acquiring one as the mode requires."""
 
-        if self._refresh_token:
-            return self._access_token_via_refresh_grant()
-        return self._dev_login_token()
+        if cred.refresh_token:
+            return self._access_token_via_refresh_grant(cred)
+        return self._dev_login_token(cred)
 
     # -- refresh grant (ADR-012 D10) ----------------------------------------
-    def _access_token_via_refresh_grant(self) -> str:
+    def _access_token_via_refresh_grant(self, cred: _Credential) -> str:
         """A live access token, renewing it before it expires."""
 
-        token = self._token
-        if token and time.monotonic() < self._access_expires_at:
+        token = cred.token
+        if token and time.monotonic() < cred.access_expires_at:
             return token
-        return self._renew(stale_access=token)
+        return self._renew(cred, stale_access=token)
 
-    def _renew(self, *, stale_access: str = "", force: bool = False) -> str:
+    def _renew(
+        self, cred: _Credential, *, stale_access: str = "", force: bool = False
+    ) -> str:
         """Exchange the refresh token for a new token pair. Single-flight.
 
         The lock is held across the request — the opposite discipline to
@@ -455,6 +671,9 @@ class FaultMavenClient:
         presenting a refresh token *consumes* it. Two threads renewing at once
         would each revoke the other's credential and the loser would be locked
         out until an operator intervened.
+
+        The lock is per-credential, so this serializes one workspace's renewals
+        without making a busy workspace wait on another's.
 
         ``force`` renews even when the access token is still good. The keepalive
         needs it: its job is to slide the *refresh* window, which has nothing to
@@ -464,70 +683,105 @@ class FaultMavenClient:
         # Captured before the lock so we can tell "someone else rotated while we
         # queued" (their token is now current, ours is revoked) from "we are the
         # renewing thread".
-        intended = self._refresh_token
+        intended = cred.refresh_token
 
-        with self._renew_lock:
-            if self._refresh_token != intended and self._token:
-                return self._token
+        with cred.renew_lock:
+            if cred.refresh_token != intended and cred.token:
+                return cred.token
             if not force:
-                current = self._token
+                current = cred.token
                 if (
                     current
                     and current != stale_access
-                    and time.monotonic() < self._access_expires_at
+                    and time.monotonic() < cred.access_expires_at
                 ):
                     return current
 
             try:
-                return self._exchange_refresh_token(self._refresh_token)
+                return self._exchange_refresh_token(cred, cred.refresh_token)
             except _CredentialRejected:
                 # Rejected means the credential we hold is no longer the live
                 # one. Before declaring a lockout, try the two ways a newer one
                 # can exist. (Only a backend rejection reaches here — a failed
                 # persist no longer raises at all.)
-                for candidate, source in self._alternative_credentials():
+                for candidate, source in self._alternative_credentials(cred):
                     logger.warning(
-                        "FaultMaven credential rejected; retrying with the %s",
+                        "FaultMaven credential rejected for %s; retrying with "
+                        "the %s",
+                        cred.label,
                         source,
                     )
                     try:
-                        return self._exchange_refresh_token(candidate)
+                        return self._exchange_refresh_token(cred, candidate)
                     except _CredentialRejected:
                         continue
                 raise
 
-    def _alternative_credentials(self) -> list[tuple[str, str]]:
+    def _alternative_credentials(self, cred: _Credential) -> list[tuple[str, str]]:
         """Credentials worth trying after the one we hold was rejected.
 
-        1. Whatever is on disk now. Another process may have rotated it —
+        1. Whatever the store holds now. Another process may have rotated it —
            ``scripts/preflight.py`` authenticates, which under the refresh grant
            consumes a rotation. Without this, a valid token sitting in the store
            would be ignored and the running agent would stay locked out.
         2. The configured seed, for the documented recovery: the operator
            re-runs provisioning and restarts us while the store still holds the
-           dead token.
+           dead token. A per-workspace credential has no configured seed — its
+           recovery is re-binding the workspace — so this arm is default-only.
         """
 
-        tried = {self._refresh_token}
+        tried = {cred.refresh_token}
         alternatives: list[tuple[str, str]] = []
 
-        if self._credential_store is not None:
-            try:
-                stored = self._credential_store.get()
-            except Exception as exc:  # noqa: BLE001 — unreadable store is not fatal here
-                logger.warning("Could not re-read the credential store: %s", exc)
-                stored = None
-            if stored and stored not in tried:
-                tried.add(stored)
-                alternatives.append((stored, "credential now in the store"))
+        try:
+            stored = self._stored_refresh_token(cred)
+        except Exception as exc:  # noqa: BLE001 — unreadable store is not fatal here
+            logger.warning("Could not re-read the credential store: %s", exc)
+            stored = None
+        if stored and stored not in tried:
+            tried.add(stored)
+            alternatives.append((stored, "credential now in the store"))
 
-        seed = self._bootstrap_refresh_token
+        seed = cred.bootstrap_refresh_token
         if seed and seed not in tried:
             alternatives.append((seed, "configured FAULTMAVEN_REFRESH_TOKEN"))
 
         return alternatives
 
-    def _exchange_refresh_token(self, refresh_token: str) -> str:
+    def _assert_expected_org(self, cred: _Credential, access_token: str) -> None:
+        """Refuse a token minted for an organization this workspace is not bound to.
+
+        Tenancy travels only in the token chain: the backend's ``users`` table
+        has no organization column, so ``/auth/refresh`` re-attaches whatever
+        ``organization_id`` the presented refresh token carried. Nothing in the
+        database contradicts a credential provisioned against the wrong
+        organization — the mistake is invisible until a customer finds their
+        incidents inside another tenant.
+
+        So the binding records the organization it was provisioned for, and this
+        checks every minted access token against it. Refusing turns a silent
+        cross-tenant misroute into a loud, fixable failure. A token whose claim
+        is unreadable is not treated as a mismatch — the backend, not this
+        decoder, is the authority on validity.
+        """
+
+        if not cred.organization_id:
+            return
+        claims = _jwt_claims(access_token)
+        if claims is None:
+            return
+        actual = claims.get("organization_id")
+        if actual is None or actual == cred.organization_id:
+            return
+        raise FaultMavenCredentialError(
+            f"FaultMaven minted a token for organization {actual!r}, but "
+            f"{cred.label} is bound to {cred.organization_id!r}. Refusing to use "
+            "it: this workspace's cases would be filed inside another tenant. "
+            "Re-provision the workspace's service account against the correct "
+            "organization."
+        )
+
+    def _exchange_refresh_token(self, cred: _Credential, refresh_token: str) -> str:
         """POST the refresh grant, persist the rotated token, return access.
 
         Ordering is the whole point: the rotated refresh token is committed to
@@ -551,10 +805,10 @@ class FaultMavenClient:
 
         if resp.status_code in (400, 401):
             raise _CredentialRejected(
-                f"FaultMaven rejected the refresh credential (HTTP "
-                f"{resp.status_code}): {self._error_detail(resp)}. It has expired "
-                "or was revoked (a lost rotation, or two agents sharing one "
-                "credential). Re-run the backend provisioning step "
+                f"FaultMaven rejected the refresh credential for {cred.label} "
+                f"(HTTP {resp.status_code}): {self._error_detail(resp)}. It has "
+                "expired or was revoked (a lost rotation, or two agents sharing "
+                "one credential). Re-run the backend provisioning step "
                 "(scripts/auth/provision_service_account.py) and set the new "
                 "FAULTMAVEN_REFRESH_TOKEN."
             )
@@ -575,6 +829,13 @@ class FaultMavenClient:
         if not rotated:
             raise FaultMavenError("token refresh returned no refresh_token")
 
+        # Before the rotation is committed or the access token is cached: a
+        # cross-tenant credential must not be persisted as this workspace's, and
+        # must never reach a request. The presented token is already revoked, so
+        # this workspace is locked out either way — loudly, and without having
+        # filed anything in the wrong organization.
+        self._assert_expected_org(cred, access)
+
         # Persist BEFORE use — but never at the cost of the token itself. The
         # rotated credential is the only live one (the presented token is
         # already revoked server-side), so discarding it on a write error would
@@ -582,29 +843,32 @@ class FaultMavenClient:
         # that recovering the disk cannot undo. Keep it, say so loudly, and
         # retry the write later: the process stays usable, and a restart before
         # the write succeeds is the only casualty.
-        if self._credential_store is not None:
-            try:
-                self._credential_store.put(rotated)
-                self._credential_unpersisted = False
-            except Exception as exc:  # noqa: BLE001 — degraded, not fatal
-                self._credential_unpersisted = True
-                logger.error(
-                    "Rotated FaultMaven refresh token could NOT be persisted "
-                    "(%s). The agent keeps working, but a restart before this "
-                    "write succeeds needs re-provisioning. Check the volume.",
-                    exc,
-                )
+        try:
+            self._persist(cred, rotated)
+            cred.unpersisted = False
+        except Exception as exc:  # noqa: BLE001 — degraded, not fatal
+            cred.unpersisted = True
+            logger.error(
+                "Rotated FaultMaven refresh token for %s could NOT be persisted "
+                "(%s). The agent keeps working, but a restart before this "
+                "write succeeds needs re-provisioning. Check the volume.",
+                cred.label,
+                exc,
+            )
 
         expires_in = body.get("expires_in")
         lifetime = float(expires_in) if isinstance(expires_in, (int, float)) else 900.0
-        with self._token_lock:
-            self._refresh_token = rotated
-            self._token = access
-            self._credential_obtained_at = time.monotonic()
-            self._access_expires_at = self._credential_obtained_at + max(
+        with cred.token_lock:
+            cred.refresh_token = rotated
+            cred.token = access
+            cred.obtained_at = time.monotonic()
+            cred.access_expires_at = cred.obtained_at + max(
                 lifetime - _ACCESS_EXPIRY_SKEW_SECONDS, 0.0
             )
-        logger.info("Renewed FaultMaven access token via the refresh grant")
+        logger.info(
+            "Renewed FaultMaven access token for %s via the refresh grant",
+            cred.label,
+        )
         return access
 
     def _start_keepalive(self) -> None:
@@ -614,6 +878,10 @@ class FaultMavenClient:
         expires on wall-clock time. A workspace that goes quiet for longer than
         the server's refresh window would come back to a locked-out agent, which
         only an operator can fix.
+
+        One thread covers every credential: the work is a sub-second expiry
+        check per credential once an hour, so a per-workspace thread would buy
+        nothing and cost one thread per install.
         """
 
         if self._keepalive is not None:
@@ -628,42 +896,61 @@ class FaultMavenClient:
 
     def _keepalive_loop(self) -> None:
         while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
-            try:
-                self._retry_pending_persist()
-                if self._refresh_credential_is_due():
-                    # force: the access token's remaining life is irrelevant —
-                    # this renewal exists to slide the refresh window.
-                    self._renew(force=True)
-            except Exception as exc:  # noqa: BLE001 — a daemon must not die
-                logger.warning("FaultMaven credential keepalive failed: %s", exc)
+            with self._workspaces_lock:
+                credentials = [self._default, *self._workspaces.values()]
+            for cred in credentials:
+                if not cred.refresh_token:
+                    continue
+                try:
+                    self._retry_pending_persist(cred)
+                    if self._refresh_credential_is_due(cred):
+                        # force: the access token's remaining life is irrelevant
+                        # — this renewal exists to slide the refresh window.
+                        self._renew(cred, force=True)
+                except Exception as exc:  # noqa: BLE001 — a daemon must not die
+                    # Per credential, so one workspace's dead credential cannot
+                    # stop every other workspace's window from sliding.
+                    logger.warning(
+                        "FaultMaven credential keepalive failed for %s: %s",
+                        cred.label,
+                        exc,
+                    )
 
-    def _retry_pending_persist(self) -> None:
+    def _retry_pending_persist(self, cred: _Credential) -> None:
         """Re-attempt a write that failed earlier, so the disk error can heal."""
 
-        if not self._credential_unpersisted or self._credential_store is None:
+        if not cred.unpersisted:
             return
-        token = self._refresh_token
+        token = cred.refresh_token
         try:
-            self._credential_store.put(token)
+            self._persist(cred, token)
         except Exception as exc:  # noqa: BLE001 — still broken; try again later
-            logger.warning("FaultMaven credential still not persistable: %s", exc)
+            logger.warning(
+                "FaultMaven credential for %s still not persistable: %s",
+                cred.label,
+                exc,
+            )
             return
-        self._credential_unpersisted = False
-        logger.info("Rotated FaultMaven refresh token persisted after an earlier failure")
+        cred.unpersisted = False
+        logger.info(
+            "Rotated FaultMaven refresh token for %s persisted after an "
+            "earlier failure",
+            cred.label,
+        )
 
-    def _refresh_credential_is_due(self) -> bool:
+    def _refresh_credential_is_due(self, cred: _Credential) -> bool:
         """True when the refresh credential is close enough to expiry to renew."""
 
-        expires_at = _jwt_expiry(self._refresh_token)
+        expires_at = _jwt_expiry(cred.refresh_token)
         if expires_at is None:
             # Expiry unreadable (not a JWT, or an opaque token): fall back to a
             # fixed cadence rather than assuming the credential is fine until it
             # silently isn't.
-            age = time.monotonic() - self._credential_obtained_at
+            age = time.monotonic() - cred.obtained_at
             return age >= _REFRESH_BLIND_RENEW_SECONDS
         return (expires_at - time.time()) <= _REFRESH_RENEW_MARGIN_SECONDS
 
-    def _dev_login_token(self) -> str:
+    def _dev_login_token(self, cred: _Credential) -> str:
         """The bearer token, acquiring one via dev-login if absent.
 
         The lock is NOT held across ``_dev_login`` (a network call bounded only
@@ -675,20 +962,20 @@ class FaultMavenClient:
         original produced.
         """
 
-        token = self._token
+        token = cred.token
         if token:
             return token
-        if not self._dev_login_username:
+        if not cred.dev_login_username:
             raise FaultMavenError(
                 "no FAULTMAVEN_API_TOKEN configured and dev-login disabled"
             )
-        fresh = self._dev_login(self._dev_login_username)  # outside the lock
-        with self._token_lock:
-            if not self._token:
-                self._token = fresh
-            return self._token
+        fresh = self._dev_login(cred.dev_login_username)  # outside the lock
+        with cred.token_lock:
+            if not cred.token:
+                cred.token = fresh
+            return cred.token
 
-    def _reauth(self, stale: str) -> str:
+    def _reauth(self, cred: _Credential, stale: str) -> str:
         """Re-acquire a token after a 401, unless another thread already did.
 
         Under the refresh grant this renews (the access token expired earlier
@@ -701,17 +988,17 @@ class FaultMavenClient:
         token is never transiently blanked.
         """
 
-        if self._refresh_token:
-            return self._renew(stale_access=stale)
+        if cred.refresh_token:
+            return self._renew(cred, stale_access=stale)
 
-        current = self._token
+        current = cred.token
         if current and current != stale:
             return current  # another thread already refreshed
-        fresh = self._dev_login(self._dev_login_username)  # outside the lock
-        with self._token_lock:
-            if self._token == stale or not self._token:
-                self._token = fresh
-            return self._token
+        fresh = self._dev_login(cred.dev_login_username)  # outside the lock
+        with cred.token_lock:
+            if cred.token == stale or not cred.token:
+                cred.token = fresh
+            return cred.token
 
     def _dev_login(self, username: str) -> str:
         try:
@@ -739,13 +1026,11 @@ class FaultMavenClient:
     def _auth_header(token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"} if token else {}
 
-    def _headers(self) -> dict[str, str]:
-        return self._auth_header(self._token)
-
     def _post(
         self,
         url: str,
         *,
+        cred: _Credential,
         json: dict[str, Any] | None = None,
         data: dict[str, str] | None = None,
         files: list | None = None,
@@ -757,14 +1042,14 @@ class FaultMavenClient:
         retry, so turns keep working without a restart.
         """
 
-        token = self._current_token()
+        token = self._current_token(cred)
         resp = self._http.post(
             url, json=json, data=data, files=files,
             headers=self._auth_header(token),
         )
         if resp.status_code == 401:
-            if not self._refresh_token and (
-                self._token_is_preset or not self._dev_login_username
+            if not cred.refresh_token and (
+                cred.token_is_preset or not cred.dev_login_username
             ):
                 # Nothing to re-acquire — surface the 401 as-is (the operator
                 # must rotate FAULTMAVEN_API_TOKEN), keeping the token in place
@@ -775,7 +1060,7 @@ class FaultMavenClient:
                 )
                 return resp
             logger.info("FaultMaven token rejected (401); re-authenticating")
-            token = self._reauth(token)
+            token = self._reauth(cred, token)
             resp = self._http.post(
                 url, json=json, data=data, files=files,
                 headers=self._auth_header(token),
@@ -885,19 +1170,29 @@ class FaultMavenClient:
 
     # -- core calls ---------------------------------------------------------
     def create_case(
-        self, *, title: str | None = None, initial_message: str | None = None
+        self,
+        *,
+        title: str | None = None,
+        initial_message: str | None = None,
+        team_id: str | None = None,
     ) -> str:
         """Create a case and return its ``case_id``.
 
         ``initial_message`` is supported but unused by the Slack agent (see the
         module docstring) — the first turn carries the user's text.
+
+        ``team_id`` selects the Slack workspace whose service account owns the
+        case. The owner decides both the organization the case lands in and, via
+        that account's Team membership, who it auto-shares to (ADR-013 D3) — so
+        passing the wrong one is a tenancy error, not a labelling one.
         """
 
+        cred = self._credential_for(team_id)
         body: dict[str, Any] = {"title": title}
         if initial_message is not None:
             body["initial_message"] = initial_message
         try:
-            resp = self._post("/api/v1/cases", json=body)
+            resp = self._post("/api/v1/cases", cred=cred, json=body)
         except httpx.TimeoutException as exc:
             raise FaultMavenTimeoutError(
                 f"create_case timed out after {self._timeout}s"
@@ -923,6 +1218,7 @@ class FaultMavenClient:
         input_type: str | None = None,
         source_url: str | None = None,
         observed_at: str | None = None,
+        team_id: str | None = None,
     ) -> TurnResult:
         """Submit one turn (multipart) and return the normalized result.
 
@@ -961,11 +1257,15 @@ class FaultMavenClient:
                 "a turn needs at least one of query / pasted_content / files"
             )
 
+        cred = self._credential_for(team_id)
         start = time.monotonic()
         polled = False
         try:
             resp = self._post(
-                f"/api/v1/cases/{case_id}/turns", data=form, files=file_parts
+                f"/api/v1/cases/{case_id}/turns",
+                cred=cred,
+                data=form,
+                files=file_parts,
             )
             # The current backend answers turns synchronously (200). The 202 +
             # Location poll is kept as a forward-compatible safety net only.
@@ -975,6 +1275,7 @@ class FaultMavenClient:
                 polled = True
                 resp = self._poll(
                     resp.headers.get("Location", ""),
+                    cred=cred,
                     deadline=start + self._timeout,
                 )
         except httpx.TimeoutException as exc:
@@ -1074,7 +1375,7 @@ class FaultMavenClient:
         return body if isinstance(body, dict) else {}
 
     def _poll(
-        self, location: str, *, deadline: float | None = None
+        self, location: str, *, cred: _Credential, deadline: float | None = None
     ) -> httpx.Response:
         """Poll an async-turn ``Location`` until it returns a result.
 
@@ -1089,7 +1390,7 @@ class FaultMavenClient:
         if deadline is None:
             deadline = time.monotonic() + self._timeout
 
-        token = self._current_token()
+        token = self._current_token(cred)
         delay = 1.5
         reauthed = False
         while time.monotonic() < deadline:
@@ -1105,8 +1406,8 @@ class FaultMavenClient:
                 resp.status_code == 401
                 and not reauthed
                 and (
-                    self._refresh_token
-                    or (self._dev_login_username and not self._token_is_preset)
+                    cred.refresh_token
+                    or (cred.dev_login_username and not cred.token_is_preset)
                 )
             ):
                 # A token can expire mid-poll on a long async turn — a 15-minute
@@ -1114,7 +1415,7 @@ class FaultMavenClient:
                 # dev-login one. Re-acquire once, same as _post. The endpoint is
                 # known-ready — retry immediately, don't burn budget sleeping.
                 logger.info("token rejected (401) mid-poll; re-authenticating")
-                token = self._reauth(token)
+                token = self._reauth(cred, token)
                 reauthed = True
                 delay = 0.0
                 continue
