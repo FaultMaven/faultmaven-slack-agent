@@ -19,6 +19,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # oauth_config.bot scopes — the manifest is what Slack shows on the consent
 # screen; this list is what Bolt's OAuthSettings sends in the authorize URL, and
 # a mismatch yields an install that silently lacks a scope a listener needs.
+# `tests/test_config.py` asserts that lockstep, because this comment on its own
+# did not hold: `users:read` was added to the manifest and not here, which would
+# have refused every workspace bind with `missing_scope`.
 DEFAULT_BOT_SCOPES: tuple[str, ...] = (
     "assistant:write",
     "chat:write",
@@ -29,7 +32,17 @@ DEFAULT_BOT_SCOPES: tuple[str, ...] = (
     "im:history",
     "channels:history",
     "groups:history",
+    # Reads `users.info` so the install can check the installer administers the
+    # workspace before offering the FaultMaven bind (see `binding`).
+    "users:read",
 )
+
+#: In the manifest but deliberately NOT requested at install. `incoming-webhook`
+#: is carried by the published App Directory listing, and asking for it makes
+#: Slack add a channel-picker step to the consent screen for a capability the
+#: agent never uses. Named here so the lockstep test can state the exception
+#: rather than be loosened.
+MANIFEST_ONLY_BOT_SCOPES: frozenset[str] = frozenset({"incoming-webhook"})
 
 
 class Settings(BaseSettings):

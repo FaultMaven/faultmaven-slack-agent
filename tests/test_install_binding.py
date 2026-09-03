@@ -625,6 +625,7 @@ def _success_callback(monkeypatch, authority, pending_binds):
     monkeypatch.setattr(app_module, "make_web_client", lambda *_a, **_k: object())
     settings = SimpleNamespace(
         install_binding_enabled=True,
+        faultmaven_require_workspace_binding=False,
         faultmaven_dashboard_url="https://dash.example",
         faultmaven_oauth_client_id="faultmaven-slack-agent",
         faultmaven_oauth_redirect_uri="https://slack.example/faultmaven/callback",
@@ -684,3 +685,36 @@ def test_an_unknown_authority_refuses_too_but_says_something_different(monkeypat
     assert "could not confirm" in response.body
     assert "Workspace Owner or Admin" not in response.body
     assert binds.created == 0
+
+
+def test_an_enterprise_grid_org_owner_may_bind():
+    """Grid reports organization authority under ``enterprise_user``.
+
+    A Grid Org Owner is routinely a plain member of any given workspace, so the
+    top-level flags are all false. Reading only those told the highest authority
+    in the organization to go and find a Workspace Admin.
+    """
+    for flag in ("is_admin", "is_owner", "is_primary_owner"):
+        client = _UsersInfoClient(
+            user={"id": "U1", "is_admin": False, "enterprise_user": {flag: True}}
+        )
+        assert installer_authority(client, "U1") is InstallerAuthority.ADMIN
+
+
+def test_a_grid_member_with_no_authority_at_either_level_may_not_bind():
+    client = _UsersInfoClient(
+        user={"id": "U1", "is_admin": False, "enterprise_user": {"is_admin": False}}
+    )
+    assert installer_authority(client, "U1") is InstallerAuthority.NOT_ADMIN
+
+
+def test_refusal_pages_promise_a_working_app_only_when_one_is_promised():
+    """With FAULTMAVEN_REQUIRE_WORKSPACE_BINDING on, an unbound workspace is
+    refused every turn — so "the app works" is a promise of a bot that errors on
+    first mention."""
+    for page in (install_pages.not_admin_page, install_pages.authority_unknown_page):
+        lenient = page(workspace_name="Acme", binding_required=False)
+        strict = page(workspace_name="Acme", binding_required=True)
+        assert "the app works" in lenient
+        assert "the app works" not in strict
+        assert "will not answer in this workspace" in strict
