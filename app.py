@@ -262,7 +262,10 @@ def _install_callbacks(
             return BoltResponse(
                 status=200,
                 headers=_install_html_headers(args),
-                body=page(workspace_name=workspace_name),
+                body=page(
+                    workspace_name=workspace_name,
+                    binding_required=settings.faultmaven_require_workspace_binding,
+                ),
             )
 
         record = pending_binds.create(

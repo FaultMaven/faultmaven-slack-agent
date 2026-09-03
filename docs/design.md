@@ -842,12 +842,30 @@ Team) — so an admin holding only the first consents happily and is refused at 
 bind. Both tokens are revoked on every path, that one included. What is persisted
 is only the workspace service account's own refresh token.
 
-**What is still not solved.** FaultMaven cannot verify Slack-side authority:
-anyone Slack permits to install apps in a workspace can bind it into an
-organization *they* administer. The globally unique service-account username then
-locks the rightful organization out until an operator intervenes. Checking the
-installer is a Slack admin (`users.info`, needing `users:read`) would narrow
-this; it is not implemented.
+**Slack-side authority is checked at install.** Both sides of the join have to
+consent: FaultMaven's side by the organization permissions above, Slack's side by
+`installer_authority` (`users.info`, needing `users:read`), which offers the bind
+only to a Workspace Owner or Admin — reading `enterprise_user` as well, so a Grid
+Org Owner qualifies. Without it, anyone Slack permits to install apps could bind
+a workspace into an organization *they* administer, and the globally unique
+service-account username would lock the rightful organization out until an
+operator intervened. It **fails closed**: any `users.info` failure is reported as
+unknown and refuses, so a deployment whose Slack app configuration predates
+`users:read` binds nothing until the manifest is pushed. What it does not
+establish is that the Slack admin and the FaultMaven admin are the same person —
+two colluding-or-mistaken admins, one on each side, can still connect a
+workspace.
+
+**Uninstall tears the binding down.** `app_uninstalled`, and a `tokens_revoked`
+carrying a *bot* token (a `tokens.oauth`-only payload is one user disconnecting
+their account, with the app still installed), remove the workspace's row, revoke
+its service-account credential server-side, and drop the cached copy — then run
+the SDK's own installation teardown. The workspace's **cases are unaffected**:
+they belong to the service account inside the customer's organization, not to the
+Slack installation, so a reinstall re-binds to the same derived account and the
+history is still there. Slack delivers the event to one replica; the others
+discard the credential at their next rotation, because the UPDATE-only
+`put_refresh_token` finds no row.
 
 **Not covered: Enterprise Grid.** An org-wide install (`is_enterprise_install`)
 carries no `team_id` at install time — its workspaces surface at first event,

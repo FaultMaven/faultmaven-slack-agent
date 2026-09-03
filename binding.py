@@ -247,7 +247,10 @@ def installer_authority(client: WebClient, user_id: str) -> InstallerAuthority:
     ``is_primary_owner`` and ``is_owner`` are checked alongside ``is_admin``
     rather than assumed to imply it: they are independent booleans in the
     payload, and an Owner who somehow lacks the admin flag is unambiguously
-    entitled to this decision.
+    entitled to this decision. The same three are read again under
+    ``enterprise_user``, where Enterprise Grid reports **organization** authority
+    — a Grid Org Owner is commonly a plain member of the workspace they are
+    installing into.
 
     Never raises. Every failure is :data:`~InstallerAuthority.UNKNOWN`, which
     the caller refuses on — the safe direction, since the alternative is
@@ -278,9 +281,15 @@ def installer_authority(client: WebClient, user_id: str) -> InstallerAuthority:
         return InstallerAuthority.UNKNOWN
 
     user = response.get("user") or {}
-    if any(
-        user.get(flag)
-        for flag in ("is_admin", "is_owner", "is_primary_owner")
-    ):
-        return InstallerAuthority.ADMIN
+    # Two levels, because Grid puts them in two places. The top-level flags are
+    # workspace authority; ``enterprise_user`` carries ORGANIZATION authority,
+    # and a Grid Org Owner is routinely an ordinary member of any given
+    # workspace. Reading only the top level tells the highest authority in the
+    # organization to go and find an admin.
+    for scope in (user, user.get("enterprise_user") or {}):
+        if any(
+            scope.get(flag)
+            for flag in ("is_admin", "is_owner", "is_primary_owner")
+        ):
+            return InstallerAuthority.ADMIN
     return InstallerAuthority.NOT_ADMIN
