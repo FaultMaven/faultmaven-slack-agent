@@ -18,6 +18,7 @@ organization admin re-running the whole install.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,6 +30,29 @@ from listeners import register_listeners
 from listeners.lifecycle import register_lifecycle
 
 TEAM = "T0B9XNZDR44"
+
+
+class _RecordingExecutor:
+    """Bolt's listener executor, remembering what it was asked to run.
+
+    Bolt hands the listener to a pool and returns, so a test asserting straight
+    after ``dispatch`` races it. The futures are the only exact handle on "that
+    listener has finished" — the pool is shared and five wide, so neither its
+    idleness nor a barrier task answers the question.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.submitted = []
+
+    def submit(self, fn, *args, **kwargs):
+        future = self._inner.submit(fn, *args, **kwargs)
+        self.submitted.append(future)
+        return future
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
 
 
 @pytest.fixture
@@ -44,8 +68,15 @@ def wiring():
         ssl_check_enabled=False,
         url_verification_enabled=False,
     )
+    app.listener_runner.listener_executor = _RecordingExecutor(
+        app.listener_runner.listener_executor
+    )
     fm = MagicMock()
+    fm.revoke_token.return_value = True
     credentials = MagicMock()
+    credentials.get.return_value = SimpleNamespace(
+        team_id=TEAM, refresh_token="rt-live", organization_id="org-1"
+    )
     register_lifecycle(app, fm, credentials)
     return app, fm, credentials, installation_store
 
@@ -77,8 +108,26 @@ def _dispatch(app: App, event: dict, *, team_id: str | None = TEAM, **top):
             body=json.dumps(body), headers={"content-type": ["application/json"]}
         )
     )
-    app.listener_runner.listener_executor.shutdown(wait=True)
+    _drain(app)
     return response
+
+
+def _drain(app: App) -> None:
+    """Block until the dispatched listener has actually finished.
+
+    Waits on the futures the fixture recorded rather than on a barrier task:
+    Bolt's pool has five workers, so a barrier submitted after the listener can
+    be picked up by a *different* thread and return while the listener is still
+    running — a drain that usually works, which is the worst kind.
+
+    ``executor.shutdown()`` would be exact but permanent: the pool belongs to
+    the App the fixture built, so a second ``_dispatch`` against the same
+    fixture would die with "cannot schedule new futures after shutdown" — an
+    error about the harness, raised by a test about the listener.
+    """
+
+    for future in list(app.listener_runner.listener_executor.submitted):
+        future.result(timeout=10)
 
 
 # -- app_uninstalled ---------------------------------------------------------
@@ -241,3 +290,78 @@ def test_socket_mode_registers_no_lifecycle_listeners():
     subscribed = [c.args[0] for c in app.event.call_args_list if c.args]
     assert "app_uninstalled" not in subscribed
     assert "tokens_revoked" not in subscribed
+
+
+# -- revoking the credential, not just deleting the row ----------------------
+
+
+def test_uninstall_revokes_the_service_account_credential(wiring):
+    """Deleting the row makes the credential unreachable here; revoking makes it
+    unusable anywhere.
+
+    Without this the service-account refresh token stays valid inside the
+    customer's organization for its full lifetime — usable by a replica still
+    holding it, by a database backup, or by anything that logged it.
+    """
+    app, fm, credentials, _ = wiring
+
+    _dispatch(app, {"type": "app_uninstalled"})
+
+    fm.revoke_token.assert_called_once_with(
+        "rt-live", token_type_hint="refresh_token"
+    )
+
+
+def test_the_credential_is_read_before_it_is_deleted(wiring):
+    """Revoking needs the token, and after the DELETE there is nowhere to get it."""
+    app, fm, credentials, _ = wiring
+    order: list[str] = []
+    credentials.get.side_effect = lambda _t: (
+        order.append("read")
+        or SimpleNamespace(team_id=TEAM, refresh_token="rt-live", organization_id="o")
+    )
+    credentials.unbind.side_effect = lambda _t: order.append("unbind")
+    fm.revoke_token.side_effect = lambda *_a, **_k: order.append("revoke") or True
+
+    _dispatch(app, {"type": "app_uninstalled"})
+
+    assert order == ["read", "unbind", "revoke"]
+
+
+def test_a_failed_revocation_does_not_abort_the_teardown(wiring):
+    """The local binding still goes, and the installation half still runs."""
+    app, fm, credentials, installation_store = wiring
+    fm.revoke_token.side_effect = RuntimeError("backend down")
+
+    assert _dispatch(app, {"type": "app_uninstalled"}).status == 200
+
+    credentials.unbind.assert_called_once_with(TEAM)
+    fm.forget_workspace.assert_called_once_with(TEAM)
+    installation_store.delete_all.assert_called_once()
+
+
+def test_an_unreadable_binding_still_unbinds(wiring):
+    """Nothing to revoke is not a reason to leave the row behind."""
+    app, fm, credentials, installation_store = wiring
+    credentials.get.side_effect = RuntimeError("database is gone")
+
+    assert _dispatch(app, {"type": "app_uninstalled"}).status == 200
+
+    credentials.unbind.assert_called_once_with(TEAM)
+    fm.revoke_token.assert_not_called()
+    installation_store.delete_all.assert_called_once()
+
+
+def test_forget_workspace_raising_does_not_strand_the_installation(wiring):
+    """`_forget_binding` says it never raises — this is the half that used to.
+
+    `fm.forget_workspace()` and its log line sat outside the guard, so a raise
+    there propagated out of the listener and skipped the SDK teardown entirely,
+    leaving a live bot token behind. The failure fell on the unsafe side.
+    """
+    app, fm, credentials, installation_store = wiring
+    fm.forget_workspace.side_effect = RuntimeError("client torn down")
+
+    assert _dispatch(app, {"type": "app_uninstalled"}).status == 200
+
+    installation_store.delete_all.assert_called_once()

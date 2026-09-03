@@ -108,7 +108,28 @@ def unavailable_page() -> str:
     return _page("Installed", body)
 
 
-def not_admin_page(*, workspace_name: str) -> str:
+def _until_then(binding_required: bool) -> str:
+    """What the app actually does while the workspace stays unbound.
+
+    Not a constant, because it is not always the same fact. Under
+    ``FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`` an unbound workspace is *refused*
+    every turn rather than answered on a default account — so telling that
+    reader "the app works" promises a bot that errors on first mention.
+    """
+
+    if binding_required:
+        return (
+            "Until that happens FaultMaven will not answer in this workspace: "
+            "this deployment refuses investigations it cannot file to the right "
+            "organization."
+        )
+    return (
+        "Until then the app works, but its investigations are not filed to your "
+        "team."
+    )
+
+
+def not_admin_page(*, workspace_name: str, binding_required: bool) -> str:
     """Installed, but the installer does not administer the workspace.
 
     Says who *can* finish it rather than only that this person cannot: the
@@ -118,19 +139,17 @@ def not_admin_page(*, workspace_name: str) -> str:
 
     body = f"""
 <h1>FaultMaven is installed</h1>
-<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong> and
-   ready to use.</p>
+<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong>.</p>
 <p>Connecting this workspace to a FaultMaven organization is the one step left,
    and it has to be done by a <strong>Workspace Owner or Admin</strong> — it
    admits this workspace's investigations into a FaultMaven organization, so
    somebody who administers the workspace has to agree to it.</p>
-<p>Ask one of them to open the FaultMaven install link themselves. Until then
-   the app works, but its investigations are not filed to your team.</p>
+<p>Ask one of them to open the FaultMaven install link themselves. {escape(_until_then(binding_required))}</p>
 <p class="muted">You can close this page.</p>"""
     return _page("Installed", body)
 
 
-def authority_unknown_page(*, workspace_name: str) -> str:
+def authority_unknown_page(*, workspace_name: str, binding_required: bool) -> str:
     """Installed, but Slack would not say whether the installer is an admin.
 
     Deliberately a different page from :func:`not_admin_page`: "you are not an
@@ -140,13 +159,13 @@ def authority_unknown_page(*, workspace_name: str) -> str:
 
     body = f"""
 <h1>FaultMaven is installed</h1>
-<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong> and
-   ready to use.</p>
+<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong>.</p>
 <p>We could not confirm with Slack whether you administer this workspace, so
    the last step — connecting it to a FaultMaven organization — was not
    offered. That check is required, so it is skipped rather than assumed.</p>
 <p>Ask your FaultMaven administrator to check the agent's logs and re-run the
    installation. If the app was updated recently it may need reinstalling to
    pick up the permission this check uses.</p>
+<p>{escape(_until_then(binding_required))}</p>
 <p class="muted">You can close this page.</p>"""
     return _page("Installed", body)

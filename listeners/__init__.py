@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from slack_bolt import App
 
 from faultmaven import FaultMavenClient
 from store import CaseStore
-from workspace_credentials import WorkspaceCredentialStore
 
 from .actions import register_actions
 from .assistant import build_assistant
@@ -14,6 +15,9 @@ from .events import register_events
 from .home import register_home
 from .lifecycle import register_lifecycle
 from .shortcuts import register_shortcuts
+
+if TYPE_CHECKING:  # annotation only — keeps SQLAlchemy off socket mode's import path
+    from workspace_credentials import WorkspaceCredentialStore
 
 
 def register_listeners(

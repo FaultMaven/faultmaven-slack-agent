@@ -1009,6 +1009,31 @@ class FaultMavenClient:
         try:
             self._persist(cred, rotated)
             cred.unpersisted = False
+        except KeyError:
+            # Not a write failure — there is nothing to write TO.
+            # ``put_refresh_token`` is UPDATE-only, so a missing row means this
+            # workspace was UNBOUND (uninstalled, or re-bound elsewhere) while
+            # this process held it cached. Slack delivers that event to one
+            # replica; this is how every other replica finds out.
+            #
+            # Keeping the token here is what the "degraded, not fatal" arm below
+            # would do, and it is wrong for this case: the credential would be
+            # renewed forever and keep serving turns for a workspace that has
+            # removed the app — until the process happened to restart. Drop it
+            # instead, so the next turn re-resolves against the store and is
+            # refused (or answered on the default account) like any other
+            # unbound workspace.
+            self.forget_workspace(cred.key)
+            logger.warning(
+                "FaultMaven workspace %s is no longer bound; discarding its "
+                "cached credential. This replica was still holding it — expected "
+                "after an uninstall handled by another replica.",
+                cred.key,
+            )
+            raise FaultMavenWorkspaceUnlinkedError(
+                f"Slack workspace {cred.key} is no longer linked to a FaultMaven "
+                "organization"
+            ) from None
         except Exception as exc:  # noqa: BLE001 — degraded, not fatal
             cred.unpersisted = True
             logger.error(

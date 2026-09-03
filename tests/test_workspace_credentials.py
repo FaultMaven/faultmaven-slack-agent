@@ -972,3 +972,79 @@ def test_revoke_reports_whether_the_server_accepted_it():
     assert failing.revoke_token("tok", token_type_hint="access_token") is False
     # An empty token is nothing to revoke, not a failure.
     assert failing.revoke_token("", token_type_hint="access_token") is True
+
+
+# -- an unbound workspace must stop being served ------------------------------
+#
+# Slack delivers `app_uninstalled` to ONE replica. Every other replica finds out
+# here, at its next rotation: `put_refresh_token` is UPDATE-only, so a missing
+# row is not a write failure — it is the binding being gone.
+
+
+def test_a_rotation_with_no_row_left_discards_the_cached_credential(tmp_path):
+    """The uninstalled workspace stops being served, on every replica.
+
+    Before this, the missing-row KeyError fell into the "degraded, not fatal"
+    arm that exists for a full disk: the rotation was kept, `unpersisted` was
+    set, and the keepalive force-renewed the credential every cycle. A replica
+    that missed the uninstall kept authenticating turns as that workspace's
+    service account until the process restarted.
+    """
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    client = make_client(
+        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        workspaces=store,
+    )
+
+    # A first turn caches the credential, as any live replica would have.
+    client._credential_for("T1")
+    assert "T1" in client._workspaces
+
+    store.unbind("T1")  # the uninstall, handled by another replica
+
+    with pytest.raises(FaultMavenWorkspaceUnlinkedError):
+        client._renew(client._credential_for("T1"), force=True)
+
+    assert "T1" not in client._workspaces
+
+
+def test_a_discarded_workspace_is_not_kept_alive(tmp_path):
+    """The keepalive walks the cache, so a credential left there is renewed
+    forever. Dropping it is what makes the discard stick."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    client = make_client(
+        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        workspaces=store,
+    )
+    client._credential_for("T1")
+    store.unbind("T1")
+
+    with pytest.raises(FaultMavenWorkspaceUnlinkedError):
+        client._renew(client._credential_for("T1"), force=True)
+
+    assert [c.key for c in client._live_credentials() if c.key] == []
+
+
+def test_a_write_failure_that_is_not_a_missing_row_still_keeps_the_token(tmp_path):
+    """The full-disk case is unchanged: the rotated token is the only live one,
+    so discarding it there would turn a transient fault into a lockout."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    client = make_client(
+        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        workspaces=store,
+    )
+    cred = client._credential_for("T1")
+
+    def boom(_team_id, _token):
+        raise OSError("no space left on device")
+
+    store.put_refresh_token = boom
+
+    client._renew(cred, force=True)
+
+    assert cred.refresh_token == "rt-2"
+    assert cred.unpersisted is True
+    assert "T1" in client._workspaces

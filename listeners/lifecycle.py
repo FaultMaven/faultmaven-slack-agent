@@ -37,10 +37,17 @@ the safer side. The FaultMaven credential is the more dangerous leftover: a
 standing service-account credential inside a customer's organization, where the
 bot token Slack has already revoked is inert.
 
-**Within the binding, unbind then forget.** The store row goes before the
-in-memory copy so a turn racing this teardown re-reads the store and finds
-nothing (refused, or answered on the default account) rather than re-caching the
-credential we are about to drop.
+**Within the binding: read, unbind, revoke, forget.** The record is read first
+because revoking needs the token the delete is about to remove. Deleting the row
+makes the credential unreachable here; **revoking** makes it unusable anywhere,
+which is what actually retires a standing service-account credential.
+
+The store row goes before the in-memory copy so a turn racing this teardown is
+more likely to re-read the store and find nothing. It does not *close* that race
+— ``FaultMavenClient._credential_for`` reads the store outside its cache lock,
+so a turn that read the row just before the delete can still cache it just
+after. The revocation is what makes that harmless: the cached copy no longer
+authenticates.
 
 **What survives, deliberately.** The workspace's *cases* are untouched: they
 belong to the service account inside the customer's organization, not to the
@@ -48,13 +55,14 @@ Slack installation. A reinstall re-binds to the same derived account
 (``slack-<team_id>``, find-or-create) in the same organization, so the history
 is still there and still owned correctly.
 
-**What this cannot reach.** Slack delivers the event to one replica. Another
-replica that has the workspace cached keeps renewing that credential until its
-next rotation, when ``put_refresh_token`` finds no row and raises — caught and
-logged per credential by the keepalive. Bounded and noisy rather than silent,
-and closing it properly needs cross-replica invalidation this deployment does
-not have (the same "recovery, not prevention" posture
-:mod:`workspace_credentials` documents for concurrent rotation).
+**Other replicas.** Slack delivers the event to one replica. Another replica
+holding the workspace cached finds out at its next rotation: ``put_refresh_token``
+is UPDATE-only, so the missing row makes ``FaultMavenClient`` discard the cached
+credential and refuse the workspace rather than keep renewing it (an earlier
+version of this note claimed that already happened — it did not; the failed
+write was swallowed and the renewal succeeded, so the replica served the
+uninstalled workspace until it restarted). The revocation above closes the
+window before that rotation is due.
 """
 
 from __future__ import annotations
@@ -97,6 +105,20 @@ def _forget_binding(
         )
         return
 
+    # Read before the delete: revoking needs the token, and after the DELETE
+    # there is nowhere left to get it from.
+    record = None
+    try:
+        record = workspace_credentials.get(team_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not read the FaultMaven binding for workspace %s before "
+            "tearing it down after %s; it will be deleted without revoking its "
+            "credential, which stays valid until it expires",
+            team_id,
+            reason,
+        )
+
     try:
         workspace_credentials.unbind(team_id)
     except Exception:  # noqa: BLE001 — a teardown must not fail the event
@@ -108,9 +130,46 @@ def _forget_binding(
         )
         return
 
-    # Only after the row is gone: forgetting first would let a concurrent turn
-    # re-read the store, still find the row, and cache it again.
-    fm.forget_workspace(team_id)
+    # Deleting the row makes the credential unreachable *here*; revoking makes
+    # it unusable *anywhere*. Without this the service-account refresh token
+    # stays valid inside the customer's organization for its full lifetime —
+    # usable by a replica still holding it, by a database backup, or by anything
+    # that ever logged it. `binding.complete_bind` already revokes the admin's
+    # tokens through the same call for the same reason.
+    if record is not None and record.refresh_token:
+        try:
+            revoked = fm.revoke_token(
+                record.refresh_token, token_type_hint="refresh_token"
+            )
+        except Exception:  # noqa: BLE001 — the local teardown must still finish
+            revoked = False
+            logger.exception(
+                "Revoking the FaultMaven credential for workspace %s raised",
+                team_id,
+            )
+        if not revoked:
+            logger.error(
+                "Could not revoke the FaultMaven service-account credential for "
+                "workspace %s after %s. Its local binding is gone, but the token "
+                "remains valid until it expires — revoke it from FaultMaven if "
+                "that matters.",
+                team_id,
+                reason,
+            )
+
+    # Last, and guarded like the rest: a raise here would skip the caller's
+    # installation teardown and leave a stale bot token behind.
+    try:
+        fm.forget_workspace(team_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not drop the cached credential for workspace %s; this "
+            "replica may keep serving it until its next renewal, which now "
+            "fails and discards it",
+            team_id,
+        )
+        return
+
     logger.info(
         "Removed the FaultMaven binding for Slack workspace %s after %s "
         "(its cases are unaffected)",
