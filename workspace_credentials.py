@@ -20,15 +20,20 @@ credential provisioned against the wrong organization. That is why
 minted access token (``FaultMavenClient._assert_expected_org``) — this row is the
 only place the intended tenant is written down.
 
-**Lifecycle is operator-driven for now.** Nothing in the agent calls
-:meth:`~WorkspaceCredentialStore.bind` or
-:meth:`~WorkspaceCredentialStore.unbind` yet — there is no install hook, and no
-``app_uninstalled`` / ``tokens_revoked`` listener. Until those land a workspace
-is bound and unbound by an operator, and a credential outlives an uninstall
-until one removes it. That is a known gap, not an oversight; the write API and
-its guards exist so the hook is a caller rather than a redesign. The client
-re-reads this store whenever a credential is rejected, so an operator's change
-takes effect on a running process without a restart.
+**Lifecycle is event-driven.** :meth:`~WorkspaceCredentialStore.bind` is called
+by the install flow (:mod:`binding`, once an organization admin has consented),
+and :meth:`~WorkspaceCredentialStore.unbind` by the ``app_uninstalled`` /
+``tokens_revoked`` listeners in :mod:`listeners.lifecycle`, so a credential no
+longer outlives the installation that authorized it. An operator can still write
+either directly: the client re-reads this store whenever a credential is
+rejected, so a change takes effect on a running process without a restart.
+
+One gap remains, bounded and noisy rather than silent: Slack delivers an
+uninstall to **one** replica, and another replica holding the workspace in its
+in-process cache keeps renewing that credential until its next rotation, when
+:meth:`put_refresh_token` finds no row and raises. Closing it properly needs
+cross-replica invalidation, which is the same "recovery, not prevention" posture
+as the rotation race below.
 
 **Rotation across replicas.** The refresh grant rotates: presenting a token
 revokes it. A client serializes its own renewals per credential, but that lock is

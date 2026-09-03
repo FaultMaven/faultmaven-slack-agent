@@ -2,7 +2,7 @@
   "display_information": {
     "name": "FaultMaven (Dev)",
     "description": "AI troubleshooting copilot that runs the investigation, not just answers.",
-    "long_description": "Socket Mode development variant of FaultMaven. Create a SEPARATE Slack app from this manifest for local testing (SLACK_TRANSPORT=socket) — you cannot Socket-connect to the same app that the hosted HTTP/OAuth build serves. The production manifest is manifest.json.",
+    "long_description": "Socket Mode development variant of FaultMaven. Create a SEPARATE Slack app from this manifest for local testing (SLACK_TRANSPORT=socket) \u2014 you cannot Socket-connect to the same app that the hosted HTTP/OAuth build serves. The production manifest is manifest.json.",
     "background_color": "#1a1a2e"
   },
   "features": {
@@ -16,7 +16,7 @@
       "always_online": true
     },
     "assistant_view": {
-      "assistant_description": "I find a problem's root cause the way a seasoned engineer would — triage, hypotheses, targeted evidence, a verified fix — grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
+      "assistant_description": "I find a problem's root cause the way a seasoned engineer would \u2014 triage, hypotheses, targeted evidence, a verified fix \u2014 grounded in your logs, errors, configs, runbooks, and past fixes. You approve and execute; you stay in control.",
       "suggested_prompts": []
     },
     "shortcuts": [
@@ -39,7 +39,8 @@
         "files:read",
         "im:history",
         "channels:history",
-        "groups:history"
+        "groups:history",
+        "users:read"
       ]
     }
   },
@@ -51,7 +52,9 @@
         "message.im",
         "message.channels",
         "message.groups",
-        "app_mention"
+        "app_mention",
+        "app_uninstalled",
+        "tokens_revoked"
       ]
     },
     "interactivity": {

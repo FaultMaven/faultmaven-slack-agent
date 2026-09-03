@@ -106,3 +106,47 @@ def unavailable_page() -> str:
    the browser.</p>
 <p class="muted">You can close this page.</p>"""
     return _page("Installed", body)
+
+
+def not_admin_page(*, workspace_name: str) -> str:
+    """Installed, but the installer does not administer the workspace.
+
+    Says who *can* finish it rather than only that this person cannot: the
+    reader has done nothing wrong, the app works, and the one remaining step
+    needs an authority they do not hold.
+    """
+
+    body = f"""
+<h1>FaultMaven is installed</h1>
+<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong> and
+   ready to use.</p>
+<p>Connecting this workspace to a FaultMaven organization is the one step left,
+   and it has to be done by a <strong>Workspace Owner or Admin</strong> — it
+   admits this workspace's investigations into a FaultMaven organization, so
+   somebody who administers the workspace has to agree to it.</p>
+<p>Ask one of them to open the FaultMaven install link themselves. Until then
+   the app works, but its investigations are not filed to your team.</p>
+<p class="muted">You can close this page.</p>"""
+    return _page("Installed", body)
+
+
+def authority_unknown_page(*, workspace_name: str) -> str:
+    """Installed, but Slack would not say whether the installer is an admin.
+
+    Deliberately a different page from :func:`not_admin_page`: "you are not an
+    admin" and "we could not find out" are different facts, and only one of them
+    is fixed by finding an admin.
+    """
+
+    body = f"""
+<h1>FaultMaven is installed</h1>
+<p>The Slack app is installed in <strong>{escape(workspace_name)}</strong> and
+   ready to use.</p>
+<p>We could not confirm with Slack whether you administer this workspace, so
+   the last step — connecting it to a FaultMaven organization — was not
+   offered. That check is required, so it is skipped rather than assumed.</p>
+<p>Ask your FaultMaven administrator to check the agent's logs and re-run the
+   installation. If the app was updated recently it may need reinstalling to
+   pick up the permission this check uses.</p>
+<p class="muted">You can close this page.</p>"""
+    return _page("Installed", body)
