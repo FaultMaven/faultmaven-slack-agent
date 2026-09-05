@@ -142,6 +142,32 @@ def is_dm_summons(event: dict) -> bool:
     )
 
 
+#: What a bare ``@FaultMaven`` (no text, no file) sends when the thread is NOT
+#: yet an investigation: a summons to open one from the thread's discussion.
+SUMMONS_TEXT = "Please investigate this thread."
+
+
+def mention_text(cleaned: str, *, mapped: bool) -> str:
+    """The turn's ``query`` for an ``app_mention``, given the mention's own text
+    (already through :func:`clean_mention`) and whether the thread is already a
+    case.
+
+    A bare mention on a thread that is not yet a case is a summons — "look at
+    this thread" — and keeps the synthesised :data:`SUMMONS_TEXT`, which the
+    catch-up read then gives context to. A bare mention on a thread that IS a
+    case is the user poking the assistant, not new incident data; sending
+    "Please investigate this thread." there ran a full investigation turn
+    against nothing new. It now sends an EMPTY query, which the backend
+    (contract 2.8.0) answers with a state-aware orientation: where the case
+    stands, what was last asked for, what to do next. Any actual text is
+    passed through unchanged.
+    """
+    text = (cleaned or "").strip()
+    if text:
+        return text
+    return "" if mapped else SUMMONS_TEXT
+
+
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
     followup_dedup = Dedup()
@@ -166,8 +192,9 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = event.get("thread_ts") or event["ts"]
 
         def work() -> None:
-            text = clean_mention(event.get("text", "")) or (
-                "Please investigate this thread."
+            text = mention_text(
+                clean_mention(event.get("text", "")),
+                mapped=store.get(team_id, channel, thread_ts) is not None,
             )
             # Placeholder up front, before the (possibly slow) catch-up read and
             # file download, so the summons is acknowledged immediately.

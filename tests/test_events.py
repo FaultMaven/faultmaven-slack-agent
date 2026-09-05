@@ -11,9 +11,11 @@ import httpx
 from slack_sdk.errors import SlackApiError
 
 from listeners.events import (
+    SUMMONS_TEXT,
     _fetch_thread_context,
     is_dm_summons,
     is_thread_followup_candidate,
+    mention_text,
 )
 
 _BOT = "UBOT"
@@ -127,3 +129,27 @@ def test_returns_prior_human_messages_joined():
 
     out = _fetch_thread_context(Ok(), "C", "TS", exclude_ts="9")
     assert out == "web-1 is 500ing\nsince the deploy"
+
+
+# ---------------------------------------------------------------------------
+# What a bare @mention sends
+# ---------------------------------------------------------------------------
+
+
+def test_bare_mention_on_a_new_thread_is_a_summons():
+    assert mention_text("", mapped=False) == SUMMONS_TEXT
+    assert mention_text("   ", mapped=False) == SUMMONS_TEXT
+
+
+def test_bare_mention_on_an_investigation_thread_sends_an_empty_turn():
+    """The backend answers an empty turn with a state-aware orientation
+    (faultmaven contract 2.8.0); synthesising "Please investigate this
+    thread." there ran a full turn against nothing new."""
+    assert mention_text("", mapped=True) == ""
+    assert mention_text("   ", mapped=True) == ""
+
+
+def test_real_text_passes_through_unchanged():
+    for text in ("the pod is crashlooping again", "help", "hi"):
+        assert mention_text(text, mapped=True) == text
+        assert mention_text(text, mapped=False) == text
