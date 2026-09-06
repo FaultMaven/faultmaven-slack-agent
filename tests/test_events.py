@@ -136,20 +136,17 @@ def test_returns_prior_human_messages_joined():
 # ---------------------------------------------------------------------------
 
 
-def test_bare_mention_on_a_new_thread_is_a_summons():
-    assert mention_text("", mapped=False) == SUMMONS_TEXT
-    assert mention_text("   ", mapped=False) == SUMMONS_TEXT
+def test_bare_mention_on_an_unseeded_thread_is_a_summons():
+    """Unseeded, not unmapped: a mapping whose opening turn failed still needs
+    the summons (and the catch-up read) on the retry."""
+    assert mention_text("", seeded=False) == SUMMONS_TEXT
 
 
-def test_bare_mention_on_an_investigation_thread_sends_an_empty_turn():
-    """The backend answers an empty turn with a state-aware orientation
-    (faultmaven contract 2.8.0); synthesising "Please investigate this
-    thread." there ran a full turn against nothing new."""
-    assert mention_text("", mapped=True) == ""
-    assert mention_text("   ", mapped=True) == ""
+def test_bare_mention_on_a_seeded_thread_sends_an_empty_turn():
+    assert mention_text("", seeded=True) == ""
 
 
 def test_real_text_passes_through_unchanged():
     for text in ("the pod is crashlooping again", "help", "hi"):
-        assert mention_text(text, mapped=True) == text
-        assert mention_text(text, mapped=False) == text
+        assert mention_text(text, seeded=True) == text
+        assert mention_text(text, seeded=False) == text
