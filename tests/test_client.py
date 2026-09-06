@@ -143,6 +143,21 @@ def test_submit_turn_requires_at_least_one_input():
         client.submit_turn("c1")
 
 
+def test_submit_turn_sends_an_explicit_empty_query():
+    """``query=""`` is an EMPTY turn on purpose (a bare @mention on a seeded
+    thread; the backend answers with an orientation) — it must reach the wire,
+    where ``query=None`` with nothing else still does not."""
+    seen = {}
+
+    def handler(req):
+        seen["body"] = req.content
+        return httpx.Response(200, json={})
+
+    client = make_client(handler, token="tok")
+    client.submit_turn("c1", query="")
+    assert b"query" in seen["body"]
+
+
 def test_submit_turn_connection_lost_after_send_is_indeterminate():
     """A dropped connection AFTER the request is on the wire (the backend may
     have committed the turn) must raise the timeout/indeterminate class, not a

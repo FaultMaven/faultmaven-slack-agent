@@ -114,6 +114,12 @@ RESTARTING_TEXT = (
     "please resend it in a minute."
 )
 # Shared decline for a message whose only content was undownloadable files.
+#: What a bare ``@FaultMaven`` (no text, no readable file) sends when the thread
+#: is not yet a seeded investigation: a summons to open one from the thread's
+#: discussion. Also the fallback when a backend older than contract 2.8.0
+#: refuses the EMPTY turn a seeded thread sends (see ``run_turn_and_post``).
+SUMMONS_TEXT = "Please investigate this thread."
+
 UNREADABLE_FILES_TEXT = (
     ":information_source: I couldn't read the attached file(s) (too large, or "
     "I lack access). Paste the key text and I'll take it from there."
@@ -874,8 +880,15 @@ def run_turn_and_post(
     placeholder_ts: str | None = None,
     mention_user: str | None = None,
     intro_note: str | None = None,
+    empty_turn_fallback: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place.
+
+    ``empty_turn_fallback``: when ``text`` is ``""`` (an EMPTY turn, which the
+    backend answers with an orientation from contract 2.8.0) and the backend
+    refuses it with HTTP 400 — a deployment older than that contract — the turn
+    is re-sent once with this text instead, so a mixed-version deployment gets
+    the pre-2.8.0 behaviour rather than an error.
 
     The caller holds the per-thread gate (:func:`try_begin_turn`), so no two turns
     overlap here. ``mention_user`` addresses the reply to the person whose message
@@ -915,19 +928,34 @@ def run_turn_and_post(
 
     try:
         first_turn = store.get(team_id, channel, thread_ts) is None
-        result = run_turn(
-            fm,
-            store,
-            team_id=team_id,
-            channel_id=channel,
-            thread_ts=thread_ts,
-            text=text,
-            pasted_content=pasted_content,
-            source_url=source_url,
-            observed_at=observed_at,
-            prior_context=prior_context,
-            files=files,
-        )
+
+        def _run(text_: str):
+            return run_turn(
+                fm,
+                store,
+                team_id=team_id,
+                channel_id=channel,
+                thread_ts=thread_ts,
+                text=text_,
+                pasted_content=pasted_content,
+                source_url=source_url,
+                observed_at=observed_at,
+                prior_context=prior_context,
+                files=files,
+            )
+
+        try:
+            result = _run(text)
+        except FaultMavenAPIError as exc:
+            if text == "" and exc.status_code == 400 and empty_turn_fallback:
+                logger.info(
+                    "backend refused the empty turn (pre-2.8.0 contract) in %s; "
+                    "re-sending the summons",
+                    channel,
+                )
+                result = _run(empty_turn_fallback)
+            else:
+                raise
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
         logger.exception("turn failed in %s: %s", channel, exc)
         update(turn_error_text(exc))

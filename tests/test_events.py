@@ -11,9 +11,11 @@ import httpx
 from slack_sdk.errors import SlackApiError
 
 from listeners.events import (
+    SUMMONS_TEXT,
     _fetch_thread_context,
     is_dm_summons,
     is_thread_followup_candidate,
+    mention_text,
 )
 
 _BOT = "UBOT"
@@ -127,3 +129,24 @@ def test_returns_prior_human_messages_joined():
 
     out = _fetch_thread_context(Ok(), "C", "TS", exclude_ts="9")
     assert out == "web-1 is 500ing\nsince the deploy"
+
+
+# ---------------------------------------------------------------------------
+# What a bare @mention sends
+# ---------------------------------------------------------------------------
+
+
+def test_bare_mention_on_an_unseeded_thread_is_a_summons():
+    """Unseeded, not unmapped: a mapping whose opening turn failed still needs
+    the summons (and the catch-up read) on the retry."""
+    assert mention_text("", seeded=False) == SUMMONS_TEXT
+
+
+def test_bare_mention_on_a_seeded_thread_sends_an_empty_turn():
+    assert mention_text("", seeded=True) == ""
+
+
+def test_real_text_passes_through_unchanged():
+    for text in ("the pod is crashlooping again", "help", "hi"):
+        assert mention_text(text, seeded=True) == text
+        assert mention_text(text, seeded=False) == text

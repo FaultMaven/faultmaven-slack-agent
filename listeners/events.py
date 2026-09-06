@@ -25,7 +25,6 @@ from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
-    UNREADABLE_FILES_TEXT,
     Dedup,
     is_thread_busy,
     mark_skipped,
@@ -34,6 +33,8 @@ from ._turn import (
     run_gated,
     run_turn_and_post,
     skipped_files_note,
+    SUMMONS_TEXT,
+    UNREADABLE_FILES_TEXT,
 )
 
 
@@ -142,6 +143,22 @@ def is_dm_summons(event: dict) -> bool:
     )
 
 
+def mention_text(cleaned: str, *, seeded: bool) -> str:
+    """The turn's ``query`` for an ``app_mention``.
+
+    Real text passes through. A bare mention on a thread that is not yet a
+    SEEDED investigation is a summons (:data:`SUMMONS_TEXT`) — "seeded", not
+    merely mapped: a mapping whose opening turn failed still needs the summons
+    and the catch-up read on the retry. A bare mention on a seeded thread is the
+    user poking the assistant, not new data, and sends an EMPTY turn, which the
+    backend answers with a state-aware orientation (``run_turn_and_post`` falls
+    back to the summons on a backend that predates that).
+    """
+    if cleaned:
+        return cleaned
+    return "" if seeded else SUMMONS_TEXT
+
+
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
     followup_dedup = Dedup()
@@ -166,20 +183,21 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = event.get("thread_ts") or event["ts"]
 
         def work() -> None:
-            text = clean_mention(event.get("text", "")) or (
-                "Please investigate this thread."
-            )
+            cleaned = clean_mention(event.get("text", ""))
             # Placeholder up front, before the (possibly slow) catch-up read and
             # file download, so the summons is acknowledged immediately.
             placeholder_ts = post_placeholder(client, channel, thread_ts)
             if placeholder_ts is None:
                 return  # can't post here — /invite @FaultMaven
 
+            # One read of the thread's state, used for both decisions below.
+            seeded = store.is_seeded(team_id, channel, thread_ts)
+
             # Replay the prior discussion until the case has actually landed a
             # turn (unseeded): a mapping whose first submit failed still needs
             # the catch-up on the retry, or the engine investigates blind.
             prior_context = None
-            if not store.is_seeded(team_id, channel, thread_ts):
+            if not seeded:
                 prior_context = _fetch_thread_context(
                     client, channel, thread_ts, exclude_ts=event.get("ts")
                 )
@@ -192,6 +210,16 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             )
             if skipped:
                 _post_note(client, channel, thread_ts, skipped_files_note(skipped))
+            # File(s) present but none readable, and no text: decline, as every
+            # other surface does, instead of sending a turn with nothing on it.
+            if not cleaned and event.get("files") and not files and not snippet_text:
+                try:
+                    client.chat_update(
+                        channel=channel, ts=placeholder_ts, text=UNREADABLE_FILES_TEXT
+                    )
+                except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
+                    logger.warning("decline update failed in %s: %s", channel, exc)
+                return
             run_turn_and_post(
                 client,
                 fm,
@@ -199,16 +227,15 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=text,
+                text=mention_text(cleaned, seeded=seeded),
                 pasted_content=snippet_text,
                 prior_context=prior_context,
                 files=files or None,
                 placeholder_ts=placeholder_ts,
                 mention_user=event.get("user"),
+                empty_turn_fallback=SUMMONS_TEXT,
             )
 
-        # Reserve the thread and run on a background worker; if a turn is already
-        # running, this one is skipped (⏭️).
         run_gated(
             client, team_id=team_id, channel=channel, thread_ts=thread_ts,
             skip_ts=event.get("ts"), work=work,

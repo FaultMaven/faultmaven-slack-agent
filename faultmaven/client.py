@@ -1639,7 +1639,11 @@ class FaultMavenClient:
         """
 
         form: dict[str, str] = {}
-        if query:
+        # ``None`` means "no query was given"; ``""`` is an EMPTY turn sent on
+        # purpose (a bare @mention on an investigation thread — the backend
+        # answers it with a state-aware orientation, contract >= 2.8.0). The
+        # field travels so the guard below sees a turn with content.
+        if query is not None:
             form["query"] = query
         if pasted_content:
             form["pasted_content"] = pasted_content

@@ -15,13 +15,15 @@ from faultmaven.client import TurnResult
 from listeners._turn import (
     CASE_BUSY_TEXT,
     CASE_CLOSED_TEXT,
-    RESTARTING_TEXT,
-    TURN_ERROR_TEXT,
-    TURN_TIMEOUT_TEXT,
     Dedup,
+    RESTARTING_TEXT,
     retry_may_help,
     run_turn,
+    run_turn_and_post,
+    SUMMONS_TEXT,
     turn_error_text,
+    TURN_ERROR_TEXT,
+    TURN_TIMEOUT_TEXT,
 )
 
 # _shutting_down is reset around every test by the autouse fixture in conftest.
@@ -338,3 +340,92 @@ def test_dedup_is_thread_safe():
         t.join()
 
     assert results.count(False) == 1  # exactly one thread saw it as new
+
+
+# -- the EMPTY turn a bare @mention on a seeded thread sends -------------------
+
+
+class _FakeStore:
+    def __init__(self, case_id="case_1", seeded=True):
+        self.m = {("T", "C", "th"): case_id}
+        self.seeded = seeded
+
+    def get(self, t, c, th):
+        return self.m.get((t, c, th))
+
+    def put(self, t, c, th, cid):
+        self.m[(t, c, th)] = cid
+
+    def is_seeded(self, t, c, th):
+        return self.seeded
+
+    def mark_seeded(self, t, c, th):
+        self.seeded = True
+
+    def record_turn(self, *a, **k):
+        pass
+
+    def get_last_turn_ts(self, *a, **k):
+        return None
+
+
+def _result():
+    return TurnResult(agent_response="We're investigating …", case_state="investigating")
+
+
+def test_run_turn_sends_the_empty_query_to_the_backend():
+    """The path PR #65 exists for, driven end to end through the turn runner."""
+    calls = []
+
+    class FakeFM:
+        def submit_turn(self, case_id, **kw):
+            calls.append((case_id, kw))
+            return _result()
+
+    run_turn(FakeFM(), _FakeStore(), team_id="T", channel_id="C", thread_ts="th", text="")
+    assert calls and calls[0][0] == "case_1"
+    assert calls[0][1]["query"] == ""
+
+
+def test_empty_turn_falls_back_to_the_summons_on_a_pre_2_8_backend():
+    """A backend older than contract 2.8.0 answers the empty turn 400; the
+    summons is re-sent once, so a mixed-version deployment keeps working."""
+    from unittest.mock import MagicMock
+
+    calls = []
+
+    class FakeFM:
+        def submit_turn(self, case_id, **kw):
+            calls.append(kw.get("query"))
+            if kw.get("query") == "":
+                raise FaultMavenAPIError("rejected", status_code=400, detail="At least one of query…")
+            return _result()
+
+    client = MagicMock()
+    client.chat_postMessage.return_value = {"ts": "p1"}
+    run_turn_and_post(
+        client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
+        text="", empty_turn_fallback=SUMMONS_TEXT,
+    )
+    assert calls == ["", SUMMONS_TEXT]
+    posted = client.chat_update.call_args.kwargs.get("text", "")
+    assert "hit an error" not in posted and "rejected" not in posted
+
+
+def test_a_non_400_error_on_an_empty_turn_is_not_retried():
+    from unittest.mock import MagicMock
+
+    calls = []
+
+    class FakeFM:
+        def submit_turn(self, case_id, **kw):
+            calls.append(kw.get("query"))
+            raise FaultMavenAPIError("boom", status_code=500)
+
+    client = MagicMock()
+    client.chat_postMessage.return_value = {"ts": "p1"}
+    run_turn_and_post(
+        client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
+        text="", empty_turn_fallback=SUMMONS_TEXT,
+    )
+    assert calls == [""]
