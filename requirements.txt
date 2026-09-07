@@ -5,7 +5,7 @@
 # and the HTTP/Events + multi-workspace OAuth transport (hosted, the production
 # transport — docs/design.md §10, §16 P5).
 slack-bolt==1.30.0
-slack-sdk==3.44.0
+slack-sdk==3.44.1
 
 # HTTP transport: FastAPI hosts the Slack request handler (/slack/events,
 # /slack/install, /slack/oauth_redirect) plus /health for k8s liveness.
