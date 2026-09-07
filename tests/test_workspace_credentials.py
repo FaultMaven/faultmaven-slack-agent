@@ -342,6 +342,91 @@ def test_an_unreadable_claim_is_not_treated_as_a_mismatch(tmp_path):
     assert client.create_case(team_id="T1") == "case_abc"
 
 
+# -- the enterprise-less row: unreachable, and dead if reached ----------------
+#
+# NOT NULL does not exclude the empty string. `bind` refuses to write one and
+# `bind_workspace` refuses to produce one, so the only way a row gets there is
+# around this code entirely — an operator's UPDATE, a restored dump. Both
+# directions are pinned: the store refuses to create it (also
+# `test_bind_refuses_an_unusable_binding`, the middle case), and the assertion
+# refuses to trust it.
+
+
+def test_the_store_refuses_to_write_an_enterprise_less_row(tmp_path):
+    """The write side. Named rather than left to the parametrized table above,
+    because this is the row the whole cross-tenant guard is checked against."""
+    store = make_store(tmp_path)
+
+    with pytest.raises(ValueError, match="fm_enterprise_id"):
+        store.bind(team_id="T1", fm_enterprise_id="", refresh_token="rt-1")
+    assert store.get("T1") is None
+
+
+def test_a_workspace_credential_with_no_enterprise_is_refused(tmp_path):
+    """The read side, at the assertion: dead, not trusted.
+
+    Returning here — "nothing to compare, so allow it" — would be the fail-open
+    arm this assertion exists to close: every token accepted, on the one
+    credential that has nothing to check them against.
+    """
+    from faultmaven.client import _Credential
+
+    client = make_client(lambda r: token_response())
+    cred = _Credential(key="T1", fm_enterprise_id="", refresh_token="rt-1")
+
+    with pytest.raises(FaultMavenCredentialError, match="carries no enterprise"):
+        client._assert_expected_enterprise(cred, jwt_with_enterprise("ent-a"))
+
+
+def test_a_row_emptied_behind_the_stores_back_stops_serving_turns(tmp_path):
+    """The same thing through the whole path, since that is how it would happen.
+
+    An UPDATE that blanks the column leaves a row `get` returns and `bind` would
+    never have written. The workspace must stop being served, not be served
+    against nothing.
+    """
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    with store._engine.begin() as conn:
+        conn.execute(store._table.update().values(fm_enterprise_id=""))
+
+    client = make_client(
+        lambda r: token_response(access=jwt_with_enterprise("ent-a")),
+        workspaces=store,
+    )
+
+    with pytest.raises(FaultMavenCredentialError, match="carries no enterprise"):
+        client.create_case(team_id="T1")
+
+
+def test_the_default_principal_is_not_a_binding_and_is_not_refused(tmp_path):
+    """The deliberate exception, pinned so the arm above cannot swallow it.
+
+    The process-wide default credential (Socket Mode, self-hosted, the
+    pre-binding fallback) has no binding by design — there is nothing to check a
+    claim against, and refusing it would refuse every single-tenant deployment.
+    ``key`` is what separates the two: empty only for the default. What bounds
+    the default is ``require_workspace_binding``, which withdraws it wherever
+    there is more than one tenant to be wrong about.
+    """
+    from faultmaven.client import _Credential
+
+    client = make_client(lambda r: token_response())
+
+    # Directly: an empty key is the default principal, whatever the claim says.
+    client._assert_expected_enterprise(
+        _Credential(key="", fm_enterprise_id=""), jwt_with_enterprise("ent-any")
+    )
+
+    # And through the renewal path it actually takes.
+    default_client = make_client(
+        lambda r: token_response(access=jwt_with_enterprise("ent-any")),
+        refresh_token="default-rt",
+    )
+    default_client._ensure_token()
+    assert default_client._default.token == jwt_with_enterprise("ent-any")
+
+
 # -- lifecycle ----------------------------------------------------------------
 def test_close_drains_every_workspace_credential(tmp_path):
     """Each credential renews independently, so a rotation lost on any one of

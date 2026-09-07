@@ -380,6 +380,11 @@ class _Credential:
     #: recorded when the workspace was bound. A token says which tenant it acts
     #: for, but not which one this workspace was bound to — this is the one
     #: place that can. See :meth:`FaultMavenClient._assert_expected_enterprise`.
+    #:
+    #: Empty ONLY on the process-wide default principal, which has no binding
+    #: (``key`` is empty there too). On a workspace credential it is always the
+    #: bound enterprise: the store refuses to write a row without one, and the
+    #: assertion refuses the credential outright rather than trusting it.
     fm_enterprise_id: str = ""
     access_expires_at: float = 0.0
     #: When the credential we hold was obtained, for the keepalive's fallback
@@ -943,10 +948,36 @@ class FaultMavenClient:
         A token that is not a decodable JWT is still left alone: that is an
         opaque bearer (a deployment shape), not a claim this decoder can read,
         and the backend — not this decoder — is the authority on validity.
+
+        **A workspace credential with no enterprise is dead, not trusted.** It
+        should be unreachable — ``bind`` refuses to write a row without one, and
+        ``bind_workspace`` refuses to call it without a readable claim — but the
+        column is NOT NULL, and NOT NULL does not exclude the empty string, so a
+        row written around this code (an operator's UPDATE, a restored dump)
+        could still carry one. Returning there would be the fail-open arm this
+        assertion exists to close: every token accepted, on the one credential
+        that has nothing to check them against.
+
+        The *process-wide default* principal is the deliberate exception, and
+        ``key`` is what separates them: it names the Slack workspace a credential
+        was resolved for, and is empty only for the default (Socket Mode,
+        self-hosted, and the pre-binding fallback). That principal has no binding
+        by design — there is nothing it could be checked against, and refusing it
+        would refuse every single-tenant deployment. What bounds it is
+        ``require_workspace_binding``, which withdraws it entirely wherever there
+        is more than one tenant to be wrong about.
         """
 
-        if not cred.fm_enterprise_id:
+        if not cred.key:
+            # The process-wide default: no binding, so nothing to compare.
             return
+        if not cred.fm_enterprise_id:
+            raise FaultMavenCredentialError(
+                f"The credential row for {cred.label} carries no enterprise, so "
+                "no minted token can be checked against it. Refusing to use it: "
+                "this workspace's cases would be filed wherever the credential "
+                "happens to point. Re-bind the workspace."
+            )
         claims = _jwt_claims(access_token)
         if claims is None:
             return
