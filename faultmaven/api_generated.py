@@ -15,11 +15,11 @@ class Access(Enum):
 class AdminUserListItem(BaseModel):
     created_at: AwareDatetime = Field(..., title="Created At")
     email: str = Field(..., title="Email")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     full_name: str = Field(..., title="Full Name")
     is_active: bool = Field(..., title="Is Active")
     is_verified: bool = Field(..., title="Is Verified")
     last_login_at: AwareDatetime | None = Field(None, title="Last Login At")
-    organization_id: str = Field(..., title="Organization Id")
     roles: list[str] = Field(..., title="Roles")
     updated_at: AwareDatetime = Field(..., title="Updated At")
     user_id: str = Field(..., title="User Id")
@@ -148,7 +148,12 @@ class BodyShareCaseWithTeamApiV1CasesCaseIdTeamSharesPost(BaseModel):
 
 
 class BodySubmitTurnApiV1CasesCaseIdTurnsPost(BaseModel):
-    files: list[str] | None = Field([], title="Files")
+    files: list[str] | None = Field(
+        [],
+        description="At most ONE file per turn. Submit each additional file as its own turn. `pasted_content` is a separate field and does not count toward this limit, so a turn may carry one file *and* a paste.",
+        max_length=1,
+        title="Files",
+    )
     input_type: str | None = Field(None, title="Input Type")
     intent_data: str | None = Field(None, title="Intent Data")
     intent_type: str | None = Field(None, title="Intent Type")
@@ -183,7 +188,7 @@ class BreakGlassGrant(BaseModel):
     revoked_at: AwareDatetime | None = Field(None, title="Revoked At")
     revoked_by: str | None = Field(None, title="Revoked By")
     target_case_id: str = Field(..., title="Target Case Id")
-    target_organization_id: str = Field(..., title="Target Organization Id")
+    target_enterprise_id: str = Field(..., title="Target Enterprise Id")
 
 
 class BreakGlassGrantListResponse(BaseModel):
@@ -198,10 +203,10 @@ class BreakGlassGrantRequest(BaseModel):
     case_id: constr(min_length=1, max_length=36) = Field(
         ..., description="The single case this grant covers", title="Case Id"
     )
-    organization_id: constr(min_length=1, max_length=36) = Field(
+    enterprise_id: constr(min_length=1, max_length=36) = Field(
         ...,
-        description="Organization owning the case; the RLS scope the read rebinds to",
-        title="Organization Id",
+        description="Enterprise owning the case; the RLS scope the read rebinds to",
+        title="Enterprise Id",
     )
     reason: constr(min_length=20, max_length=2000) = Field(
         ...,
@@ -230,6 +235,11 @@ class CaseCreateRequest(BaseModel):
     title: constr(max_length=200) | None = Field(
         None, description="Case title (optional, auto-generated if not provided)", title="Title"
     )
+
+
+class Format(Enum):
+    markdown = "markdown"
+    html = "html"
 
 
 class CaseState(Enum):
@@ -376,6 +386,11 @@ class HypothesisSummary(BaseModel):
         description="Reason the hypothesis was refuted. Populated only when status=REFUTED; None otherwise. Mirrors the domain model's pair-integrity invariant.",
         title="Refutation Reason",
     )
+    retirement_reason: str | None = Field(
+        None,
+        description="Why the hypothesis was set aside WITHOUT a verdict. Populated only when status=RETIRED; None otherwise. Carried beside ``refutation_reason`` because without it the Hypotheses tab cannot tell a hypothesis that was TESTED and abandoned from one the engine discarded having never grounded it — and retirement is by far the commoner end (40 retired against 8 refuted in the corpus), so the missing half was the larger one (#1142). The domain model truncates this to 200 characters rather than rejecting it, because the user-retire path writes the user's own message into the field.",
+        title="Retirement Reason",
+    )
     state: HypothesisState = Field(
         ..., description="Status: CAPTURED | ACTIVE | VALIDATED | REFUTED | INCONCLUSIVE | RETIRED"
     )
@@ -434,7 +449,7 @@ class KnowledgeBaseDocument(BaseModel):
     document_type: str = Field(..., title="Document Type")
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
     owner_id: str | None = Field(None, title="Owner Id")
-    scope: str | None = Field("global", title="Scope")
+    scope: str = Field(..., title="Scope")
     source_suggestion_id: str | None = Field(None, title="Source Suggestion Id")
     source_url: str | None = Field(None, title="Source Url")
     status: str | None = Field("processed", title="Status")
@@ -625,7 +640,7 @@ class OperatorAccessAuditEntry(BaseModel):
     operator_username: str | None = Field(None, title="Operator Username")
     reason: str | None = Field(None, title="Reason")
     target_case_id: str | None = Field(None, title="Target Case Id")
-    target_organization_id: str | None = Field(None, title="Target Organization Id")
+    target_enterprise_id: str | None = Field(None, title="Target Enterprise Id")
 
 
 class OperatorAccessAuditListResponse(BaseModel):
@@ -647,6 +662,24 @@ class OrganizationSummary(BaseModel):
     name: str = Field(..., description="Human-readable organization name", title="Name")
     organization_id: str = Field(
         ..., description="Organization identifier", title="Organization Id"
+    )
+
+
+class PersonalTenantLimitsStatus(BaseModel):
+    sso_jit_personal_tenant_enabled: bool = Field(
+        ...,
+        description="SSO_JIT_PERSONAL_TENANT_ENABLED — whether an SSO identity with no IdP organization may provision a personal tenant on its first sign-in, i.e. whether self-service sign-up is open. Multi-tenant (Cloud) deployments only: a single-tenant deployment has one organization and never reaches the branch this gates.",
+        title="Sso Jit Personal Tenant Enabled",
+    )
+    sso_jit_personal_tenant_max_per_hour: int = Field(
+        ...,
+        description="SSO_JIT_PERSONAL_TENANT_MAX_PER_HOUR — the ceiling on NEW personal enterprises provisioned per rolling hour, deployment-wide. It bounds provisioning only; tenants that already exist sign in regardless.",
+        title="Sso Jit Personal Tenant Max Per Hour",
+    )
+    tenant_daily_turn_cap: int = Field(
+        ...,
+        description="TENANT_DAILY_TURN_CAP — investigation turns an account in NO organization may take per UTC day before further turns are refused with 429. The deployment DEFAULT only: an organization is uncapped, a single-tenant deployment is never capped, and a per-organization override set with fm-set-turn-cap beats this value.",
+        title="Tenant Daily Turn Cap",
     )
 
 
@@ -676,7 +709,7 @@ class ProgressTransparencyInfo(BaseModel):
     )
     verification_status: str | None = Field(
         None,
-        description="Engine-derived verification status this turn — the grounding × progress join (healthy | treatment_blocked | open | not_yet_productive | insufficient_evidence). Lets the frontend show the honest partial outcome (e.g. insufficient_evidence) alongside the stalled-milestone surfacing.",
+        description="Engine-derived verification status this turn — the grounding × progress join (healthy | treatment_blocked | open | not_yet_productive | insufficient_evidence | restatement_held). Lets the frontend show the honest partial outcome (e.g. insufficient_evidence) alongside the stalled-milestone surfacing.",
         title="Verification Status",
     )
 
@@ -946,8 +979,8 @@ class SuggestedActionResponse(BaseModel):
 
 class TeamResponse(BaseModel):
     description: str | None = Field(None, title="Description")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     name: str = Field(..., title="Name")
-    organization_id: str = Field(..., title="Organization Id")
     team_id: str = Field(..., title="Team Id")
 
 
@@ -1025,6 +1058,11 @@ class TurnResponse(BaseModel):
         description="True when the case's conclusion claims 'verified' certainty while the assurance grade is below 'confirmed' (conclusion_overclaims seam). None when no cause is stated.",
         title="Cause Overclaim",
     )
+    investigation_turn: int | None = Field(
+        None,
+        description="How many of the case's turns so far were investigation work. turn_number is the message clock and advances on every exchange; this excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation and recorded as such (#1329). Every message, aside or not, is charged against the tenant's daily turn cap. Clients that display a turn counter should prefer this.",
+        title="Investigation Turn",
+    )
     milestones_completed: list[str] = Field(..., title="Milestones Completed")
     progress_made: bool = Field(..., title="Progress Made")
     progress_transparency: ProgressTransparencyInfo | None = Field(
@@ -1099,12 +1137,12 @@ class UploadedFilesList(BaseModel):
 class UserDetailResponse(BaseModel):
     created_at: AwareDatetime = Field(..., title="Created At")
     email: str = Field(..., title="Email")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     full_name: str = Field(..., title="Full Name")
     is_active: bool = Field(..., title="Is Active")
     is_verified: bool = Field(..., title="Is Verified")
     last_login_at: AwareDatetime | None = Field(None, title="Last Login At")
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
-    organization_id: str = Field(..., title="Organization Id")
     permissions: list[str] = Field(..., title="Permissions")
     roles: list[str] = Field(..., title="Roles")
     updated_at: AwareDatetime = Field(..., title="Updated At")
@@ -1183,9 +1221,10 @@ class AdminCaseMetadata(BaseModel):
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
     current_turn: int = Field(..., title="Current Turn")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
-    organization_id: str = Field(..., title="Organization Id")
+    organization_id: str | None = Field(None, title="Organization Id")
     resolved_at: AwareDatetime | None = Field(..., title="Resolved At")
     source: str | None = Field("copilot", title="Source")
     stage: InvestigationStage | None
@@ -1242,13 +1281,14 @@ class CaseDetail(BaseModel):
     current_stage: InvestigationStage | None
     current_turn: int = Field(..., title="Current Turn")
     description: str = Field(..., title="Description")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     escalated: bool = Field(..., title="Escalated")
     evidence_count: int = Field(..., title="Evidence Count")
     hypothesis_count: int = Field(..., title="Hypothesis Count")
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
     milestones_completed: list[str] = Field(..., title="Milestones Completed")
-    organization_id: str = Field(..., title="Organization Id")
+    organization_id: str | None = Field(None, title="Organization Id")
     pending_milestones: list[str] = Field(..., title="Pending Milestones")
     resolved_at: AwareDatetime | None = Field(..., title="Resolved At")
     shared_team_ids: list[str] | None = Field(None, title="Shared Team Ids")
@@ -1311,9 +1351,10 @@ class CaseSummary(BaseModel):
     created_at: AwareDatetime = Field(..., title="Created At")
     current_turn: int = Field(..., title="Current Turn")
     description: str = Field(..., title="Description")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
-    organization_id: str = Field(..., title="Organization Id")
+    organization_id: str | None = Field(None, title="Organization Id")
     resolved_at: AwareDatetime | None = Field(..., title="Resolved At")
     shared_team_ids: list[str] | None = Field(None, title="Shared Team Ids")
     source: str | None = Field("copilot", title="Source")
@@ -1418,6 +1459,10 @@ class EnvConfigStatusResponse(BaseModel):
         None, description="Optional features and their configuration status", title="Features"
     )
     llm_provider: str = Field(..., description="Primary LLM provider name", title="Llm Provider")
+    personal_tenant_limits: PersonalTenantLimitsStatus = Field(
+        ...,
+        description="Effective values of the settings that bound self-service sign-up: whether an org-less SSO identity may provision a personal tenant, how many such tenants may be provisioned per hour deployment-wide, and how many investigation turns each one gets per UTC day.",
+    )
     pii_redaction_enabled: bool = Field(..., title="Pii Redaction Enabled")
     rate_limit_enabled: bool = Field(
         ...,
@@ -1486,9 +1531,9 @@ class InvestigationSessionResponse(BaseModel):
     case_id: str = Field(..., title="Case Id")
     created_at: AwareDatetime = Field(..., title="Created At")
     ended_at: AwareDatetime | None = Field(None, title="Ended At")
+    enterprise_id: str = Field(..., title="Enterprise Id")
     findings_summary: str | None = Field(None, title="Findings Summary")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
-    organization_id: str = Field(..., title="Organization Id")
     session_goal: str | None = Field(None, title="Session Goal")
     session_id: str = Field(..., title="Session Id")
     started_at: AwareDatetime = Field(..., title="Started At")
@@ -1631,7 +1676,7 @@ class CaseReport(BaseModel):
         title="Case Id",
     )
     content: str = Field(..., description="Full report content in Markdown format", title="Content")
-    format: Literal["markdown"] = Field("markdown", description="Report format", title="Format")
+    format: Format | None = Field("markdown", description="Report format", title="Format")
     generated_at: str | None = Field(
         None, description="ISO 8601 timestamp when report was first generated", title="Generated At"
     )
