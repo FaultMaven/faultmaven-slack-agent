@@ -7,13 +7,13 @@ this attack works:
 
 1. An attacker installs the Slack app into **their own** workspace — entirely
    legitimate, and it yields a FaultMaven authorize URL.
-2. They forward that URL to an admin of a **victim** organization.
+2. They forward that URL to an admin in a **victim** enterprise.
 3. The victim is signed in to FaultMaven. The consent screen cannot name the
    workspace (it renders the client name and a caller-supplied scope string), so
    nothing on it looks wrong. They approve.
 4. The code lands on our callback and we bind the **attacker's workspace into
-   the victim's tenant** — a `slack` service account inside their organization,
-   on a Team, receiving the attacker's Slack traffic.
+   the victim's tenant** — a `slack` service account inside their enterprise,
+   on a team, receiving the attacker's Slack traffic.
 
 What stops it is that the record below is addressed by a value held **only in
 the installing admin's browser**, as a cookie, and separately from the ``state``

@@ -1,22 +1,27 @@
-"""Per-workspace FaultMaven credentials (ADR-013 D3).
+"""Per-workspace FaultMaven credentials (ADR-017 D6).
 
-A Slack workspace maps to a FaultMaven Team inside the customer's Organization,
-and the agent authenticates as *that workspace's* ``slack`` service account. The
-credential is the only thing that carries the tenant: the backend's ``users``
-table has no organization column, so ``/auth/refresh`` re-attaches whatever
-``organization_id`` the presented refresh token held. Everything that follows is
-a consequence of that, and is pinned here:
+A Slack workspace is admitted to the installer's FaultMaven **enterprise** — the
+isolation boundary — and becomes a team inside it; the agent authenticates as
+*that workspace's* ``slack`` service account. The credential is the only thing
+that carries the tenant into a request: every read is scoped by the
+``enterprise_id`` claim of the bearer presented. Everything that follows is a
+consequence of that, and is pinned here:
 
 * a turn authenticates as the credential bound to its workspace, so its case is
-  owned in the right organization and auto-shares to the right Team;
+  owned in the right enterprise and auto-shares to the right team;
 * two workspaces never share a credential object — sharing one would mean
   sharing its renew lock's *subject*, and the refresh grant rotates, so a shared
   credential is a mutual-revocation lockout;
 * an unbound workspace is REFUSED under ``require_workspace_binding`` rather
   than answered as the default account, which would file one customer's incident
   inside another tenant;
-* a token minted for the wrong organization is refused, because nothing
-  server-side would contradict it.
+* a token minted for the wrong enterprise — or for none — is refused, because a
+  credential can be valid and still belong to somebody else;
+* the ``organization_id`` claim decides nothing and is read for nothing: under
+  ADR-017 D2 it is billing context, and it is absent for every beta account.
+
+**Two enterprises, one word.** ``enterprise_id`` here is Slack's Enterprise Grid
+id; the FaultMaven tenant is always ``fm_enterprise_id``.
 
 Uses httpx.MockTransport, so real request shaping is exercised without a backend.
 """
@@ -45,15 +50,26 @@ def make_store(tmp_path) -> WorkspaceCredentialStore:
     return WorkspaceCredentialStore(engine)
 
 
-def jwt_with_org(org: str | None) -> str:
-    """A token shaped like a JWT — only ``organization_id`` matters here."""
+def jwt_with_enterprise(
+    enterprise: str | None, *, organization: str | None = None
+) -> str:
+    """A token shaped like a JWT, carrying the claims a real one carries.
+
+    ``enterprise`` is the ISOLATION claim — ``None`` leaves it out, which is what
+    a backend speaking JWT but naming no tenant looks like. ``organization`` is
+    the BILLING claim beside it, present only so a test can prove the client
+    ignores it; it is absent from a real token for every beta account.
+    """
 
     def seg(data: dict) -> str:
         return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
     claims = {"exp": 4102444800}
-    if org is not None:
-        claims["organization_id"] = org
+    if enterprise is not None:
+        claims["enterprise_id"] = enterprise
+    if organization is not None:
+        # The claim the client must not read. Deliberately spelled out here.
+        claims["organization_id"] = organization
     return f"{seg({'alg': 'RS256'})}.{seg(claims)}.signature"
 
 
@@ -85,11 +101,11 @@ def token_response(access="at-1", refresh="rt-2", expires_in=900):
 # -- the binding store --------------------------------------------------------
 def test_bind_round_trips_the_tenant_and_the_token(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
 
     record = store.get("T1")
     assert record is not None
-    assert record.organization_id == "org-a"
+    assert record.fm_enterprise_id == "ent-a"
     assert record.refresh_token == "rt-1"
 
 
@@ -100,24 +116,24 @@ def test_an_unbound_workspace_reads_as_none(tmp_path):
 def test_rebinding_replaces_rather_than_duplicates(tmp_path):
     """A reinstall re-binds the same workspace; it must not leave two rows."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
-    store.bind(team_id="T1", organization_id="org-b", refresh_token="rt-2")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-b", refresh_token="rt-2")
 
-    assert store.get("T1").organization_id == "org-b"
+    assert store.get("T1").fm_enterprise_id == "ent-b"
     assert store.team_ids() == ["T1"]
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"team_id": "", "organization_id": "org-a", "refresh_token": "rt"},
-        {"team_id": "T1", "organization_id": "", "refresh_token": "rt"},
-        {"team_id": "T1", "organization_id": "org-a", "refresh_token": ""},
+        {"team_id": "", "fm_enterprise_id": "ent-a", "refresh_token": "rt"},
+        {"team_id": "T1", "fm_enterprise_id": "", "refresh_token": "rt"},
+        {"team_id": "T1", "fm_enterprise_id": "ent-a", "refresh_token": ""},
     ],
 )
 def test_bind_refuses_an_unusable_binding(tmp_path, kwargs):
     """Each missing piece would produce a row the agent cannot safely use — an
-    organization-less binding above all, since it is what the token claim is
+    enterprise-less binding above all, since it is what the token claim is
     checked against."""
     with pytest.raises(ValueError):
         make_store(tmp_path).bind(**kwargs)
@@ -125,10 +141,10 @@ def test_bind_refuses_an_unusable_binding(tmp_path, kwargs):
 
 def test_a_rotation_never_resurrects_an_uninstalled_workspace(tmp_path):
     """put_refresh_token is UPDATE-only. An in-flight rotation landing after an
-    uninstall must not re-create the row — it would have no organization to be
+    uninstall must not re-create the row — it would have no enterprise to be
     checked against, which is exactly the state the guard exists to prevent."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
     store.unbind("T1")
 
     with pytest.raises(KeyError):
@@ -138,7 +154,7 @@ def test_a_rotation_never_resurrects_an_uninstalled_workspace(tmp_path):
 
 def test_put_refresh_token_refuses_an_empty_token(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
     with pytest.raises(ValueError):
         store.put_refresh_token("T1", "")
 
@@ -146,7 +162,7 @@ def test_put_refresh_token_refuses_an_empty_token(tmp_path):
 # -- resolution ---------------------------------------------------------------
 def test_a_turn_authenticates_as_its_own_workspace(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
     presented: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -165,8 +181,8 @@ def test_two_workspaces_never_share_a_credential(tmp_path):
     """The refresh grant rotates: one credential object shared by two workspaces
     would mean each revoking the other's token."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
-    store.bind(team_id="T2", organization_id="org-b", refresh_token="rt-t2")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    store.bind(team_id="T2", fm_enterprise_id="ent-b", refresh_token="rt-t2")
     presented: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -182,15 +198,15 @@ def test_two_workspaces_never_share_a_credential(tmp_path):
 
     assert presented == ["rt-t1", "rt-t2"]
     assert client._credential_for("T1") is not client._credential_for("T2")
-    assert client._credential_for("T1").organization_id == "org-a"
-    assert client._credential_for("T2").organization_id == "org-b"
+    assert client._credential_for("T1").fm_enterprise_id == "ent-a"
+    assert client._credential_for("T2").fm_enterprise_id == "ent-b"
 
 
 def test_a_cold_workspace_resolves_to_one_credential_under_concurrency(tmp_path):
     """Two threads racing an unseen workspace must converge on ONE object: two
     would carry two renew locks, which is the double-rotation lockout."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
     client = make_client(lambda r: token_response(), workspaces=store)
 
     resolved: list = []
@@ -212,7 +228,7 @@ def test_a_cold_workspace_resolves_to_one_credential_under_concurrency(tmp_path)
 
 def test_a_rotation_is_persisted_against_the_workspace_not_the_default(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
 
     client = make_client(
         lambda r: token_response(refresh="rotated-t1"),
@@ -267,19 +283,19 @@ def test_an_unbound_workspace_is_refused_when_binding_is_required(tmp_path):
 
 
 # -- the cross-tenant guard ---------------------------------------------------
-def test_a_token_minted_for_another_organization_is_refused(tmp_path):
-    """Tenancy travels only in the token chain, so a credential provisioned
-    against the wrong organization is invisible server-side. This is the only
-    place the intended tenant is written down, so it is the only place that can
-    catch it."""
+def test_a_token_minted_for_another_enterprise_is_refused(tmp_path):
+    """A credential provisioned against the wrong enterprise mints perfectly
+    valid tokens: the backend is happy, and every case lands inside another
+    customer. This row is the only place the *intended* tenant is written down,
+    so it is the only place that can catch it."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
     client = make_client(
-        lambda r: token_response(access=jwt_with_org("org-WRONG")),
+        lambda r: token_response(access=jwt_with_enterprise("ent-WRONG")),
         workspaces=store,
     )
 
-    with pytest.raises(FaultMavenCredentialError, match="org-WRONG"):
+    with pytest.raises(FaultMavenCredentialError, match="ent-WRONG"):
         client.create_case(team_id="T1")
 
 
@@ -287,9 +303,9 @@ def test_a_mismatched_token_is_refused_before_it_is_persisted(tmp_path):
     """Refusing after storing it would leave the wrong-tenant credential behind
     to be used on the next restart."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
     client = make_client(
-        lambda r: token_response(access=jwt_with_org("org-WRONG"), refresh="rotated"),
+        lambda r: token_response(access=jwt_with_enterprise("ent-WRONG"), refresh="rotated"),
         workspaces=store,
     )
 
@@ -298,13 +314,13 @@ def test_a_mismatched_token_is_refused_before_it_is_persisted(tmp_path):
     assert store.get("T1").refresh_token == "rt-t1", "rotation not committed"
 
 
-def test_a_token_for_the_bound_organization_is_accepted(tmp_path):
+def test_a_token_for_the_bound_enterprise_is_accepted(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/oauth/token"):
-            return token_response(access=jwt_with_org("org-a"))
+            return token_response(access=jwt_with_enterprise("ent-a"))
         return httpx.Response(200, json={"case_id": "case_abc"})
 
     client = make_client(handler, workspaces=store)
@@ -315,7 +331,7 @@ def test_an_unreadable_claim_is_not_treated_as_a_mismatch(tmp_path):
     """The backend, not this decoder, is the authority on a token's validity —
     an opaque token must not be read as a cross-tenant credential."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/oauth/token"):
@@ -331,7 +347,7 @@ def test_close_drains_every_workspace_credential(tmp_path):
     """Each credential renews independently, so a rotation lost on any one of
     them locks out that workspace."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
 
     started = threading.Event()
     release = threading.Event()
@@ -361,8 +377,8 @@ def test_close_drains_every_workspace_credential(tmp_path):
 
 def test_bound_workspaces_are_listed_for_preflight(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
-    store.bind(team_id="T2", organization_id="org-b", refresh_token="rt-2")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
+    store.bind(team_id="T2", fm_enterprise_id="ent-b", refresh_token="rt-2")
 
     client = make_client(lambda r: token_response(), workspaces=store)
     assert sorted(client.bound_workspaces()) == ["T1", "T2"]
@@ -423,17 +439,17 @@ def test_two_workspaces_open_cases_under_their_own_service_accounts(tmp_path):
     """The whole point, exercised through ``run_turn`` rather than the client
     API: two workspaces asking the same question must reach the backend as two
     different principals, because the principal is what decides the owning
-    organization and the Team the case auto-shares to."""
+    enterprise and the team the case auto-shares to."""
     from listeners._turn import run_turn
     from store import CaseStore
 
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
-    store.bind(team_id="T2", organization_id="org-b", refresh_token="rt-t2")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    store.bind(team_id="T2", fm_enterprise_id="ent-b", refresh_token="rt-t2")
 
     # token → the access token minted for it, so a request's bearer identifies
     # which workspace's credential produced it.
-    minted = {"rt-t1": "at-org-a", "rt-t2": "at-org-b"}
+    minted = {"rt-t1": "at-ent-a", "rt-t2": "at-ent-b"}
     bearers: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -457,10 +473,10 @@ def test_two_workspaces_open_cases_under_their_own_service_accounts(tmp_path):
         cases.close()
 
     assert bearers == [
-        "Bearer at-org-a",  # T1 create_case
-        "Bearer at-org-a",  # T1 submit_turn
-        "Bearer at-org-b",  # T2 create_case
-        "Bearer at-org-b",  # T2 submit_turn
+        "Bearer at-ent-a",  # T1 create_case
+        "Bearer at-ent-a",  # T1 submit_turn
+        "Bearer at-ent-b",  # T2 create_case
+        "Bearer at-ent-b",  # T2 submit_turn
     ]
 
 
@@ -502,7 +518,7 @@ def test_the_keepalive_covers_a_workspace_that_has_not_taken_a_turn(tmp_path):
     keepalive off it means a bound-but-quiet workspace never has its refresh
     window slid — the exact lockout the keepalive exists to prevent."""
     store = make_store(tmp_path)
-    store.bind(team_id="T-quiet", organization_id="org-a", refresh_token="rt-quiet")
+    store.bind(team_id="T-quiet", fm_enterprise_id="ent-a", refresh_token="rt-quiet")
 
     client = make_client(lambda r: token_response(), workspaces=store)
     assert client._workspaces == {}, "nothing has taken a turn yet"
@@ -513,7 +529,7 @@ def test_the_keepalive_covers_a_workspace_that_has_not_taken_a_turn(tmp_path):
 
 def test_a_turnless_workspace_is_actually_renewed_by_the_keepalive(tmp_path):
     store = make_store(tmp_path)
-    store.bind(team_id="T-quiet", organization_id="org-a", refresh_token="rt-quiet")
+    store.bind(team_id="T-quiet", fm_enterprise_id="ent-a", refresh_token="rt-quiet")
     presented: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -555,8 +571,8 @@ def test_close_gives_every_credential_its_own_drain_budget(tmp_path, monkeypatch
     monkeypatch.setattr(client_mod, "_CLOSE_DRAIN_HEADROOM_SECONDS", 0.2)
 
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
-    store.bind(team_id="T2", organization_id="org-b", refresh_token="rt-t2")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    store.bind(team_id="T2", fm_enterprise_id="ent-b", refresh_token="rt-t2")
 
     client = make_client(lambda r: token_response(), workspaces=store, timeout=0.05)
     first, second = client._credential_for("T1"), client._credential_for("T2")
@@ -592,36 +608,36 @@ def test_close_gives_every_credential_its_own_drain_budget(tmp_path, monkeypatch
     )
 
 
-def test_a_rebound_workspace_adopts_its_new_organization(tmp_path):
+def test_a_rebound_workspace_adopts_its_new_enterprise(tmp_path):
     """The cached credential outlives a re-bind. Without reconciliation its
-    stale organization makes the cross-tenant guard reject the very token the
+    stale enterprise makes the cross-tenant guard reject the very token the
     re-bind provisioned — every turn failing until a restart, while blaming the
     backend for minting the wrong tenant."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-old")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-old")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/oauth/token"):
             presented = json.loads(request.content)["refresh_token"]
             if presented == "rt-old":
                 return httpx.Response(401, json={"detail": "revoked"})
-            return token_response(access=jwt_with_org("org-b"), refresh="rt-new2")
+            return token_response(access=jwt_with_enterprise("ent-b"), refresh="rt-new2")
         return httpx.Response(200, json={"case_id": "case_abc"})
 
     client = make_client(handler, workspaces=store)
-    client._credential_for("T1")  # cache it against org-a
+    client._credential_for("T1")  # cache it against ent-a
 
-    store.bind(team_id="T1", organization_id="org-b", refresh_token="rt-new")
+    store.bind(team_id="T1", fm_enterprise_id="ent-b", refresh_token="rt-new")
 
     assert client.create_case(team_id="T1") == "case_abc"
-    assert client._credential_for("T1").organization_id == "org-b"
+    assert client._credential_for("T1").fm_enterprise_id == "ent-b"
 
 
 def test_an_unbound_workspace_drops_its_cached_credential(tmp_path):
     """After an uninstall the cached copy must not keep serving turns that the
     binding no longer authorizes."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
     client = make_client(
         lambda r: httpx.Response(401, json={"detail": "revoked"}), workspaces=store
     )
@@ -642,7 +658,7 @@ def test_a_restored_credential_is_aged_from_when_it_was_stored(tmp_path):
     from faultmaven.client import _REFRESH_BLIND_RENEW_SECONDS
 
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="opaque-token")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="opaque-token")
     # Backdate the row past the blind-renew threshold.
     with store._engine.begin() as conn:
         conn.execute(
@@ -667,39 +683,100 @@ def test_a_workspace_keeps_its_binding_when_it_joins_a_grid(tmp_path):
     Slack starts sending an enterprise id, the lookup misses, and a bound
     workspace silently reads as unbound."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-1")
 
     # The workspace converts to a Grid; the binding is re-recorded with one.
     store.bind(
         team_id="T1",
-        organization_id="org-a",
+        fm_enterprise_id="ent-a",
         refresh_token="rt-1",
         enterprise_id="E1",
     )
 
     record = store.get("T1")
     assert record is not None, "resolvable by workspace id, Grid or not"
-    assert record.enterprise_id == "E1", "the Grid is recorded"
+    assert record.enterprise_id == "E1", "the Slack Grid id is recorded"
+    assert record.fm_enterprise_id == "ent-a", "the FaultMaven tenant is untouched"
     assert store.team_ids() == ["T1"], "and listed exactly once"
 
 
-def test_a_token_with_no_organization_claim_is_flagged(tmp_path, caplog):
-    """A decodable JWT that names no tenant is not the opaque-token case: the
-    guard has nothing to compare, and a claim rename upstream would otherwise
-    disable it permanently and invisibly."""
+def test_a_token_with_no_enterprise_claim_is_refused(tmp_path):
+    """A decodable JWT that names no tenant is REFUSED, not merely logged.
+
+    The enterprise is the isolation input: a token without it is one the backend
+    itself would refuse, and passing it here is how a claim rename upstream
+    would switch off the only local cross-tenant check invisibly. (The
+    organization check this replaced passed such a token on purpose — an
+    organization decided nothing, so using it was safe. This one is not.)
+    """
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-a", refresh_token="rt-t1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/oauth/token"):
-            return token_response(access=jwt_with_org(None))
+            return token_response(access=jwt_with_enterprise(None), refresh="rotated")
         return httpx.Response(200, json={"case_id": "case_abc"})
 
     client = make_client(handler, workspaces=store)
-    with caplog.at_level("WARNING"):
-        assert client.create_case(team_id="T1") == "case_abc"
+    with pytest.raises(FaultMavenCredentialError, match="no enterprise claim"):
+        client.create_case(team_id="T1")
+    assert store.get("T1").refresh_token == "rt-t1", "rotation not committed"
 
-    assert any("no organization claim" in r.message for r in caplog.records)
+
+def test_an_empty_enterprise_claim_is_refused_like_an_absent_one(tmp_path):
+    """The backend mints ``enterprise_id: ""`` exactly when it could not resolve
+    the account's enterprise under multi-tenant. That is a dead credential, and
+    ``""`` must not slip through as "some tenant"."""
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    client = make_client(
+        lambda r: token_response(access=jwt_with_enterprise("")),
+        workspaces=store,
+    )
+
+    with pytest.raises(FaultMavenCredentialError, match="no enterprise claim"):
+        client.create_case(team_id="T1")
+
+
+def test_the_organization_claim_is_ignored_on_a_matching_token(tmp_path):
+    """The organization claim is ignored: it is billing context (ADR-017 D2).
+
+    The token names the right enterprise and an organization the binding has
+    never heard of. That must be accepted — reading the organization as a tenant
+    is the confusion this rename exists to end.
+    """
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return token_response(
+                access=jwt_with_enterprise("ent-a", organization="org-someone-else")
+            )
+        return httpx.Response(200, json={"case_id": "case_abc"})
+
+    client = make_client(handler, workspaces=store)
+    assert client.create_case(team_id="T1") == "case_abc"
+
+
+def test_the_organization_claim_cannot_rescue_a_wrong_enterprise(tmp_path):
+    """The other direction of the same rule: the organization claim is ignored.
+
+    A token for the WRONG enterprise carrying an organization that matches the
+    bound tenant's name is still refused — nothing about the organization is
+    consulted, in either direction.
+    """
+    store = make_store(tmp_path)
+    store.bind(team_id="T1", fm_enterprise_id="ent-a", refresh_token="rt-t1")
+    client = make_client(
+        lambda r: token_response(
+            access=jwt_with_enterprise("ent-WRONG", organization="ent-a")
+        ),
+        workspaces=store,
+    )
+
+    with pytest.raises(FaultMavenCredentialError, match="ent-WRONG"):
+        client.create_case(team_id="T1")
 
 
 def test_a_credential_less_deployment_still_says_so_at_boot(caplog):
@@ -712,112 +789,48 @@ def test_a_credential_less_deployment_still_says_so_at_boot(caplog):
     assert any("auth deferred" in r.message for r in caplog.records)
 
 
-# -- the composite-key migration ----------------------------------------------
-def _legacy_table(engine):
-    """The table exactly as the first shipped version created it."""
-    from sqlalchemy import Column, DateTime, MetaData, String, Table, Text
+# -- no migration ------------------------------------------------------------
+def test_a_pre_cutover_table_is_not_silently_reused(tmp_path):
+    """The tenant column moved, and nothing migrates it. Loudly.
 
-    md = MetaData()
-    t = Table(
-        "fm_workspace_credentials",
-        md,
-        Column("enterprise_id", String(32), primary_key=True),
-        Column("team_id", String(32), primary_key=True),
-        Column("organization_id", String(64), nullable=False),
-        Column("faultmaven_team_id", String(64), nullable=True),
-        Column("refresh_token", Text, nullable=False),
-        Column("updated_at", DateTime, nullable=False),
+    ``create_all`` is ``checkfirst``, so a database written before ADR-017 keeps
+    its old shape. A shim that re-pointed those rows at the new column would be
+    inventing an isolation decision, and the owner rule for this cutover is that
+    no data is preserved. What must NOT happen is the quiet version: reads
+    returning None, every bound workspace reading as unbound, and — without
+    ``require_workspace_binding`` — every one of them answered on the default
+    account, which is the cross-tenant misroute itself. So the read raises.
+    """
+    from sqlalchemy import (
+        Column,
+        DateTime,
+        MetaData,
+        String,
+        Table,
+        Text,
+        create_engine,
+        exc,
     )
-    md.create_all(engine)
-    return t
-
-
-def test_an_existing_composite_key_table_is_migrated(tmp_path):
-    """`create_all` is checkfirst and no-ops on an existing table, so a database
-    that already ran the first version would silently keep the old key and the
-    Grid fix would never take effect."""
-    from datetime import datetime, timezone
-
-    from sqlalchemy import create_engine, inspect
-
-    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
-    legacy = _legacy_table(engine)
-    with engine.begin() as conn:
-        conn.execute(
-            legacy.insert().values(
-                enterprise_id="", team_id="T1", organization_id="org-a",
-                refresh_token="rt-1", updated_at=datetime.now(timezone.utc),
-            )
-        )
-
-    store = WorkspaceCredentialStore(engine)
-
-    pk = inspect(engine).get_pk_constraint("fm_workspace_credentials")
-    assert pk["constrained_columns"] == ["team_id"]
-    assert store.get("T1").refresh_token == "rt-1", "the binding survived"
-
-
-def test_the_migration_keeps_the_most_recent_row_for_a_workspace(tmp_path):
-    """A workspace could hold rows under both "" and a Grid id. Collapsing them
-    must keep the live binding, not an arbitrary one — and must leave exactly
-    one row, since the new WHERE team_id=? would otherwise write a rotated token
-    into a row bound to a different organization."""
-    from datetime import datetime, timedelta, timezone
-
-    from sqlalchemy import create_engine
-
-    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
-    legacy = _legacy_table(engine)
-    now = datetime.now(timezone.utc)
-    with engine.begin() as conn:
-        conn.execute(
-            legacy.insert().values(
-                enterprise_id="", team_id="T1", organization_id="org-old",
-                refresh_token="rt-old", updated_at=now - timedelta(days=2),
-            )
-        )
-        conn.execute(
-            legacy.insert().values(
-                enterprise_id="E1", team_id="T1", organization_id="org-new",
-                refresh_token="rt-new", updated_at=now,
-            )
-        )
-
-    store = WorkspaceCredentialStore(engine)
-
-    assert store.team_ids() == ["T1"], "collapsed to exactly one row"
-    record = store.get("T1")
-    assert record.organization_id == "org-new"
-    assert record.refresh_token == "rt-new"
-
-
-def test_the_migration_is_idempotent(tmp_path):
-    from sqlalchemy import create_engine
-
-    engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
-    _legacy_table(engine)
-    WorkspaceCredentialStore(engine)
-    store = WorkspaceCredentialStore(engine)  # second boot must be a no-op
-
-    store.bind(team_id="T9", organization_id="org-a", refresh_token="rt-9")
-    assert store.get("T9") is not None
-
-
-def test_an_unrecognised_table_shape_is_refused_not_rewritten(tmp_path):
-    """Migrating a table we do not recognise would be destructive on a guess."""
-    from sqlalchemy import Column, MetaData, String, Table, create_engine
 
     engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
     md = MetaData()
     Table(
         "fm_workspace_credentials",
         md,
-        Column("something_else", String(32), primary_key=True),
+        Column("team_id", String(32), primary_key=True),
+        Column("enterprise_id", String(32), nullable=False, server_default=""),
+        # The pre-ADR-017 tenant column.
+        Column("organization_id", String(64), nullable=False),
+        Column("faultmaven_team_id", String(64), nullable=True),
+        Column("refresh_token", Text, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
     )
     md.create_all(engine)
 
-    with pytest.raises(RuntimeError, match="unexpected primary key"):
-        WorkspaceCredentialStore(engine)
+    store = WorkspaceCredentialStore(engine)
+
+    with pytest.raises(exc.OperationalError):
+        store.get("T1")
 
 
 # -- the binding HTTP calls ---------------------------------------------------
@@ -860,9 +873,10 @@ def test_a_non_json_exchange_body_is_a_typed_failure():
         )
 
 
-def test_the_bind_carries_the_admin_bearer_and_names_no_organization():
-    """The organization is taken from the token's own claim server-side. Sending
-    one would be a way to bind into a tenant the admin does not administer."""
+def test_the_bind_carries_the_admin_bearer_and_names_no_tenant():
+    """The enterprise is taken from the admin token's own claim server-side.
+    Naming one in the request would be a way to bind into a tenant the admin
+    does not belong to."""
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -871,10 +885,10 @@ def test_the_bind_carries_the_admin_bearer_and_names_no_organization():
         return httpx.Response(
             200,
             json={
-                "slack_team_id": "T1", "organization_id": "org-a",
+                "slack_team_id": "T1",
                 "team_id": "fmteam", "team_name": "Ops",
                 "service_account_username": "slack-T1",
-                "refresh_token": "sa-rt",
+                "refresh_token": jwt_with_enterprise("ent-a"),
                 "account_created": True, "team_created": False,
             },
         )
@@ -885,9 +899,97 @@ def test_the_bind_carries_the_admin_bearer_and_names_no_organization():
     )
 
     assert seen["auth"] == "Bearer admin-at"
-    assert "organization_id" not in seen["body"]
-    assert binding.refresh_token == "sa-rt"
+    assert "enterprise_id" not in seen["body"]
+    assert "fm_enterprise_id" not in seen["body"]
+    assert binding.refresh_token == jwt_with_enterprise("ent-a")
     assert binding.account_created is True
+
+
+def test_the_bind_reads_the_enterprise_from_the_credential_it_was_issued():
+    """WHICH field the tenant comes from, pinned.
+
+    The enterprise is the ``enterprise_id`` claim of the service account's own
+    refresh token — the credential this agent will present forever after, and
+    the chain ``/auth/refresh`` re-mints that claim from. A field beside it in
+    the body would be a second source for one fact; the two disagreeing is
+    precisely the misroute ``_assert_expected_enterprise`` exists to catch.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "slack_team_id": "T1", "team_id": "fmteam",
+                "refresh_token": jwt_with_enterprise("ent-from-the-token"),
+                # Ignored: the organization claim is billing context (D2), and
+                # a body field is not the credential.
+                "organization_id": "org-billing",
+                "enterprise_id": "ent-from-a-body-field",
+            },
+        )
+
+    binding = bind_client_for(handler).bind_workspace(
+        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+    )
+
+    assert binding.fm_enterprise_id == "ent-from-the-token"
+
+
+def test_a_bind_needs_no_organization_at_all():
+    """ADR-017 D6: no organization is a precondition of install.
+
+    The response names no organization anywhere — no claim on the credential, no
+    field in the body — and the workspace binds, because the organization
+    answers "who pays?" and nothing else. This is faultmaven-cloud#29's dead end,
+    pinned open.
+    """
+    store_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "slack_team_id": "T1", "team_id": "fmteam",
+                "refresh_token": jwt_with_enterprise("ent-a"),
+            },
+        )
+
+    binding = bind_client_for(handler).bind_workspace(
+        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+    )
+
+    assert binding.fm_enterprise_id == "ent-a"
+    assert store_calls == []
+
+
+@pytest.mark.parametrize(
+    "credential",
+    ["an-opaque-bearer", "not.a.jwt", "", None],
+    ids=["opaque", "malformed", "empty", "no-enterprise-claim"],
+)
+def test_a_bind_whose_credential_names_no_enterprise_is_refused(credential):
+    """The row would be live-looking and uncheckable — refuse the bind instead.
+
+    A credential this agent cannot read a tenant off is one the cross-tenant
+    guard can never run on. Storing it would mean a workspace answering turns
+    with the one local isolation check permanently disabled, so the bind fails
+    the way every other unrecoverable response does: loudly, naming re-issue.
+    """
+    token = jwt_with_enterprise(None) if credential is None else credential
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "slack_team_id": "T1", "team_id": "fmteam",
+                "refresh_token": token or "unset",
+            },
+        )
+
+    with pytest.raises(WorkspaceBindError, match="re-issue"):
+        bind_client_for(handler).bind_workspace(
+            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        )
 
 
 def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
@@ -899,8 +1001,8 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
             200,
             json={
                 "slack_team_id": "t1-normalised-differently",
-                "organization_id": "org-a", "team_id": "fmteam",
-                "refresh_token": "sa-rt",
+                "team_id": "fmteam",
+                "refresh_token": jwt_with_enterprise("ent-a"),
             },
         )
 
@@ -914,7 +1016,7 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
 @pytest.mark.parametrize(
     ("status", "fragment", "retryable"),
     [
-        (403, "manage users", False),
+        (403, "connect a workspace", False),
         (409, "already bound", False),
         (503, "not configured", True),
         (500, "refused the bind", True),
@@ -938,14 +1040,14 @@ def test_each_bind_refusal_is_typed_and_advises_correctly(status, fragment, retr
     assert caught.value.retryable is retryable
 
 
-@pytest.mark.parametrize("missing", ["refresh_token", "organization_id", "team_id"])
+@pytest.mark.parametrize("missing", ["refresh_token", "team_id"])
 def test_an_incomplete_bind_response_is_reported_as_unrecoverable(missing):
-    """The server has already created the account and Team by now, and the
+    """The server has already created the account and team by now, and the
     credential is issued once — so a retry is refused as already-bound. The
     message must not invite one."""
     full = {
-        "slack_team_id": "T1", "organization_id": "org-a",
-        "team_id": "fmteam", "refresh_token": "sa-rt",
+        "slack_team_id": "T1",
+        "team_id": "fmteam", "refresh_token": jwt_with_enterprise("ent-a"),
     }
     body = {k: v for k, v in full.items() if k != missing}
     client = bind_client_for(lambda r: httpx.Response(200, json=body))
@@ -991,9 +1093,9 @@ def test_a_rotation_with_no_row_left_discards_the_cached_credential(tmp_path):
     service account until the process restarted.
     """
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-1", refresh_token="rt-1")
     client = make_client(
-        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        lambda r: token_response(access=jwt_with_enterprise("ent-1"), refresh="rt-2"),
         workspaces=store,
     )
 
@@ -1013,9 +1115,9 @@ def test_a_discarded_workspace_is_not_kept_alive(tmp_path):
     """The keepalive walks the cache, so a credential left there is renewed
     forever. Dropping it is what makes the discard stick."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-1", refresh_token="rt-1")
     client = make_client(
-        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        lambda r: token_response(access=jwt_with_enterprise("ent-1"), refresh="rt-2"),
         workspaces=store,
     )
     client._credential_for("T1")
@@ -1031,9 +1133,9 @@ def test_a_write_failure_that_is_not_a_missing_row_still_keeps_the_token(tmp_pat
     """The full-disk case is unchanged: the rotated token is the only live one,
     so discarding it there would turn a transient fault into a lockout."""
     store = make_store(tmp_path)
-    store.bind(team_id="T1", organization_id="org-1", refresh_token="rt-1")
+    store.bind(team_id="T1", fm_enterprise_id="ent-1", refresh_token="rt-1")
     client = make_client(
-        lambda r: token_response(access=jwt_with_org("org-1"), refresh="rt-2"),
+        lambda r: token_response(access=jwt_with_enterprise("ent-1"), refresh="rt-2"),
         workspaces=store,
     )
     cred = client._credential_for("T1")
@@ -1048,3 +1150,47 @@ def test_a_write_failure_that_is_not_a_missing_row_still_keeps_the_token(tmp_pat
     assert cred.refresh_token == "rt-2"
     assert cred.unpersisted is True
     assert "T1" in client._workspaces
+
+
+# -- the retired vocabulary ---------------------------------------------------
+def test_the_retired_account_vocabulary_is_gone():
+    """ADR-017 D6 retires one phrase from every string, identifier and doc.
+
+    There are exactly two kinds of account — **individual** (a human) and
+    **service** (an agent acting for an integration). A team is not an account
+    at all: it is a group of accounts that agreed to share. The retired phrase
+    (the regex below spells it) named this agent's service account, and is the
+    one that produced the confusion the ADR untangles — so it goes by grep
+    rather than by good intentions. Say "service account".
+
+    Deliberately a test and not a linter: this repository's CI runs ruff and
+    pytest, and a rule nothing executes is a rule that comes back.
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    banned = re.compile(r"team[ _-]accounts?\b", re.IGNORECASE)
+    skip = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+    suffixes = {".py", ".md", ".json", ".yml", ".yaml", ".toml", ".txt", ".example"}
+
+    offenders = []
+    for path in repo.rglob("*"):
+        if not path.is_file() or set(path.parts) & skip:
+            continue
+        if path.suffix not in suffixes and path.name != ".env.example":
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        offenders += [
+            f"{path.relative_to(repo)}:{n}"
+            for n, line in enumerate(content.splitlines(), 1)
+            if banned.search(line)
+        ]
+
+    assert not offenders, (
+        "say 'service account' — a team is not an account (ADR-017 D6): "
+        + ", ".join(offenders)
+    )

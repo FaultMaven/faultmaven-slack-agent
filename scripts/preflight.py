@@ -194,7 +194,7 @@ def check_workspace_bindings(
     if not bound:
         if settings.faultmaven_require_workspace_binding:
             return _fail(
-                "no Slack workspace is bound to a FaultMaven organization",
+                "no Slack workspace is bound to a FaultMaven enterprise",
                 "FAULTMAVEN_REQUIRE_WORKSPACE_BINDING is on, so every turn will "
                 "be refused until a workspace is bound.",
             )

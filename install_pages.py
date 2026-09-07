@@ -3,8 +3,8 @@
 Kept apart from the flow logic so the security-relevant code in :mod:`binding`
 is not interleaved with markup, and so every page here is built the same way:
 **no request input is ever interpolated.** Only values the server established —
-a workspace name from the Slack install, an organization id from a bind we just
-performed — reach the templates, and they are escaped regardless.
+a workspace name from the Slack install, a FaultMaven enterprise id from a bind
+we just performed — reach the templates, and they are escaped regardless.
 """
 
 from __future__ import annotations
@@ -63,23 +63,29 @@ def confirm_page(*, workspace_name: str, team_id: str, authorize_url: str) -> st
   <dt>Workspace ID</dt><dd>{escape(team_id)}</dd>
 </dl>
 <p>Continuing signs you in to FaultMaven. The workspace is connected to
-   <strong>the organization you sign in to</strong>, and this creates a service
-   account and a team inside it.</p>
+   <strong>the FaultMaven enterprise your account belongs to</strong>, and this
+   creates a service account and a team inside it.</p>
 <p><a class="btn" href="{escape(authorize_url, quote=True)}">Continue to FaultMaven</a></p>
 <p class="muted">If you did not just install FaultMaven in Slack, close this
    page — nothing has been connected.</p>"""
     return _page("Connect workspace", body)
 
 
-def bound_page(*, workspace_name: str, organization_id: str) -> str:
-    """Reported after a bind actually succeeded."""
+def bound_page(*, workspace_name: str, fm_enterprise_id: str) -> str:
+    """Reported after a bind actually succeeded.
+
+    Names the **FaultMaven enterprise** — the boundary the workspace's
+    investigations now live inside (ADR-017 D6). Not Slack's Enterprise Grid id,
+    which this flow also handles and which says nothing about who can read a
+    case.
+    """
 
     body = f"""
 <h1>Workspace connected</h1>
 <p><strong>{escape(workspace_name)}</strong> is now connected to FaultMaven.
    Investigations started from this workspace belong to it, and are visible to
    its team.</p>
-<dl><dt>Organization</dt><dd>{escape(organization_id)}</dd></dl>
+<dl><dt>FaultMaven enterprise</dt><dd>{escape(fm_enterprise_id)}</dd></dl>
 <p class="muted">You can close this page and go back to Slack.</p>"""
     return _page("Workspace connected", body)
 
@@ -101,7 +107,7 @@ def unavailable_page() -> str:
     body = """
 <h1>FaultMaven is installed</h1>
 <p>The Slack app is installed and ready.</p>
-<p>Connecting this workspace to a FaultMaven organization is a step your
+<p>Connecting this workspace to a FaultMaven enterprise is a step your
    FaultMaven administrator completes — this deployment doesn't offer it from
    the browser.</p>
 <p class="muted">You can close this page.</p>"""
@@ -121,7 +127,7 @@ def _until_then(binding_required: bool) -> str:
         return (
             "Until that happens FaultMaven will not answer in this workspace: "
             "this deployment refuses investigations it cannot file to the right "
-            "organization."
+            "enterprise."
         )
     return (
         "Until then the app works, but its investigations are not filed to your "
@@ -140,9 +146,9 @@ def not_admin_page(*, workspace_name: str, binding_required: bool) -> str:
     body = f"""
 <h1>FaultMaven is installed</h1>
 <p>The Slack app is installed in <strong>{escape(workspace_name)}</strong>.</p>
-<p>Connecting this workspace to a FaultMaven organization is the one step left,
+<p>Connecting this workspace to a FaultMaven enterprise is the one step left,
    and it has to be done by a <strong>Workspace Owner or Admin</strong> — it
-   admits this workspace's investigations into a FaultMaven organization, so
+   admits this workspace's investigations into a FaultMaven enterprise, so
    somebody who administers the workspace has to agree to it.</p>
 <p>Ask one of them to open the FaultMaven install link themselves. {escape(_until_then(binding_required))}</p>
 <p class="muted">You can close this page.</p>"""
@@ -161,7 +167,7 @@ def authority_unknown_page(*, workspace_name: str, binding_required: bool) -> st
 <h1>FaultMaven is installed</h1>
 <p>The Slack app is installed in <strong>{escape(workspace_name)}</strong>.</p>
 <p>We could not confirm with Slack whether you administer this workspace, so
-   the last step — connecting it to a FaultMaven organization — was not
+   the last step — connecting it to a FaultMaven enterprise — was not
    offered. That check is required, so it is skipped rather than assumed.</p>
 <p>Ask your FaultMaven administrator to check the agent's logs and re-run the
    installation. If the app was updated recently it may need reinstalling to

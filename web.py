@@ -170,7 +170,7 @@ def create_fastapi_app() -> FastAPI:
         The two halves are checked together and the record is claimed before the
         code is exchanged. A forwarded authorize URL carries the ``state`` but
         not the cookie, which is what stops an attacker's workspace being bound
-        into the organization of whoever they forwarded it to.
+        into the enterprise of whoever they forwarded it to.
         """
 
         if not binding_enabled:
@@ -209,7 +209,7 @@ def create_fastapi_app() -> FastAPI:
             )
 
         try:
-            organization_id = await run_in_threadpool(
+            fm_enterprise_id = await run_in_threadpool(
                 lambda: complete_bind(
                     fm=fm,
                     workspace_credentials=stores.workspace_credentials,
@@ -228,7 +228,7 @@ def create_fastapi_app() -> FastAPI:
 
         return _html(
             install_pages.bound_page(
-                workspace_name=record.team_name, organization_id=organization_id
+                workspace_name=record.team_name, fm_enterprise_id=fm_enterprise_id
             ),
             clear_cookie=True,
         )

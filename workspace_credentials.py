@@ -1,9 +1,17 @@
 """Per-workspace FaultMaven credentials — the Slack workspace → tenant binding.
 
-ADR-013 D3 maps a **Slack workspace to a FaultMaven Team** inside the customer's
-**Organization**, and the agent authenticates as that workspace's ``slack``
-service account so its cases are owned there and auto-share to the right Team.
+ADR-017 D6 anchors a Slack workspace to the installer's **FaultMaven
+enterprise** — the isolation boundary — and makes the workspace a *team* inside
+it. The agent authenticates as that workspace's ``slack`` **service account**,
+so its cases are owned in the right enterprise and auto-share to the right team.
 This module is where those per-workspace credentials live.
+
+**Two things are called an enterprise here; they are not the same thing.**
+``enterprise_id`` in this module is Slack's **Enterprise Grid** id, recorded
+because it is worth knowing which Grid a workspace belongs to. The FaultMaven
+isolation tenant is ``fm_enterprise_id`` — column, field, log line and page
+label all say so, and nothing in this repository shortens it to
+``enterprise_id``.
 
 **Why beside the installation, not on the pod's volume.** The binding is
 per-install, exactly like the bot token in :mod:`oauth_store` — so it belongs in
@@ -12,16 +20,18 @@ survives a pod moving. The single-row SQLite :class:`credentials.CredentialStore
 stays for the *process-wide default* credential (Socket Mode, self-hosted), which
 is genuinely one-per-process state.
 
-**Tenancy travels only in the token chain.** The backend's ``users`` table has no
-organization column: ``/auth/refresh`` re-attaches whatever ``organization_id``
-the presented refresh token carried. So nothing server-side contradicts a
-credential provisioned against the wrong organization. That is why
-``organization_id`` is stored here alongside the token and asserted against every
-minted access token (``FaultMavenClient._assert_expected_org``) — this row is the
-only place the intended tenant is written down.
+**Why the row records the tenant at all.** The backend anchors each account to
+an enterprise and ``/auth/refresh`` re-mints the ``enterprise_id`` claim from
+that row, so the token always says which tenant it acts for — but it cannot say
+whether that is the tenant *this workspace* was bound to. A credential
+provisioned, restored or copied against the wrong enterprise mints perfectly
+valid tokens, and every case this agent files with them lands in another
+customer's tenant. So the bind writes the enterprise down here, and
+``FaultMavenClient._assert_expected_enterprise`` refuses any minted token whose
+claim disagrees. This row is the only place the *intended* tenant exists.
 
 **Lifecycle is event-driven.** :meth:`~WorkspaceCredentialStore.bind` is called
-by the install flow (:mod:`binding`, once an organization admin has consented),
+by the install flow (:mod:`binding`, once a workspace admin has authorized it),
 and :meth:`~WorkspaceCredentialStore.unbind` by the ``app_uninstalled`` /
 ``tokens_revoked`` listeners in :mod:`listeners.lifecycle`, so a credential no
 longer outlives the installation that authorized it. An operator can still write
@@ -43,6 +53,13 @@ this store is shared: a rejected credential is retried against whatever the stor
 holds *now* (``FaultMavenClient._alternative_credentials``), which is what the
 other replica wrote. Recovery, not prevention — a deployment that wants
 prevention needs row-level locking held across the token exchange.
+
+**No migration.** ``create_all`` is ``checkfirst``, so a database written by a
+pre-ADR-017 build keeps its old organization column and every read here fails
+on the missing one. That is deliberate: the tenant key moved, no data is
+preserved across the cutover, and a shim that quietly re-pointed old rows at a
+new tenant column would be inventing an isolation decision. Drop the table (or
+the database) and re-bind.
 """
 
 from __future__ import annotations
@@ -58,7 +75,6 @@ from sqlalchemy import (
     String,
     Table,
     Text,
-    inspect,
     select,
 )
 from sqlalchemy.engine import Engine
@@ -75,10 +91,14 @@ class WorkspaceCredential:
     """One workspace's binding: which tenant it acts as, and with what token."""
 
     team_id: str
-    organization_id: str
+    #: The FaultMaven **enterprise** this workspace's cases belong to — the
+    #: isolation boundary (ADR-017 D6). Not Slack's Grid id; see
+    #: ``enterprise_id`` below.
+    fm_enterprise_id: str
     refresh_token: str
+    #: Slack's **Enterprise Grid** id, or ``""`` for an ordinary workspace.
     enterprise_id: str = NO_ENTERPRISE
-    #: The FaultMaven Team the workspace maps to. Recorded for diagnostics and
+    #: The FaultMaven team the workspace maps to. Recorded for diagnostics and
     #: for the install-time provisioning flow; the agent itself never sends it —
     #: sharing is resolved server-side from the service account's membership.
     faultmaven_team_id: str | None = None
@@ -110,84 +130,17 @@ class WorkspaceCredentialStore:
             # the team id, and this store would miss the row — turning a bound
             # workspace into an unbound one on an event we do not control.
             Column("team_id", String(32), primary_key=True),
-            # Recorded, not keyed: worth knowing which Grid a workspace belongs
-            # to, never worth failing a lookup over.
+            # Slack's Grid id: recorded, not keyed — worth knowing which Grid a
+            # workspace belongs to, never worth failing a lookup over.
             Column("enterprise_id", String(32), nullable=False, server_default=""),
-            Column("organization_id", String(64), nullable=False),
+            # The FaultMaven tenant. NOT NULL: a row without it is a live-looking
+            # binding whose token nothing can check.
+            Column("fm_enterprise_id", String(64), nullable=False),
             Column("faultmaven_team_id", String(64), nullable=True),
             Column("refresh_token", Text, nullable=False),
             Column("updated_at", DateTime, nullable=False),
         )
-        self._migrate_from_composite_key(engine)
         self._metadata.create_all(engine)
-
-    # -- migration ----------------------------------------------------------
-    def _migrate_from_composite_key(self, engine: Engine) -> None:
-        """Re-key an existing table from ``(enterprise_id, team_id)`` to ``team_id``.
-
-        The first shipped version of this table keyed on both columns. That
-        diverges from the server, which binds on the workspace alone and records
-        the Grid id without keying on it — so a workspace joining a Grid would
-        stop resolving here while the server still considered it bound.
-
-        ``create_all`` is ``checkfirst`` and silently no-ops on an existing
-        table, so without this an already-deployed database would keep the old
-        shape forever and the fix would appear to have been applied. Worse, the
-        new ``WHERE team_id = ?`` writes could match two rows there and put one
-        workspace's rotated token into a row bound to a different organization.
-
-        Idempotent: it inspects the live primary key and returns immediately
-        unless the old shape is actually present.
-        """
-
-        inspector = inspect(engine)
-        if not inspector.has_table(self._table.name):
-            return
-        pk = set(
-            inspector.get_pk_constraint(self._table.name).get(
-                "constrained_columns", []
-            )
-        )
-        if pk == {"team_id"}:
-            return
-        if "enterprise_id" not in pk:
-            # Some other shape entirely — not ours to rewrite. Say so rather
-            # than silently proceeding against a table we do not recognise.
-            raise RuntimeError(
-                f"{self._table.name} has an unexpected primary key {sorted(pk)}; "
-                "refusing to migrate it automatically"
-            )
-
-        legacy = f"{self._table.name}__legacy"
-        logger.warning(
-            "Migrating %s from a composite (enterprise_id, team_id) key to "
-            "team_id, to match the server's binding key",
-            self._table.name,
-        )
-        with engine.begin() as conn:
-            conn.exec_driver_sql(
-                f"ALTER TABLE {self._table.name} RENAME TO {legacy}"
-            )
-            self._table.create(conn)
-            # A workspace could have rows under both "" and a Grid id. Keep the
-            # most recently written one: it is the live binding, and the other
-            # is a leftover from before the conversion.
-            conn.exec_driver_sql(
-                f"""
-                INSERT INTO {self._table.name}
-                    (team_id, enterprise_id, organization_id,
-                     faultmaven_team_id, refresh_token, updated_at)
-                SELECT team_id, enterprise_id, organization_id,
-                       faultmaven_team_id, refresh_token, updated_at
-                FROM {legacy} l
-                WHERE l.updated_at = (
-                    SELECT MAX(l2.updated_at) FROM {legacy} l2
-                    WHERE l2.team_id = l.team_id
-                )
-                """
-            )
-            conn.exec_driver_sql(f"DROP TABLE {legacy}")
-        logger.info("Migration of %s complete", self._table.name)
 
     # -- reads --------------------------------------------------------------
     def get(self, team_id: str) -> WorkspaceCredential | None:
@@ -201,7 +154,7 @@ class WorkspaceCredentialStore:
             row = conn.execute(
                 select(
                     self._table.c.team_id,
-                    self._table.c.organization_id,
+                    self._table.c.fm_enterprise_id,
                     self._table.c.refresh_token,
                     self._table.c.enterprise_id,
                     self._table.c.faultmaven_team_id,
@@ -212,7 +165,7 @@ class WorkspaceCredentialStore:
             return None
         return WorkspaceCredential(
             team_id=row.team_id,
-            organization_id=row.organization_id,
+            fm_enterprise_id=row.fm_enterprise_id,
             refresh_token=row.refresh_token,
             enterprise_id=row.enterprise_id,
             faultmaven_team_id=row.faultmaven_team_id,
@@ -237,7 +190,7 @@ class WorkspaceCredentialStore:
         self,
         *,
         team_id: str,
-        organization_id: str,
+        fm_enterprise_id: str,
         refresh_token: str,
         enterprise_id: str = NO_ENTERPRISE,
         faultmaven_team_id: str | None = None,
@@ -246,14 +199,14 @@ class WorkspaceCredentialStore:
 
         Idempotent, so a reinstall re-binds rather than duplicating. Refuses the
         pieces that would produce a live-looking row the agent cannot use: a
-        binding without an organization could not be checked against the token's
-        claim, which is the whole guard against a cross-tenant misroute.
+        binding without a FaultMaven enterprise could not be checked against the
+        token's claim, which is the whole guard against a cross-tenant misroute.
         """
 
         if not team_id:
             raise ValueError("team_id is required")
-        if not organization_id:
-            raise ValueError("organization_id is required")
+        if not fm_enterprise_id:
+            raise ValueError("fm_enterprise_id is required")
         if not refresh_token:
             raise ValueError("refusing to persist an empty refresh token")
 
@@ -265,16 +218,16 @@ class WorkspaceCredentialStore:
                 self._table.insert().values(
                     enterprise_id=enterprise_id,
                     team_id=team_id,
-                    organization_id=organization_id,
+                    fm_enterprise_id=fm_enterprise_id,
                     faultmaven_team_id=faultmaven_team_id,
                     refresh_token=refresh_token,
                     updated_at=datetime.now(timezone.utc),
                 )
             )
         logger.info(
-            "Bound Slack workspace %s to FaultMaven organization %s",
+            "Bound Slack workspace %s to FaultMaven enterprise %s",
             team_id,
-            organization_id,
+            fm_enterprise_id,
         )
 
     def put_refresh_token(self, team_id: str, refresh_token: str) -> None:
@@ -285,7 +238,7 @@ class WorkspaceCredentialStore:
         a lockout if the process dies in between.
 
         Only ever an UPDATE — a rotation must not resurrect a binding that was
-        deleted (an uninstall) as a row with no organization to check against.
+        deleted (an uninstall) as a row with no enterprise to check against.
         """
 
         if not refresh_token:
@@ -305,7 +258,7 @@ class WorkspaceCredentialStore:
     def unbind(self, team_id: str) -> None:
         """Drop a workspace's binding (uninstall / token revocation).
 
-        The workspace's *cases* are unaffected — they are Team artifacts owned by
+        The workspace's *cases* are unaffected — they are team artifacts owned by
         the service account, not by the installation.
         """
 

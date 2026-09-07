@@ -98,15 +98,14 @@ CREDENTIAL_ERROR_TEXT = (
     ":warning: I can't sign in to FaultMaven right now, so I can't work on "
     "this. This needs an admin to restore my access — retrying won't help."
 )
-# This workspace has no FaultMaven credential bound to it (ADR-013 D3), so there
-# is no organization its cases could correctly belong to. Deliberately says
+# This workspace has no FaultMaven credential bound to it (ADR-017 D6), so there
+# is no enterprise its cases could correctly belong to. Deliberately says
 # "isn't connected" rather than reporting a fault: nothing is broken, the install
-# is simply not finished, and the fix belongs to a FaultMaven org admin rather
-# than to whoever is standing in the channel.
+# is simply not finished, and the fix belongs to a FaultMaven admin rather than
+# to whoever is standing in the channel.
 WORKSPACE_UNLINKED_TEXT = (
-    ":link: This Slack workspace isn't connected to a FaultMaven organization "
-    "yet, so I can't open an investigation here. A FaultMaven admin for your "
-    "organization needs to finish linking it."
+    ":link: This Slack workspace isn't connected to FaultMaven yet, so I can't "
+    "open an investigation here. A FaultMaven admin needs to finish linking it."
 )
 # The failure came from our own teardown, not the turn: say so.
 RESTARTING_TEXT = (

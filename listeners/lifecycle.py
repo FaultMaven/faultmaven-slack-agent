@@ -25,8 +25,8 @@ used; one listener per event runs both halves in a chosen order.
 user revoking their own token leaves the app installed and the bot working — so
 unbinding on any ``tokens_revoked`` would destroy a live workspace's FaultMaven
 binding because one person disconnected their account. The credential is issued
-once per bind, so that is not a self-healing mistake: it takes an organization
-admin re-running the install to recover. Only a **bot**-token revocation is
+once per bind, so that is not a self-healing mistake: it takes an admin
+re-running the install to recover. Only a **bot**-token revocation is
 treated as the app being gone.
 
 **Neither half can strand the other**: each is guarded separately, so a failing
@@ -34,7 +34,7 @@ installation teardown still removes the binding and vice versa. The order —
 binding first, then installation — is therefore not load-bearing today, and is
 pinned by a test anyway so that if a guard is ever dropped the failure falls on
 the safer side. The FaultMaven credential is the more dangerous leftover: a
-standing service-account credential inside a customer's organization, where the
+standing service-account credential inside a customer's enterprise, where the
 bot token Slack has already revoked is inert.
 
 **Within the binding: read, unbind, revoke, forget.** The record is read first
@@ -50,9 +50,9 @@ after. The revocation is what makes that harmless: the cached copy no longer
 authenticates.
 
 **What survives, deliberately.** The workspace's *cases* are untouched: they
-belong to the service account inside the customer's organization, not to the
+belong to the service account inside the customer's enterprise, not to the
 Slack installation. A reinstall re-binds to the same derived account
-(``slack-<team_id>``, find-or-create) in the same organization, so the history
+(``slack-<team_id>``, find-or-create) in the same enterprise, so the history
 is still there and still owned correctly.
 
 **Other replicas.** Slack delivers the event to one replica. Another replica
@@ -132,7 +132,7 @@ def _forget_binding(
 
     # Deleting the row makes the credential unreachable *here*; revoking makes
     # it unusable *anywhere*. Without this the service-account refresh token
-    # stays valid inside the customer's organization for its full lifetime —
+    # stays valid inside the customer's enterprise for its full lifetime —
     # usable by a replica still holding it, by a database backup, or by anything
     # that ever logged it. `binding.complete_bind` already revokes the admin's
     # tokens through the same call for the same reason.
