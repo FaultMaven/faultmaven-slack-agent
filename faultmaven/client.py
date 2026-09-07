@@ -90,6 +90,22 @@ def _jwt_claims(token: str) -> dict[str, Any] | None:
     return claims if isinstance(claims, dict) else None
 
 
+def _enterprise_claim(token: str) -> str:
+    """The ``enterprise_id`` claim of a JWT — the ISOLATION claim — or ``""``.
+
+    ``""`` for anything that is not a decodable JWT carrying a string claim, so
+    every caller reads "this token names no tenant" from one place rather than
+    inventing its own idea of an absent claim. Deliberately the isolation claim
+    and not the billing one: under ADR-017 the organization claim is context,
+    optional, and absent for every beta account — reading it as a tenant is the
+    mistake this rename exists to make impossible.
+    """
+
+    claims = _jwt_claims(token)
+    value = claims.get("enterprise_id") if claims else None
+    return value if isinstance(value, str) else ""
+
+
 def _jwt_expiry(token: str) -> float | None:
     """The ``exp`` claim of a JWT as a POSIX timestamp, or None."""
 
@@ -261,7 +277,9 @@ class WorkspaceBinding:
     """What the server created for a workspace, as the agent needs it."""
 
     slack_team_id: str
-    organization_id: str
+    #: The FaultMaven enterprise the workspace was admitted to — the isolation
+    #: boundary (ADR-017 D6), read off the issued credential's own claim.
+    fm_enterprise_id: str
     team_id: str
     team_name: str
     service_account_username: str
@@ -275,12 +293,11 @@ class FaultMavenWorkspaceUnlinkedError(FaultMavenError):
 
     Under a multi-tenant (cloud) backend this is a **refusal, not a fallback**.
     A workspace's cases are owned by *its* ``slack`` service account, and the
-    organization those cases land in travels only in that account's token chain
-    (ADR-013 D3; the backend's ``users`` table has no organization column). So
-    answering an unbound workspace on the process-wide default credential would
-    not degrade gracefully — it would file one customer's incident inside
-    whatever organization that credential happens to carry. Refusing is the only
-    safe direction; the fix is to bind the workspace.
+    enterprise those cases land in is whatever that account's tokens claim
+    (ADR-017 D6). So answering an unbound workspace on the process-wide default
+    credential would not degrade gracefully — it would file one customer's
+    incident inside whatever enterprise that credential happens to act for.
+    Refusing is the only safe direction; the fix is to bind the workspace.
 
     The process-wide default credential stays legitimate where there is exactly
     one tenant to be wrong about: Socket Mode and self-hosted deployments.
@@ -325,10 +342,10 @@ class TurnResult:
 class _Credential:
     """One principal's credential, and the access token it is currently good for.
 
-    A hosted deployment holds one of these **per Slack workspace**: ADR-013 maps
-    a workspace to a Team inside the customer's Organization, and the agent
-    authenticates as that workspace's ``slack`` service account so its cases are
-    owned there and auto-share to the right Team.
+    A hosted deployment holds one of these **per Slack workspace**: ADR-017 D6
+    anchors a workspace to the installer's FaultMaven enterprise and makes it a
+    team inside it, and the agent authenticates as that workspace's ``slack``
+    service account so its cases are owned there and auto-share to that team.
 
     Only the *credential* is per-workspace. The HTTP connection pool and the
     keepalive scheduler are shared, because neither is tenanted — giving every
@@ -359,12 +376,16 @@ class _Credential:
     token: str = ""
     token_is_preset: bool = False
     dev_login_username: str = ""
-    #: The FaultMaven organization this credential is expected to act within,
-    #: recorded when the workspace was bound. Tenancy travels ONLY in the token
-    #: chain, so nothing in the backend's database contradicts a credential
-    #: minted against the wrong organization — this is the one place that can.
-    #: See :meth:`FaultMavenClient._assert_expected_org`.
-    organization_id: str = ""
+    #: The FaultMaven **enterprise** this credential is expected to act within,
+    #: recorded when the workspace was bound. A token says which tenant it acts
+    #: for, but not which one this workspace was bound to — this is the one
+    #: place that can. See :meth:`FaultMavenClient._assert_expected_enterprise`.
+    #:
+    #: Empty ONLY on the process-wide default principal, which has no binding
+    #: (``key`` is empty there too). On a workspace credential it is always the
+    #: bound enterprise: the store refuses to write a row without one, and the
+    #: assertion refuses the credential outright rather than trusting it.
+    fm_enterprise_id: str = ""
     access_expires_at: float = 0.0
     #: When the credential we hold was obtained, for the keepalive's fallback
     #: cadence when a token's expiry can't be read.
@@ -677,7 +698,7 @@ class FaultMavenClient:
             if self._require_workspace_binding:
                 raise FaultMavenWorkspaceUnlinkedError(
                     "Slack sent no workspace id for this turn, so it cannot be "
-                    "matched to a FaultMaven organization"
+                    "matched to a FaultMaven enterprise"
                 )
             return self._default
 
@@ -699,7 +720,7 @@ class FaultMavenClient:
                 if self._require_workspace_binding:
                     raise FaultMavenWorkspaceUnlinkedError(
                         f"Slack workspace {team_id} is not linked to a FaultMaven "
-                        "organization"
+                        "enterprise"
                     )
                 if team_id not in self._warned_unbound:
                     self._warned_unbound.add(team_id)
@@ -707,7 +728,7 @@ class FaultMavenClient:
                         "Slack workspace %s has no FaultMaven credential bound; "
                         "answering it as the default service account. Against a "
                         "multi-tenant backend this files the workspace's cases "
-                        "in whatever organization that account carries — bind "
+                        "in whatever enterprise that account acts for — bind "
                         "the workspace, and set "
                         "FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true to refuse "
                         "instead of guessing.",
@@ -717,7 +738,7 @@ class FaultMavenClient:
             cred = _Credential(
                 key=team_id,
                 refresh_token=record.refresh_token,
-                organization_id=record.organization_id,
+                fm_enterprise_id=record.fm_enterprise_id,
                 # Aged from when the token was STORED, not from now. The blind
                 # renew cadence (used when a token's expiry can't be read) is
                 # measured from this, so stamping it at cache time would restart
@@ -744,11 +765,12 @@ class FaultMavenClient:
 
         For a workspace credential this also **reconciles the binding**: the
         cached ``_Credential`` outlives a re-bind, and its stale
-        ``organization_id`` would then make :meth:`_assert_expected_org` reject
-        the very token the re-bind provisioned — failing every turn until the
-        process restarted, while blaming the backend for minting the wrong
-        tenant. The store is the source of truth for a binding, so a changed
-        organization is adopted here rather than fought.
+        ``fm_enterprise_id`` would then make
+        :meth:`_assert_expected_enterprise` reject the very token the re-bind
+        provisioned — failing every turn until the process restarted, while
+        blaming the backend for minting the wrong tenant. The store is the
+        source of truth for a binding, so a changed enterprise is adopted here
+        rather than fought.
         """
 
         if not cred.key:
@@ -764,15 +786,15 @@ class FaultMavenClient:
             # caller must not keep serving this workspace off a cached token.
             self.forget_workspace(cred.key)
             return None
-        if record.organization_id != cred.organization_id:
+        if record.fm_enterprise_id != cred.fm_enterprise_id:
             logger.warning(
-                "Workspace %s was re-bound from organization %s to %s; adopting "
+                "Workspace %s was re-bound from enterprise %s to %s; adopting "
                 "the stored binding",
                 cred.key,
-                cred.organization_id or "(none)",
-                record.organization_id,
+                cred.fm_enterprise_id or "(none)",
+                record.fm_enterprise_id,
             )
-            cred.organization_id = record.organization_id
+            cred.fm_enterprise_id = record.fm_enterprise_id
         return record.refresh_token
 
     def forget_workspace(self, team_id: str) -> None:
@@ -897,51 +919,90 @@ class FaultMavenClient:
 
         return alternatives
 
-    def _assert_expected_org(self, cred: _Credential, access_token: str) -> None:
-        """Refuse a token minted for an organization this workspace is not bound to.
+    def _assert_expected_enterprise(
+        self, cred: _Credential, access_token: str
+    ) -> None:
+        """Refuse a token minted for an enterprise this workspace is not bound to.
 
-        Tenancy travels only in the token chain: the backend's ``users`` table
-        has no organization column, so ``/auth/refresh`` re-attaches whatever
-        ``organization_id`` the presented refresh token carried. Nothing in the
-        database contradicts a credential provisioned against the wrong
-        organization — the mistake is invisible until a customer finds their
-        incidents inside another tenant.
+        The enterprise is the isolation boundary (ADR-017 D6): every read the
+        backend serves is scoped by the ``enterprise_id`` claim of the token
+        presented. The backend anchors each account to an enterprise and
+        ``/auth/refresh`` re-mints that claim from the account row, so a token
+        always says which tenant it acts for — what it cannot say is whether
+        that is the tenant *this workspace* was bound to. A credential
+        provisioned, restored or copied against the wrong enterprise mints
+        perfectly valid tokens, and every case filed with them lands inside
+        another customer.
 
-        So the binding records the organization it was provisioned for, and this
+        So the binding records the enterprise it was provisioned for, and this
         checks every minted access token against it. Refusing turns a silent
-        cross-tenant misroute into a loud, fixable failure. A token whose claim
-        is unreadable is not treated as a mismatch — the backend, not this
-        decoder, is the authority on validity.
+        cross-tenant misroute into a loud, fixable failure.
+
+        **An absent claim is refused too**, unlike the organization check this
+        replaces. The organization decides nothing about visibility, so a token
+        without one was still safe to use; the enterprise decides everything, so
+        a token that names none is a token whose isolation the backend itself
+        would refuse — and passing it here would mean the only local check
+        silently switching itself off on a claim rename upstream.
+
+        A token that is not a decodable JWT is still left alone: that is an
+        opaque bearer (a deployment shape), not a claim this decoder can read,
+        and the backend — not this decoder — is the authority on validity.
+
+        **A workspace credential with no enterprise is dead, not trusted.** It
+        should be unreachable — ``bind`` refuses to write a row without one, and
+        ``bind_workspace`` refuses to call it without a readable claim — but the
+        column is NOT NULL, and NOT NULL does not exclude the empty string, so a
+        row written around this code (an operator's UPDATE, a restored dump)
+        could still carry one. Returning there would be the fail-open arm this
+        assertion exists to close: every token accepted, on the one credential
+        that has nothing to check them against.
+
+        The *process-wide default* principal is the deliberate exception, and
+        ``key`` is what separates them: it names the Slack workspace a credential
+        was resolved for, and is empty only for the default (Socket Mode,
+        self-hosted, and the pre-binding fallback). That principal has no binding
+        by design — there is nothing it could be checked against, and refusing it
+        would refuse every single-tenant deployment. What bounds it is
+        ``require_workspace_binding``, which withdraws it entirely wherever there
+        is more than one tenant to be wrong about.
         """
 
-        if not cred.organization_id:
+        if not cred.key:
+            # The process-wide default: no binding, so nothing to compare.
             return
+        if not cred.fm_enterprise_id:
+            raise FaultMavenCredentialError(
+                f"The credential row for {cred.label} carries no enterprise, so "
+                "no minted token can be checked against it. Refusing to use it: "
+                "this workspace's cases would be filed wherever the credential "
+                "happens to point. Re-bind the workspace."
+            )
         claims = _jwt_claims(access_token)
         if claims is None:
             return
-        actual = claims.get("organization_id")
-        if actual == cred.organization_id:
+        actual = claims.get("enterprise_id")
+        if actual == cred.fm_enterprise_id:
             return
-        if actual is None:
-            # A decodable JWT that simply does not name a tenant is NOT the
-            # opaque-token case above: the backend is speaking JWT and is not
-            # saying which organization this is for, so the only cross-tenant
-            # check in the system has nothing to compare. Treating that as a
-            # pass is the safe direction (the backend still enforces its own
-            # scoping), but it must not be silent — a claim rename upstream
-            # would otherwise disable this guard permanently and invisibly.
-            logger.warning(
-                "FaultMaven minted a token for %s carrying no organization "
-                "claim; the cross-tenant check cannot run on it",
-                cred.label,
+        if not actual:
+            # A decodable JWT that names no tenant. The backend mints the claim
+            # empty exactly when it could not resolve the account's enterprise,
+            # so this is a dead credential upstream as well — say which
+            # workspace it belongs to rather than letting it reach a request.
+            raise FaultMavenCredentialError(
+                f"FaultMaven minted a token for {cred.label} carrying no "
+                f"enterprise claim, so it names no tenant at all. Refusing to "
+                f"use it: {cred.label} is bound to "
+                f"{cred.fm_enterprise_id!r}, and an isolation claim is not "
+                "something to assume. Re-provision the workspace's service "
+                "account against that enterprise."
             )
-            return
         raise FaultMavenCredentialError(
-            f"FaultMaven minted a token for organization {actual!r}, but "
-            f"{cred.label} is bound to {cred.organization_id!r}. Refusing to use "
-            "it: this workspace's cases would be filed inside another tenant. "
-            "Re-provision the workspace's service account against the correct "
-            "organization."
+            f"FaultMaven minted a token for enterprise {actual!r}, but "
+            f"{cred.label} is bound to {cred.fm_enterprise_id!r}. Refusing to "
+            "use it: this workspace's cases would be filed inside another "
+            "tenant. Re-provision the workspace's service account against the "
+            "correct enterprise."
         )
 
     def _exchange_refresh_token(self, cred: _Credential, refresh_token: str) -> str:
@@ -996,8 +1057,8 @@ class FaultMavenClient:
         # cross-tenant credential must not be persisted as this workspace's, and
         # must never reach a request. The presented token is already revoked, so
         # this workspace is locked out either way — loudly, and without having
-        # filed anything in the wrong organization.
-        self._assert_expected_org(cred, access)
+        # filed anything in the wrong enterprise.
+        self._assert_expected_enterprise(cred, access)
 
         # Persist BEFORE use — but never at the cost of the token itself. The
         # rotated credential is the only live one (the presented token is
@@ -1032,7 +1093,7 @@ class FaultMavenClient:
             )
             raise FaultMavenWorkspaceUnlinkedError(
                 f"Slack workspace {cred.key} is no longer linked to a FaultMaven "
-                "organization"
+                "enterprise"
             ) from None
         except Exception as exc:  # noqa: BLE001 — degraded, not fatal
             cred.unpersisted = True
@@ -1448,16 +1509,17 @@ class FaultMavenClient:
         team_name: str,
         slack_enterprise_id: str | None = None,
     ) -> WorkspaceBinding:
-        """Bind a Slack workspace to a Team, as the authenticated admin.
+        """Bind a Slack workspace to a team, as the authenticated admin.
 
-        The organization is taken from ``admin_access_token``'s own claim
+        The enterprise is taken from ``admin_access_token``'s own claim
         server-side; there is deliberately no way to name one here, so this
-        cannot bind a workspace into a tenant the admin does not administer.
+        cannot bind a workspace into a tenant the admin does not belong to
+        (ADR-017 D6: the workspace is anchored to the *installer's* enterprise).
 
         The returned refresh token is the workspace service account's, issued
         once. The admin's bearer is a *parameter*, never stored on this client:
-        it carries org-admin authority far beyond this call, so it lives only as
-        long as the caller's stack frame.
+        it carries their full authority, far beyond this call, so it lives only
+        as long as the caller's stack frame.
         """
 
         payload: dict[str, Any] = {
@@ -1481,9 +1543,9 @@ class FaultMavenClient:
 
         if resp.status_code == 403:
             raise WorkspaceBindError(
-                "Your FaultMaven account can sign in but is not allowed to bind a "
-                "workspace. This needs both 'manage users' and 'manage settings' "
-                "in your organization — ask an organization owner.",
+                "Your FaultMaven account can sign in but is not allowed to "
+                "connect a workspace. Ask a FaultMaven administrator to do it, "
+                "or to grant you the permission.",
                 status_code=403,
             )
         if resp.status_code == 409:
@@ -1524,9 +1586,7 @@ class FaultMavenClient:
             ) from exc
 
         missing = [
-            name
-            for name in ("refresh_token", "organization_id", "team_id")
-            if not body.get(name)
+            name for name in ("refresh_token", "team_id") if not body.get(name)
         ]
         if missing:
             raise WorkspaceBindError(
@@ -1536,13 +1596,31 @@ class FaultMavenClient:
                 status_code=resp.status_code,
             )
         refresh = body["refresh_token"]
+
+        # The tenant is read from the CREDENTIAL, not from a field beside it:
+        # the ``enterprise_id`` claim on the service account's own refresh token
+        # is what ``/auth/refresh`` will re-mint on every renewal, and therefore
+        # exactly what ``_assert_expected_enterprise`` compares each access
+        # token against. A body field would be a second source for one fact,
+        # and the two disagreeing is precisely the misroute the assertion
+        # exists to catch. Refusing a credential whose claim cannot be read
+        # fails the bind loudly rather than storing a row nothing can check.
+        fm_enterprise_id = _enterprise_claim(refresh)
+        if not fm_enterprise_id:
+            raise WorkspaceBindError(
+                "The workspace was created in FaultMaven, but the credential it "
+                "issued names no enterprise, so this agent cannot tell which "
+                "tenant the workspace was admitted to — and will not guess. An "
+                "administrator must re-issue the workspace credential.",
+                status_code=resp.status_code,
+            )
         return WorkspaceBinding(
             # The Slack workspace id is OURS — the one the completed install
             # established — not whatever the server echoes. They should agree;
             # if they ever did not, storing the echo would file the credential
             # under a key no Slack event ever looks up.
             slack_team_id=slack_team_id,
-            organization_id=body.get("organization_id", ""),
+            fm_enterprise_id=fm_enterprise_id,
             team_id=body.get("team_id", ""),
             team_name=body.get("team_name", team_name),
             service_account_username=body.get("service_account_username", ""),
@@ -1590,8 +1668,8 @@ class FaultMavenClient:
         module docstring) — the first turn carries the user's text.
 
         ``team_id`` selects the Slack workspace whose service account owns the
-        case. The owner decides both the organization the case lands in and, via
-        that account's Team membership, who it auto-shares to (ADR-013 D3) — so
+        case. The owner decides both the enterprise the case lands in and, via
+        that account's team membership, who it auto-shares to (ADR-017 D6) — so
         passing the wrong one is a tenancy error, not a labelling one.
         """
 

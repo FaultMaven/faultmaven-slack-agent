@@ -146,15 +146,16 @@ class Settings(BaseSettings):
         default="data/credentials.db", validation_alias="CREDENTIAL_STORE_PATH"
     )
     # Refuse a turn from a Slack workspace that has no FaultMaven credential
-    # bound to it (ADR-013 D3), instead of answering it as the process-wide
+    # bound to it (ADR-017 D6), instead of answering it as the process-wide
     # default account.
     #
     # MUST be true against a multi-tenant (cloud) backend. There, the default
-    # account carries some *particular* organization in its token chain, so
-    # answering an unbound workspace does not degrade — it files that customer's
-    # incident inside another tenant. Off by default only so a deployment
-    # running today's single shared service account keeps working until its
-    # workspaces are bound; each fallback logs a warning naming the workspace.
+    # account acts for some *particular* enterprise — the isolation boundary —
+    # so answering an unbound workspace does not degrade: it files that
+    # customer's incident inside another tenant. Off by default only so a
+    # deployment running today's single shared service account keeps working
+    # until its workspaces are bound; each fallback logs a warning naming the
+    # workspace.
     faultmaven_require_workspace_binding: bool = Field(
         default=False,
         validation_alias="FAULTMAVEN_REQUIRE_WORKSPACE_BINDING",

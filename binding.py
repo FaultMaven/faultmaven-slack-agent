@@ -1,11 +1,16 @@
-"""Binding a Slack workspace to a FaultMaven Team at install (ADR-013 §D3).
+"""Binding a Slack workspace to a FaultMaven team at install (ADR-017 §D6).
+
+The workspace is admitted to the **installer's enterprise** — the isolation
+boundary — and becomes a team inside it. No organization is a precondition:
+the organization answers "who pays for this account?", and it decides nothing
+about who may see a case.
 
 The install flow, and why it is shaped this way:
 
 1. **Slack install completes.** Bolt hands us the workspace and the installer.
    We open a :class:`pending_binds.PendingBind`, set its id in a ``__Host-``
    cookie, and show the installer a page naming the workspace they are about to
-   admit into a FaultMaven organization.
+   admit into a FaultMaven enterprise.
 2. **The admin authorizes on the dashboard.** They are sent to FaultMaven's
    consent screen with PKCE and the record's ``state``.
 3. **They land back here.** We require the ``state`` from the URL and the id
@@ -20,16 +25,16 @@ workspace X", and the only place that can is here. Doing it *before* also means
 the admin's bearer never has to survive across a request — we obtain it, use it
 once, and revoke it inside a single handler.
 
-**What the admin's token is, and is not.** It carries their full organization
-authority (the bind needs both ``ORG_MANAGE_USERS`` and ``ORG_MANAGE_SETTINGS``).
-It is never written down: not to the credential store, not to a cookie, not to a
-log. What is persisted is only the workspace service account's own refresh
-token, which is scoped to that account.
+**What the admin's token is, and is not.** It carries their full FaultMaven
+authority, and the server decides from its own claim which enterprise the
+workspace joins. It is never written down: not to the credential store, not to
+a cookie, not to a log. What is persisted is only the workspace service
+account's own refresh token, which is scoped to that account.
 
-**Both sides of the join must consent.** The FaultMaven side is covered by that
-organization authority. The *Slack* side is not: without a check, a FaultMaven
-organization admin who is an ordinary member of a workspace could admit that
-workspace's investigations into their organization on their own, with nobody who
+**Both sides of the join must consent.** The FaultMaven side is covered by the
+admin signing in and authorizing. The *Slack* side is not: without a check, a
+FaultMaven user who is an ordinary member of a workspace could admit that
+workspace's investigations into their enterprise on their own, with nobody who
 administers the workspace involved. :func:`installer_authority` closes that —
 the flow is offered only to a Workspace Owner or Admin.
 """
@@ -102,12 +107,12 @@ def complete_bind(
 ) -> str:
     """Exchange the code, bind the workspace, persist the credential.
 
-    Returns the organization id the workspace was bound to.
+    Returns the FaultMaven enterprise id the workspace was bound to.
 
     The admin's tokens are revoked in a ``finally``, so they do not outlive this
     call on any path — including the one where the bind is refused, which is the
-    path most likely to be reached (an admin without ``ORG_MANAGE_SETTINGS``
-    consents successfully and is refused here).
+    path most likely to be reached (an admin whose account may not connect a
+    workspace consents successfully and is refused here).
     """
 
     access, refresh = fm.exchange_authorization_code(
@@ -126,7 +131,11 @@ def complete_bind(
         try:
             workspace_credentials.bind(
                 team_id=record.team_id,
-                organization_id=binding.organization_id,
+                # The FaultMaven tenant, from the issued credential's own
+                # claim. ``enterprise_id`` beside it is Slack's Enterprise Grid
+                # id, from the install — two different enterprises, and the
+                # only place in this repository they meet.
+                fm_enterprise_id=binding.fm_enterprise_id,
                 refresh_token=binding.refresh_token,
                 enterprise_id=record.enterprise_id or "",
                 faultmaven_team_id=binding.team_id,
@@ -137,12 +146,12 @@ def complete_bind(
             # is refused as already-bound. Say exactly that, loudly, instead of
             # letting the caller tell an admin "nothing was changed".
             logger.error(
-                "Workspace %s was bound in FaultMaven (organization %s, team %s) "
+                "Workspace %s was bound in FaultMaven (enterprise %s, team %s) "
                 "but its credential could not be stored locally: %s. The "
                 "credential is issued once and is now lost; re-issue it for "
                 "service account %s.",
                 record.team_id,
-                binding.organization_id,
+                binding.fm_enterprise_id,
                 binding.team_id,
                 exc,
                 binding.service_account_username,
@@ -156,20 +165,20 @@ def complete_bind(
 
         # The client caches a credential per workspace, and a re-bind replaces
         # the row underneath it. Without this, turns keep authenticating as the
-        # PREVIOUS service account — filing cases in the previous organization —
+        # PREVIOUS service account — filing cases in the previous enterprise —
         # until that token happens to be rejected.
         fm.forget_workspace(record.team_id)
         logger.info(
-            "Bound Slack workspace %s to organization %s (team %s, account %s, "
-            "account_created=%s team_created=%s)",
+            "Bound Slack workspace %s to FaultMaven enterprise %s (team %s, "
+            "account %s, account_created=%s team_created=%s)",
             binding.slack_team_id,
-            binding.organization_id,
+            binding.fm_enterprise_id,
             binding.team_name,
             binding.service_account_username,
             binding.account_created,
             binding.team_created,
         )
-        return binding.organization_id
+        return binding.fm_enterprise_id
     finally:
         # A live refresh token is a standing org-admin credential, so its
         # revocation failing is worth an operator's attention; an access token
@@ -192,7 +201,7 @@ def complete_bind(
 #: Bind failures whose message is written for a browser. Every other
 #: ``WorkspaceBindError`` embeds up to 300 characters of the backend's raw
 #: response — useful in a log, wrong on a page, and capable of naming another
-#: tenant's organization on the 409.
+#: tenant on the 409.
 _BROWSER_SAFE_BIND_STATUSES = frozenset({403, 503})
 
 
@@ -209,8 +218,8 @@ def bind_failure_message(exc: Exception) -> str:
             return str(exc)
         if exc.status_code == 409:
             return (
-                "This Slack workspace is already connected to a FaultMaven "
-                "organization. If that is not the one you expect, a FaultMaven "
+                "This Slack workspace is already connected to FaultMaven. If "
+                "that is not the connection you expect, a FaultMaven "
                 "administrator has to disconnect it first."
             )
         return (
@@ -248,9 +257,9 @@ def installer_authority(client: WebClient, user_id: str) -> InstallerAuthority:
     rather than assumed to imply it: they are independent booleans in the
     payload, and an Owner who somehow lacks the admin flag is unambiguously
     entitled to this decision. The same three are read again under
-    ``enterprise_user``, where Enterprise Grid reports **organization** authority
-    — a Grid Org Owner is commonly a plain member of the workspace they are
-    installing into.
+    ``enterprise_user``, where Slack's Enterprise Grid reports **Grid
+    organization** authority — a Grid Org Owner is commonly a plain member of
+    the workspace they are installing into.
 
     Never raises. Every failure is :data:`~InstallerAuthority.UNKNOWN`, which
     the caller refuses on — the safe direction, since the alternative is
@@ -282,10 +291,10 @@ def installer_authority(client: WebClient, user_id: str) -> InstallerAuthority:
 
     user = response.get("user") or {}
     # Two levels, because Grid puts them in two places. The top-level flags are
-    # workspace authority; ``enterprise_user`` carries ORGANIZATION authority,
-    # and a Grid Org Owner is routinely an ordinary member of any given
-    # workspace. Reading only the top level tells the highest authority in the
-    # organization to go and find an admin.
+    # workspace authority; ``enterprise_user`` carries Slack GRID ORGANIZATION
+    # authority, and a Grid Org Owner is routinely an ordinary member of any
+    # given workspace. Reading only the top level tells the highest authority in
+    # the Grid to go and find an admin.
     for scope in (user, user.get("enterprise_user") or {}):
         if any(
             scope.get(flag)

@@ -33,7 +33,7 @@ Two goals drive every decision, and they are **complementary, not in tension**:
 | Interaction model | **Explicitly summoned, then thread-scoped** — a mention or shortcut *creates* an owned investigation; plain replies in that thread **auto-continue** it (no re-ping), but the agent acts only on threads it already owns (§5). One turn per thread, **drop-if-busy** (§5.3). | Deliberate creation protects the soundness guarantee and keeps the agent non-ambient; in-thread continuity is the natural UX once summoned; the linear backend can't reconcile N:1 concurrency, so strict turn-taking lives agent-side. |
 | Case scoping & lifecycle | **Thread-scoped collaborative cases shared to the workspace's Team**, with offer-to-close / auto-close-on-inactivity, and terminal-is-permanent (never reopened) (§6) | A Slack thread never "closes" on its own; the agent must supply the lifecycle drivers a Copilot user did by hand, so cases stay bounded and the knowledge flywheel keeps turning. |
 | Required Slack tech | **Slack AI capabilities only** | Assistant container, suggested prompts, streaming, `set_status`, feedback. Directly serves the business need. MCP / Real-Time Search deferred (§14). |
-| Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ a FaultMaven **Team** (within the customer's Organization); per-user FaultMaven account linking. |
+| Deploy / auth | **Cloud OAuth, multi-workspace** | Slack workspace ↔ a FaultMaven **Team** (within the customer's **enterprise**, the isolation boundary); per-user FaultMaven account linking. |
 | Privacy posture | **Subscribe-and-gate** — `message.channels`/`message.groups` for in-thread continuity, but act only on already-owned threads (never ambient) | Same enterprise-trust "no firehose" guarantee as strict mention-only, with the in-thread UX; ownership gate does the filtering. |
 | Backend integration | **FaultMaven REST** (`/cases`, `/cases/{id}/turns`, `/reports`, `/knowledge`) | Carries the case state machine, evidence pipeline, and milestones. |
 
@@ -84,7 +84,7 @@ uniquely great at.
 - A first-class AI-App experience: suggested prompts, live status, streamed
   reasoning, hypotheses, and actionable next steps.
 - Multi-workspace cloud deployment with clean tenant isolation
-  (the customer's **Organization** is the tenant/isolation boundary; each Slack
+  (the customer's **enterprise** is the tenant/isolation boundary; each Slack
   workspace maps to a **Team** within it).
 - Honor FaultMaven's two soundness guarantees in every rendered turn (§9.3):
   **never present an incorrect conclusion; never collapse under pressure** —
@@ -412,9 +412,10 @@ problem-solving unit.
 Stop mapping Slack onto "an individual's private cases." In a war room a case is
 a **team artifact**:
 
-- The tenancy/isolation boundary is the customer's **FaultMaven Organization**
-  (RLS keys on `org_id`, the multi-tenant model, §10); the Slack workspace maps
-  to a **Team** (the sharing unit) within that Org. That is the real tenancy line.
+- The tenancy/isolation boundary is the customer's **FaultMaven enterprise**
+  (ADR-017 D2: isolation is default-deny and database-enforced at the
+  enterprise, §10); the Slack workspace maps to a **Team** (the sharing unit)
+  within that enterprise. That is the real tenancy line.
 - A case is **scoped to its thread/channel** and **shared to the workspace's
   Team** — not owned by one person.
 - Case *browsing* is the Dashboard's job (deep-linked from Slack), scoped
@@ -728,19 +729,31 @@ pressure**. The rendering layer enforces this:
 
 ## 10. Auth & multi-tenancy (Cloud OAuth, multi-workspace)
 
-Two OAuth flows, each doing a distinct job. Mapping (per **ADR-013**): **Slack
-workspace ↔ a FaultMaven Team** (the sharing unit); the customer's **FaultMaven
-Organization** is the tenant/isolation boundary that *groups* Teams. There is
-**no Slack-user ↔ FaultMaven-user mapping** — individual Slack users hold no
-FaultMaven account (only Copilot users do), and the server's principal for every
-Slack turn is this agent's service account (§6.1). A single-workspace customer collapses Org and Team 1:1; a multi-workspace
-(Slack Grid) customer is **one Organization** containing several Teams (one per
-workspace).
+Two OAuth flows, each doing a distinct job. Mapping (per **ADR-017 D6**):
+**Slack workspace ↔ a FaultMaven Team** (the sharing unit); the customer's
+**FaultMaven enterprise** is the tenant/isolation boundary that *groups* Teams.
+There is **no Slack-user ↔ FaultMaven-user mapping** — individual Slack users
+hold no FaultMaven account (only Copilot users do), and the server's principal
+for every Slack turn is this agent's service account (§6.1). A single-workspace
+customer collapses enterprise and Team 1:1; a multi-workspace (Slack Grid)
+customer is **one enterprise** containing several Teams (one per workspace).
+
+The customer's **organization** appears nowhere in this mapping. Under ADR-017
+D2 it answers "who pays for this account?" and decides nothing about who may
+read a case, so the agent neither requires one at install nor reads the
+`organization_id` claim its tokens may carry.
 
 > **Naming collision — Slack `team_id` ≠ FaultMaven Team.** Slack's own
 > `team_id` (and Bolt's `context.team_id`) identifies the **Slack workspace**, not
 > a FaultMaven Team. Throughout this repo, `team_id` always means the Slack
 > workspace; the FaultMaven Team it binds to is written out as "Team".
+>
+> **The same collision, one tier up.** Slack has an "enterprise" too: an
+> **Enterprise Grid** id, sent with an install from a Grid. Throughout this repo
+> `enterprise_id` is *that* — Slack's Grid id — and the FaultMaven isolation
+> tenant is always written `fm_enterprise_id`, in the column, the field, the log
+> line and the page label. They are unrelated identifiers: a workspace with no
+> Grid still belongs to a FaultMaven enterprise.
 
 ### 10.1 Slack app installation (workspace-level)
 
@@ -748,53 +761,60 @@ workspace).
   `OAuthSettings` with a **Postgres-backed `InstallationStore`** and
   `OAuthStateStore` (the template's `FileInstallationStore` is dev-only).
 - Yields the per-team bot token (`xoxb`), `team_id`, installer identity.
-- The installing **admin links the workspace to a FaultMaven Team** (within the
-  customer's Organization; a one-time FaultMaven OAuth/admin step), establishing
-  `team_id → faultmaven_team_id` (and thereby the owning `org_id`).
+- The installing **admin links the workspace to a FaultMaven Team** (a one-time
+  FaultMaven OAuth/admin step), establishing `team_id → faultmaven_team_id`
+  inside the admin's own enterprise.
 
-> **Link, never create.** The Organization is a **precondition**, not something
-> this flow provisions. It is the RLS tenant and the billing boundary, its rows
-> are written by an operator holding the RLS-owning database role (see
-> `fm-provision-sso-org`), and FaultMaven deliberately has **no just-in-time
-> tenant provisioning** — an unmapped IdP organization fails a login closed
-> rather than minting a tenant. A Slack install auto-creating one would be that
-> rejected pattern, driven by an admin who has not authenticated to FaultMaven
-> at all. The **Team** is different: a Team is not a tenant, so find-or-create
-> inside an already-mapped Organization is legitimate, and mirrors what SSO
-> already does for users and org membership.
+> **Link, never create.** The **enterprise** is a **precondition**, not something
+> this flow provisions: it is the isolation tenant, and an account already has
+> exactly one, derived from its verified email domain at sign-up (ADR-017 D3).
+> The workspace is admitted to *the installer's* enterprise — there is no way to
+> name a different one, which is what keeps this flow from binding a workspace
+> into a tenant its installer does not belong to. FaultMaven deliberately has
+> **no just-in-time tenant provisioning**, and a Slack install minting an
+> enterprise would be that rejected pattern, driven by an admin who has not
+> authenticated to FaultMaven at all. The **Team** is different: a Team is not a
+> tenant, so find-or-create inside the installer's enterprise is legitimate, and
+> mirrors what SSO already does for users.
 >
-> **Ordering (ADR-013).** Organization (precondition) → Team (find-or-create) →
-> the `slack` service account → its **Organization** membership → its **Team**
-> membership. The org membership is not optional plumbing: team-membership
-> writes reject a target who is not already an org member, and it is the Team
-> membership that makes `_auto_share_slack_case` resolve to anything at all.
+> **Ordering (ADR-017 D6).** Enterprise (precondition, the installer's) → Team
+> (find-or-create inside it) → the `slack` **service account**, anchored to that
+> same enterprise → its **Team** membership, which is what makes
+> `_auto_share_slack_case` resolve to anything at all. **No organization step**:
+> an organization is a billing fact, absent for every beta account, and
+> requiring one was the dead end ADR-017 D6 removes.
 
 **Where the credential lives.** Each bound workspace's FaultMaven refresh
 credential is stored beside its installation, in `SLACK_DATABASE_URL`
 (`workspace_credentials.py`) — not on a pod volume, because the binding is
 per-install state shared across replicas, exactly like the bot token. Every turn
 authenticates as its own workspace's credential (`FaultMavenClient` resolves it
-from Bolt's `context.team_id`), so the case is owned in the right Organization
-and auto-shares to the right Team.
+from Bolt's `context.team_id`), so the case is owned in the right enterprise and
+auto-shares to the right Team.
 
-**Tenancy is carried only by the token.** The backend's `users` table has no
-organization column: `/auth/refresh` re-attaches whatever `organization_id` the
-presented refresh token held, and the request's org context is bound from that
-claim. Two consequences the agent is built around:
+**Tenancy is carried only by the token.** Every request is scoped by the
+`enterprise_id` claim of the bearer it presents; the account is anchored to an
+enterprise server-side and `/auth/refresh` re-mints the claim from that row. Two
+consequences the agent is built around:
 
-1. Nothing needs to *send* an org id — holding the right credential is the whole
-   mechanism.
-2. Nothing server-side contradicts a credential minted against the **wrong**
-   organization. So the binding records the organization it was provisioned for
-   and the client refuses any access token whose claim disagrees; otherwise the
+1. Nothing needs to *send* a tenant id — holding the right credential is the
+   whole mechanism.
+2. A credential provisioned, restored or copied against the **wrong** enterprise
+   is perfectly valid and completely wrong. So the binding records the
+   enterprise it was provisioned for (`fm_enterprise_id`) and the client refuses
+   any access token whose claim disagrees **or is absent**; otherwise the
    mistake stays invisible until a customer finds their incidents in another
    tenant.
+
+The `organization_id` claim, when a token carries one, is read for nothing: it
+is billing context (ADR-017 D2), it is absent for every beta account, and
+treating it as a tenant is exactly the confusion this design no longer has.
 
 **An unbound workspace is refused, not absorbed.** With
 `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` (**required against a multi-tenant
 backend**) a turn from a workspace with no binding is declined in-thread rather
-than answered as the process-wide default account — that account carries some
-particular organization, so answering would file one customer's incident inside
+than answered as the process-wide default account — that account acts for some
+particular enterprise, so answering would file one customer's incident inside
 another tenant. The default account remains the right answer where there is
 exactly one tenant to be wrong about: Socket Mode and self-hosted.
 
@@ -805,12 +825,12 @@ consent. Neither is remarkable; the seam between them is where the risk lives.
 
 **The attack the design exists to stop.** An attacker installs the app into
 *their own* workspace — entirely legitimate — and gets a FaultMaven authorize
-URL. They forward it to an admin of a **victim** organization. The dashboard's
+URL. They forward it to an admin in a **victim** enterprise. The dashboard's
 consent screen renders the client name and a *caller-supplied* scope string, so
 it names no workspace and nothing on it looks wrong; the victim approves. If the
 callback trusted `state` alone, the attacker's workspace would be bound into the
-victim's tenant — a service account on a Team inside their organization,
-carrying the attacker's Slack traffic.
+victim's tenant — a service account on a Team inside their enterprise, carrying
+the attacker's Slack traffic.
 
 **What stops it.** A pending-bind record is addressed by **two independent
 secrets**: `state`, which travels in the URL, and a record id in a `__Host-`
@@ -836,19 +856,20 @@ screen cannot describe this grant, so the agent names the workspace itself. Doin
 it first also means the admin's bearer never survives a request boundary: it is
 obtained, used once, and revoked inside a single handler.
 
-**The admin's token is borrowed, not held.** The bind needs both
-`ORG_MANAGE_USERS` **and** `ORG_MANAGE_SETTINGS` (the second because it creates a
-Team) — so an admin holding only the first consents happily and is refused at the
-bind. Both tokens are revoked on every path, that one included. What is persisted
-is only the workspace service account's own refresh token.
+**The admin's token is borrowed, not held.** Whether the account may connect a
+workspace at all is the server's decision, taken from that token's own claims —
+an admin who lacks the permission consents happily and is refused at the bind,
+which is the *likeliest* path through this code and so the one the revocation
+has to cover. Both tokens are revoked on every path, that one included. What is
+persisted is only the workspace service account's own refresh token.
 
 **Slack-side authority is checked at install.** Both sides of the join have to
-consent: FaultMaven's side by the organization permissions above, Slack's side by
-`installer_authority` (`users.info`, needing `users:read`), which offers the bind
-only to a Workspace Owner or Admin — reading `enterprise_user` as well, so a Grid
-Org Owner qualifies. Without it, anyone Slack permits to install apps could bind
-a workspace into an organization *they* administer, and the globally unique
-service-account username would lock the rightful organization out until an
+consent: FaultMaven's side by the admin authenticating and authorizing, Slack's
+side by `installer_authority` (`users.info`, needing `users:read`), which offers
+the bind only to a Workspace Owner or Admin — reading `enterprise_user` as well,
+so a Slack Grid Org Owner qualifies. Without it, anyone Slack permits to install
+apps could bind a workspace into *their* enterprise, and the globally unique
+service-account username would lock the rightful enterprise out until an
 operator intervened. It **fails closed**: any `users.info` failure is reported as
 unknown and refuses, so a deployment whose Slack app configuration predates
 `users:read` binds nothing until the manifest is pushed. What it does not
@@ -861,18 +882,19 @@ carrying a *bot* token (a `tokens.oauth`-only payload is one user disconnecting
 their account, with the app still installed), remove the workspace's row, revoke
 its service-account credential server-side, and drop the cached copy — then run
 the SDK's own installation teardown. The workspace's **cases are unaffected**:
-they belong to the service account inside the customer's organization, not to the
+they belong to the service account inside the customer's enterprise, not to the
 Slack installation, so a reinstall re-binds to the same derived account and the
 history is still there. Slack delivers the event to one replica; the others
 discard the credential at their next rotation, because the UPDATE-only
 `put_refresh_token` finds no row.
 
-**Not covered: Enterprise Grid.** An org-wide install (`is_enterprise_install`)
-carries no `team_id` at install time — its workspaces surface at first event,
-when no admin is present to authorize a binding. Binding must therefore also be
-possible lazily, keyed `(enterprise_id, team_id)`. The credential table is keyed
-that way already so the schema need not change, but the lazy-binding flow itself
-is out of scope here.
+**Not covered: Slack Enterprise Grid.** An org-wide install
+(`is_enterprise_install`) carries no `team_id` at install time — its workspaces
+surface at first event, when no admin is present to authorize a binding. Binding
+must therefore also be possible lazily. The credential table needs no change for
+it: it is keyed on the workspace alone and records Slack's Grid id beside the
+row, matching the server's binding key, so a workspace keeps its binding when it
+joins or leaves a Grid. The lazy-binding flow itself is out of scope here.
 
 ### 10.2 FaultMaven account linking (per user)
 
@@ -892,9 +914,9 @@ Reuses the Copilot's proven PKCE flow (`client_id=faultmaven-copilot`, scopes
 **War-room fallback (avoid collapse-under-pressure for UX):** in a shared
 incident thread, requiring every participant to link before the agent responds
 would stall the room. So unlinked users' turns run under a **workspace service
-identity** (the workspace→Team binding, resolving to the owning Org), attributed
-to the Slack user in metadata. The *case* always lives in the bound Org — never
-cross-tenant.
+identity** (the workspace→Team binding, resolving to the owning enterprise),
+attributed to the Slack user in metadata. The *case* always lives in the bound
+enterprise — never cross-tenant.
 
 > **⚠️ Unsettled: "attributed to the Slack user in metadata."** The backend does
 > not do this, and ADR-012 D2 deliberately says it should not — `case_messages.
@@ -917,11 +939,12 @@ cross-tenant.
 
 ### 10.3 Tenant isolation
 
-- Every FaultMaven call carries a token scoped to the bound Org; `org_id` is
-  derived from the token server-side (never passed by us).
+- Every FaultMaven call carries a token scoped to the bound enterprise; the
+  tenant is derived from the token's `enterprise_id` claim server-side (never
+  passed by us).
 - Our stores (installations, tokens, thread→case map) are keyed by `team_id`
   (the Slack workspace); no cross-workspace reads.
-- This rides FaultMaven's existing multi-tenant RLS model (the **Organization**
+- This rides FaultMaven's multi-tenant RLS model (ADR-017 D2: the **enterprise**
   is the RLS tenant boundary; the workspace resolves to a **Team** within it).
 
 ---

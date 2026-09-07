@@ -218,8 +218,9 @@ def _install_callbacks(
     """What the browser sees when a Slack install finishes.
 
     Bolt's default is a bare "success" page. We replace it because the install is
-    only half the story: the workspace still has no FaultMaven organization, and
-    the installer is the one person positioned to say which one it belongs to.
+    only half the story: the workspace is not yet in any FaultMaven enterprise,
+    and the installer is the one person positioned to say which one it belongs
+    to.
     """
 
     def on_success(args: SuccessArgs) -> BoltResponse:
@@ -238,11 +239,11 @@ def _install_callbacks(
                 body=install_pages.unavailable_page(),
             )
 
-        # Both sides of the join must consent. The FaultMaven leg is gated on
-        # organization authority; this is the Slack leg. Without it a FaultMaven
-        # org admin who is an ordinary member here could admit this workspace on
-        # their own. Checked before the pending record is created, so a refusal
-        # leaves no state behind.
+        # Both sides of the join must consent. The FaultMaven leg is the admin
+        # signing in and authorizing; this is the Slack leg. Without it a
+        # FaultMaven user who is an ordinary member here could admit this
+        # workspace on their own. Checked before the pending record is created,
+        # so a refusal leaves no state behind.
         authority = installer_authority(
             make_web_client(installation.bot_token), installation.user_id or ""
         )

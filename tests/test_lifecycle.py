@@ -12,13 +12,12 @@ The behaviour with the sharpest edge is the ``tokens_revoked`` split: a payload
 carrying only ``tokens.oauth`` is one person disconnecting their own account, and
 the app is still installed. Unbinding there would destroy a live workspace's
 FaultMaven credential — which is issued once per bind, so recovering means an
-organization admin re-running the whole install.
+admin re-running the whole install.
 """
 
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,6 +27,7 @@ from slack_sdk.oauth.installation_store import InstallationStore
 
 from listeners import register_listeners
 from listeners.lifecycle import register_lifecycle
+from workspace_credentials import WorkspaceCredential
 
 TEAM = "T0B9XNZDR44"
 
@@ -74,8 +74,11 @@ def wiring():
     fm = MagicMock()
     fm.revoke_token.return_value = True
     credentials = MagicMock()
-    credentials.get.return_value = SimpleNamespace(
-        team_id=TEAM, refresh_token="rt-live", organization_id="org-1"
+    # The real dataclass, not a stand-in: a fake would accept a field name
+    # the store no longer has, and this suite would keep passing after the row
+    # shape moved underneath it.
+    credentials.get.return_value = WorkspaceCredential(
+        team_id=TEAM, fm_enterprise_id="ent-1", refresh_token="rt-live"
     )
     register_lifecycle(app, fm, credentials)
     return app, fm, credentials, installation_store
@@ -188,7 +191,7 @@ def test_uninstall_tears_the_binding_down_before_the_installation(wiring):
     one guard should fail here rather than silently start leaving a live
     FaultMaven credential behind whenever the SDK half throws. The credential is
     the more dangerous leftover — a standing service-account credential inside a
-    customer's organization, where the bot token Slack has already revoked is
+    customer's enterprise, where the bot token Slack has already revoked is
     inert.
     """
     app, fm, credentials, installation_store = wiring
@@ -300,7 +303,7 @@ def test_uninstall_revokes_the_service_account_credential(wiring):
     unusable anywhere.
 
     Without this the service-account refresh token stays valid inside the
-    customer's organization for its full lifetime — usable by a replica still
+    customer's enterprise for its full lifetime — usable by a replica still
     holding it, by a database backup, or by anything that logged it.
     """
     app, fm, credentials, _ = wiring
@@ -318,7 +321,9 @@ def test_the_credential_is_read_before_it_is_deleted(wiring):
     order: list[str] = []
     credentials.get.side_effect = lambda _t: (
         order.append("read")
-        or SimpleNamespace(team_id=TEAM, refresh_token="rt-live", organization_id="o")
+        or WorkspaceCredential(
+            team_id=TEAM, fm_enterprise_id="ent-1", refresh_token="rt-live"
+        )
     )
     credentials.unbind.side_effect = lambda _t: order.append("unbind")
     fm.revoke_token.side_effect = lambda *_a, **_k: order.append("revoke") or True

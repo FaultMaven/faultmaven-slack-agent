@@ -5,17 +5,17 @@ the seam, and one attack in particular:
 
     An attacker installs the app into **their own** Slack workspace, which is
     entirely legitimate and yields a FaultMaven authorize URL. They forward that
-    URL to an admin of a **victim** organization. The dashboard consent screen
+    URL to an admin in a **victim** enterprise. The dashboard consent screen
     cannot name a workspace — it renders the client name and a caller-supplied
     scope string — so nothing on it looks wrong, and the victim approves. If the
     callback trusted ``state`` alone, the attacker's workspace would be bound
-    into the victim's tenant: a service account on a Team inside their
-    organization, receiving the attacker's Slack traffic.
+    into the victim's tenant: a service account on a team inside their
+    enterprise, receiving the attacker's Slack traffic.
 
 Every test below exists because of that, or because of a way the same authority
 could leak: the cookie half, single use, expiry, where ``slack_team_id`` is read
-from, and whether the admin's borrowed org-admin token outlives the one call it
-was obtained for.
+from, and whether the admin's borrowed authority outlives the one call it was
+obtained for.
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class FakeFM:
             raise self.bind_error
         return WorkspaceBinding(
             slack_team_id=slack_team_id,
-            organization_id="org-victim",
+            fm_enterprise_id="ent-victim",
             team_id="fmteam-1",
             team_name=team_name,
             service_account_username=f"slack-{slack_team_id}",
@@ -98,11 +98,11 @@ class FakeFM:
 
 
 # -- the attack ---------------------------------------------------------------
-def test_a_forwarded_authorize_url_cannot_bind_into_the_victims_org(tmp_path):
+def test_a_forwarded_authorize_url_cannot_bind_into_the_victims_enterprise(tmp_path):
     """THE test. The attacker holds the state (it is in the URL they forward)
     but not the cookie, which lives only in their own browser. Without both, the
     callback must refuse — otherwise the victim's approval binds the attacker's
-    workspace into the victim's organization."""
+    workspace into the victim's enterprise."""
     pending, _ = make_stores(tmp_path)
     record = open_bind(pending)
 
@@ -227,7 +227,7 @@ def test_the_authorize_url_is_built_only_from_config_and_record(tmp_path):
 
 # -- the borrowed admin authority --------------------------------------------
 def test_the_admin_tokens_are_revoked_after_a_successful_bind(tmp_path):
-    """The bearer carries the admin's whole organization authority. It exists for
+    """The bearer carries the admin's whole FaultMaven authority. It exists for
     one call and must not survive it."""
     pending, creds = make_stores(tmp_path)
     record = pending.consume(
@@ -245,9 +245,9 @@ def test_the_admin_tokens_are_revoked_after_a_successful_bind(tmp_path):
 
 
 def test_the_admin_tokens_are_revoked_even_when_the_bind_is_refused(tmp_path):
-    """The likeliest failure: the endpoint needs ORG_MANAGE_USERS *and*
-    ORG_MANAGE_SETTINGS, so an admin with only the first consents happily and is
-    refused here. Their token must not be left live because of it."""
+    """The likeliest failure: an admin whose FaultMaven account may not connect
+    a workspace consents happily and is refused here. Their token must not be
+    left live because of it."""
     pending, creds = make_stores(tmp_path)
     r = open_bind(pending)
     record = pending.consume(state=r.state, bind_id=r.bind_id)
@@ -279,7 +279,7 @@ def test_only_the_service_account_credential_is_persisted(tmp_path):
 
     stored = creds.get("T-OK")
     assert stored.refresh_token == "sa-refresh"
-    assert stored.organization_id == "org-victim"
+    assert stored.fm_enterprise_id == "ent-victim"
     assert stored.refresh_token not in ("admin-access", "admin-refresh")
 
 
@@ -423,7 +423,7 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
         seen["team_id"] = record.team_id
         seen["code"] = code
         seen["redirect_uri"] = redirect_uri
-        return "org-acme"
+        return "ent-acme"
 
     monkeypatch.setattr(web, "complete_bind", fake_complete)
 
@@ -434,7 +434,10 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
 
     assert resp.status_code == 200
     assert "Workspace connected" in resp.text
-    assert "org-acme" in resp.text
+    # The page names the FaultMaven ENTERPRISE the workspace now lives in —
+    # the boundary a reader can act on — and labels it as one.
+    assert "FaultMaven enterprise" in resp.text
+    assert "ent-acme" in resp.text
     assert seen["team_id"] == "T-REAL", "the workspace came from the record"
     assert seen["code"] == "good-code"
     assert seen["redirect_uri"] == "https://slack.faultmaven.ai/faultmaven/callback"
@@ -443,7 +446,7 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
 def test_a_rebind_drops_the_cached_credential(tmp_path):
     """The client caches a credential per workspace and a re-bind replaces the
     row underneath it. Without invalidation, turns keep authenticating as the
-    PREVIOUS service account — filing cases in the previous organization — until
+    PREVIOUS service account — filing cases in the previous enterprise — until
     that token happens to be rejected. ``forget_workspace`` exists for this."""
     pending, creds = make_stores(tmp_path)
     r = open_bind(pending, team_id="T-REBOUND")
@@ -488,19 +491,19 @@ def test_a_local_store_failure_after_the_server_bind_is_reported_as_final(tmp_pa
 
 def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
     """`bind_workspace` embeds up to 300 chars of the backend's raw response,
-    which on a cross-org conflict can name another tenant's organization. That
-    belongs in the log, not in a browser."""
+    which on a cross-tenant conflict can name another tenant. That belongs in
+    the log, not in a browser."""
     from binding import bind_failure_message
 
     exc = WorkspaceBindError(
-        "This Slack workspace is already bound elsewhere: organization "
-        "org-someone-else team 'Their Secret Project'",
+        "This Slack workspace is already bound elsewhere: enterprise "
+        "ent-someone-else team 'Their Secret Project'",
         status_code=409,
     )
 
     message = bind_failure_message(exc)
 
-    assert "org-someone-else" not in message
+    assert "ent-someone-else" not in message
     assert "Their Secret Project" not in message
     assert "already connected" in message
 
@@ -551,10 +554,10 @@ class _RecordingPendingBinds:
 
 # -- the installer must administer the workspace (users:read / users.info) ----
 #
-# Both sides of the join have to consent. The FaultMaven leg is gated on
-# organization authority; without this the *Slack* leg is gated on nothing, and
-# a FaultMaven organization admin who happens to be an ordinary member of a
-# workspace could admit that workspace's investigations into their organization
+# Both sides of the join have to consent. The FaultMaven leg is the admin
+# authenticating and authorizing; without this the *Slack* leg is gated on
+# nothing, and a FaultMaven user who happens to be an ordinary member of a
+# workspace could admit that workspace's investigations into their enterprise
 # with nobody who administers the workspace involved.
 
 
@@ -688,11 +691,11 @@ def test_an_unknown_authority_refuses_too_but_says_something_different(monkeypat
 
 
 def test_an_enterprise_grid_org_owner_may_bind():
-    """Grid reports organization authority under ``enterprise_user``.
+    """Slack's Grid reports Grid-organization authority under ``enterprise_user``.
 
     A Grid Org Owner is routinely a plain member of any given workspace, so the
     top-level flags are all false. Reading only those told the highest authority
-    in the organization to go and find a Workspace Admin.
+    in the Grid to go and find a Workspace Admin.
     """
     for flag in ("is_admin", "is_owner", "is_primary_owner"):
         client = _UsersInfoClient(
