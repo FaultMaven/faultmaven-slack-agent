@@ -8,6 +8,38 @@ configs you share, correlated with your runbooks and past fixes. Built on
 > Full architecture, feature design, backend contract, and roadmap:
 > [docs/design.md](docs/design.md).
 
+## Getting it
+
+**Try it right now, with no account and nothing installed.** FaultMaven is
+already in the [FaultMaven Community
+Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
+— join and `@FaultMaven` in a channel. That workspace is shared and public, so
+it is the right place for a real but unremarkable problem and the wrong place
+for production secrets.
+
+**In your own workspace:** ask us in the community workspace and we will set it
+up. During beta we connect each workspace **by hand** rather than advertising a
+self-serve install, and that is deliberate: `fm_workspace_credentials` is not
+yet populated per workspace, so a workspace that installs without being bound
+is answered on a shared service account and its cases are filed in another
+tenant ([fm#1457](https://github.com/FaultMaven/faultmaven/issues/1457)).
+
+‼ **Not advertising the install is not the same as disabling it.**
+`GET /slack/install` is a live route (`web.py`), so anyone holding the URL —
+from a bookmark, a cached page, `manifest.json`, or this repository's history —
+can still install today. The control that actually closes it is
+**`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`**, which defaults to `false` so
+that existing unbound workspaces keep working; set it on any multi-tenant
+backend and an unbound workspace is refused instead of misfiled. Operators
+deploying this against Cloud should treat that as required, not optional.
+
+**Not on the Slack Marketplace.** The listing is not live; do not expect to
+find it there yet. Note that `manifest.json` still declares
+`faultmaven.ai/slack` as the App Directory *installation landing page* while
+that page now offers only the community workspace — a resubmission needs one
+or the other changed, and because `app_directory` is write-only the drift
+cannot be caught programmatically.
+
 ## Operating model
 
 - **Assistant container** — a 1:1 AI side-panel session with suggested prompts
@@ -90,6 +122,12 @@ refuse an unbound workspace instead: the fallback account acts for one particula
 enterprise, so answering on it would file another customer's incident inside that
 tenant. See [docs/design.md](docs/design.md) §10.1.
 
+‼ **As deployed today, no workspace is bound** — `fm_workspace_credentials` is
+empty, so every installed workspace is on the fallback described above, and the
+setting defaults to `false`. Read this section as the design, not the current
+state; see [Getting it](#getting-it) and
+[fm#1457](https://github.com/FaultMaven/faultmaven/issues/1457).
+
 **Testing in a real workspace?** Follow the step-by-step runbook in
 [docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,
 then smoke each surface (Assistant panel, @mention, message shortcut, buttons).
@@ -125,7 +163,12 @@ Kit rendering, **interactive suggested-action buttons**, the Home tab, and
 transport). A **preflight doctor** (`scripts/preflight.py`) verifies the wiring
 before a live test.
 
-**Next:** per-user FaultMaven account linking (workspace→team binding), a
+**Not yet:** **per-workspace isolation** — every installed workspace currently
+shares one service account, so workspaces are provisioned by hand during beta
+rather than self-serve ([fm#1457](https://github.com/FaultMaven/faultmaven/issues/1457)).
+Until each is bound, set `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` on a
+multi-tenant backend so an unbound workspace is refused rather than misfiled.
+Then per-user FaultMaven account linking (workspace→team binding), a
 token-streaming reasoning timeline, and terminal-state reports — see the roadmap
 in [docs/design.md](docs/design.md) §16.
 
