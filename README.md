@@ -8,6 +8,27 @@ configs you share, correlated with your runbooks and past fixes. Built on
 > Full architecture, feature design, backend contract, and roadmap:
 > [docs/design.md](docs/design.md).
 
+## Getting it
+
+**Try it right now, with no account and nothing installed.** FaultMaven is
+already in the [FaultMaven Community
+Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
+— join and `@FaultMaven` in a channel. That workspace is shared and public, so
+it is the right place for a real but unremarkable problem and the wrong place
+for production secrets.
+
+**In your own workspace:** ask us in the community workspace and we will set it
+up. During beta we connect each workspace **by hand** rather than offering a
+self-serve install button, and that is deliberate: `fm_workspace_credentials`
+is not yet populated per workspace, so a self-serve install would put a team's
+cases in a shared service account instead of their own
+([fm#1457](https://github.com/FaultMaven/faultmaven/issues/1457)). Connecting
+by hand is what keeps a workspace's investigations inside its own enterprise
+until that is fixed.
+
+**Not on the Slack Marketplace.** The listing is not live; do not expect to
+find it there yet.
+
 ## Operating model
 
 - **Assistant container** — a 1:1 AI side-panel session with suggested prompts
@@ -125,7 +146,10 @@ Kit rendering, **interactive suggested-action buttons**, the Home tab, and
 transport). A **preflight doctor** (`scripts/preflight.py`) verifies the wiring
 before a live test.
 
-**Next:** per-user FaultMaven account linking (workspace→team binding), a
+**Not yet:** **per-workspace isolation** — every installed workspace currently
+shares one service account, so workspaces are provisioned by hand during beta
+rather than self-serve ([fm#1457](https://github.com/FaultMaven/faultmaven/issues/1457)).
+Then per-user FaultMaven account linking (workspace→team binding), a
 token-streaming reasoning timeline, and terminal-state reports — see the roadmap
 in [docs/design.md](docs/design.md) §16.
 
