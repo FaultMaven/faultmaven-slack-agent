@@ -18,7 +18,7 @@ uvicorn[standard]==0.52.4
 # default driver for a `postgresql://` URL (the hosted config); without it the
 # first connection raises ModuleNotFoundError and the pod crashes at boot.
 sqlalchemy==2.0.52
-psycopg2-binary==2.9.12
+psycopg2-binary==2.9.13
 
 # Settings / validation
 pydantic==2.13.5
