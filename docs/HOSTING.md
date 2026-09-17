@@ -74,9 +74,29 @@ error on the first Slack event.
 
 ## Service account credentials (oauth-mode backends)
 
-Against a backend running `AUTH_MODE=oauth` (cloud), dev-login is not served —
-it returns 404. The agent instead holds a provisioned **refresh token** and mints
-its own access tokens (ADR-012 D10).
+Against a backend running `AUTH_MODE=oauth` (cloud), the agent authenticates as
+a FaultMaven **service account** — `users.account_kind='service'` with
+`users.service_channel='slack'` (ADR-017 D6 retired `slack` as an account *kind*;
+it is the channel a service account serves). For a bound workspace the username
+is **derived** from the Slack workspace, never chosen — `slack-<team id>` — and
+`users.username` carries a global unique index, so "one service account per
+workspace" is a database guarantee rather than a convention. The email is
+auto-generated (`<username>@faultmaven.example`), non-routable, and never used to
+sign in.
+
+**The principal has no interactive sign-in at all.** Not "dev-login is not served
+in oauth mode" — that is a property of the *mode*. This account has no password,
+no SSO identity and no login of any kind, in any mode: there is nothing a login
+form could accept. Its only credential is a single-use **refresh token** it
+presents to mint its own access tokens (ADR-012 D10). That credential and the
+account's `is_active` flag are the whole of its access.
+
+**One workspace, one service account, one team.** A bound Slack workspace
+resolves to exactly one service account, anchored to exactly one enterprise
+(`users.enterprise_id`, the isolation boundary), which is a member of exactly one
+FaultMaven **team** inside that enterprise — and that membership is what makes a
+Slack case auto-share to the people who should see it. No organization appears
+anywhere in this chain: an organization answers "who pays", never "who may see".
 
 **Bootstrap.** On the backend, mint a credential and put it in the agent's
 Secret as `FAULTMAVEN_REFRESH_TOKEN`:
@@ -85,6 +105,14 @@ Secret as `FAULTMAVEN_REFRESH_TOKEN`:
 kubectl exec -it deploy/faultmaven-api -- \
     fm-provision-service-account -u slack-agent -o <enterprise-id> --token-only
 ```
+
+`slack-agent` is the **interim shared account** — the one process-wide principal
+that every *unbound* workspace falls back to, and the only account the live beta
+deployment uses. It is not the design. The per-workspace form is
+`slack-<team id>`, minted by the install-time bind rather than by this command,
+and it is what a multi-tenant deployment runs on;
+`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the shared account
+entirely (see *Deferred* below).
 
 `fm-provision-service-account` is a console entrypoint shipped with the
 installed package. Invoking the source file by path (`python
@@ -112,6 +140,13 @@ server's window, or revoked because a rotation was lost), the agent logs a
 credential error naming the fix and stops trying. Recovery: re-run the
 provisioning command above and update the Secret. Re-provisioning does not
 revoke a credential still in use, so it is safe to run against a healthy agent.
+
+**The kill switch.** Deactivating the service account (`is_active=False`) is how
+an operator cuts a workspace off: the account's refresh credential is refused,
+and a revocation watermark is written so tokens already minted from it stop being
+accepted. Because the account has no other way in — no password, no SSO — that
+single flag is the complete revocation. There is no session to also drop and no
+credential to also reset.
 
 **Blast radius.** A failure here degrades Slack only; the dashboard and Copilot
 authenticate through WorkOS/PKCE.
@@ -220,11 +255,21 @@ config and `--diff` pushed, so there was no safe way to compare — the
 
 ## Deferred (documented, not silently dropped)
 
-- **Per-user FaultMaven account linking (PKCE) + workspace→Team binding**
-  (design.md §10.2/10.3). Blocked on open backend asks (§15.2/15.3): no
-  workspace→Team binding API and no first-class service-identity token type exist
-  yet. For the beta, every workspace's turns run under one cloud FM service token;
-  the case always lives in that one Org. No fabricated tenant isolation.
+- **Per-user FaultMaven account linking (PKCE)** (design.md §10.2). A Slack user
+  is not a FaultMaven principal, and the flow that would make one is the part
+  that is not built; every turn authenticates as the workspace's service account.
+  The workspace→Team binding this used to be paired with **is** built — the
+  backend ask is answered (ADR-017 D6), the API exists
+  (`POST /api/v1/admin/integrations/slack/workspaces`), and the install-time flow
+  lives in `binding.py` / `pending_binds.py` / `workspace_credentials.py`
+  (design.md §10.1a).
+- **Self-service binding at install.** The flow works, but during the beta a
+  workspace is bound by hand rather than through an advertised install link, so
+  the live deployment still answers every workspace on the one interim shared
+  account described above — a service account with a rotating credential, not a
+  static token, anchored to a single **enterprise**. Set
+  `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` on a multi-tenant backend so an
+  unbound workspace is refused rather than filed in the wrong tenant.
 - **Multi-replica / HA** — gated on externalizing the case store.
 
 ## Local development (Socket Mode)
