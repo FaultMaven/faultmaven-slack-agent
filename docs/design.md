@@ -580,21 +580,34 @@ or one it did whose record is gone, which is what an unpersisted
 `CASE_STORE_PATH` volume (§10.1) produces on every restart. Slack still holds
 the answer: in a channel the agent only ever posts after being summoned, so its
 own message in the thread is proof the thread was an investigation.
-`_adopt_lost_thread` reads the thread once, and on a match tombstones it
-(`mark_unlinked` upserts) so it rejoins the path above.
+Specifically, the agent **announced the case id** on the investigation's opening
+reply (`rendering.build_turn_blocks`), and that message is still in the thread.
+So `recover_lost_case` does not declare the conversation lost — it looks the case
+up, re-links the thread (`put` + `mark_seeded`, since the case already holds that
+history) and answers the reply as the ordinary follow-up it is. If that case is
+gone too, the turn 404s and the tombstone path above takes over with the message
+it was always going to give; recovery only removes the guessing.
 
-Three things keep that read off the firehose: it runs only for a reply that said
+The proof has to be the case **pointer**, not the agent's presence. The
+placeholder goes up before `create_case`, and the unreadable-file decline and the
+skipped-attachment note are posted instead of a case existing — so "the agent
+spoke here" would adopt threads that never had an investigation and then tell
+them a case they never had could not be found. And it matches *this* app's
+messages, not any `bot_id`: an incident thread is usually full of other bots, and
+one of them is generally what started it.
+
+Three things keep the read off the firehose: it runs only for a reply that said
 something, only on a thread with no row, and only once per thread per process —
-a thread that turns out not to be ours is remembered. It matches *this* app's
-messages, not any `bot_id`, because an incident thread is usually full of other
-bots and matching them would adopt every alert thread in the channel.
+a thread already found to be someone else's is remembered, and the key is
+recorded only once the probe has *answered*, so a read that fails tries again
+rather than spending that thread's one chance on an error. The whole branch runs
+gated and offloaded like a turn, both because it can become one and because the
+gate serialises it against an `@mention` opening a case in the same thread.
 
-The probe is sound **only on channel threads**. The Assistant surface greets
-every new thread before the first user message arrives, so there the agent's
-presence proves nothing and the same probe would refuse people's opening
-messages. The store also logs a warning when it starts empty, which is the
-moment the loss is diagnosable rather than the moment someone reports that the
-bot stopped answering.
+The store also logs a warning when it starts **empty** — emptiness, not a missing
+table, since a volume can come back with the schema and none of the rows — which
+is the moment the loss is diagnosable rather than the moment someone reports that
+the bot stopped answering.
 
 So `mark_unlinked` keeps the row and flags it (`store.py`). The one-time
 channel notice is claimed with a conditional `UPDATE` (`claim_unlink_notice`)
@@ -608,9 +621,9 @@ all — while `is_unlinked` preserves the memory:
 
 | Surface | A message arrives on a tombstoned thread |
 |---|---|
-| Channel thread reply | Posts the notice **once** (`unlink_notice_pending`), then leaves the thread alone. A war-room thread keeps talking after FaultMaven drops out of it; repeating this on every reply would turn one piece of bad news into a heckle. A content-free reply doesn't spend the notice. |
-| `@mention` / **Ask** shortcut | The way back: opens a fresh case, and `put` clears the tombstone. Its first reply carries a note saying *why* it is a new case — a re-summons that arrives with an unfamiliar case id and no explanation reads as the agent having quietly forgotten the conversation, which is precisely what happened. |
-| Assistant Chat / DM | Answers **every** time — in a 1:1 every message is addressed to us, so none may go unanswered — and never opens a case silently. |
+| Channel thread reply | Posts the notice **once** (`claim_unlink_notice`, a conditional `UPDATE` whose rowcount *is* the claim — replies arrive in bursts across Bolt's thread pool, so a read-then-write would let two of them both post), then leaves the thread alone. A war-room thread keeps talking after FaultMaven drops out of it; repeating this on every reply would turn one piece of bad news into a heckle. A content-free reply doesn't spend the notice. |
+| `@mention` / **Ask** shortcut | The way back: opens a fresh case, and `put` clears the tombstone. Its first reply carries a note saying *why* it is a new case — owed via `restart_pending`, which is armed by `mark_unlinked` and retired by `mark_seeded` rather than by the write that opens the replacement, because the note travels on a reply and a restart whose first turn fails would otherwise continue on an empty case unexplained — a re-summons that arrives with an unfamiliar case id and no explanation reads as the agent having quietly forgotten the conversation, which is precisely what happened. |
+| Assistant Chat / DM | Says it once, then **forgets** the thread. There is no `@mention` here to come back through, so a tombstone that outlived the telling would answer every later message the same way for good — and a 404 is not always a deleted case (a proxy 404 during a backend deploy arrives as the same error). Having been told, the user's next message is a deliberate fresh start rather than a silent one. |
 | Suggested-action button | Answers every time, with the same wording — including when the row is missing entirely rather than tombstoned, since "the case can't be found" is true either way. The buttons stay down: the decision one carries belongs to a case that isn't there, and re-arming it would land a stale choice on whatever case the thread opens next. |
 
 ---

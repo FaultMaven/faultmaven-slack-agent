@@ -14,6 +14,8 @@ channel stays quiet:
 
 from __future__ import annotations
 
+import logging
+import re
 from logging import Logger
 
 from slack_bolt import App, BoltContext
@@ -38,6 +40,10 @@ from ._turn import (
     SUMMONS_TEXT,
     UNREADABLE_FILES_TEXT,
 )
+
+
+#: For the module-level helpers; Bolt injects its own logger into handlers.
+logger = logging.getLogger(__name__)
 
 
 def _post_note(
@@ -99,30 +105,46 @@ def _fetch_thread_context(
     return "\n".join(lines)[:_THREAD_CONTEXT_LIMIT]
 
 
-# How far back the orphan probe reads. FaultMaven's first post in a thread is
-# the placeholder it answers the summons with, so it sits near the top of the
-# replies — a bounded read finds it. A thread long enough to bury it past this
-# is one where the agent joined very late and said very little.
-_ORPHAN_PROBE_LIMIT = 200
+# How far back the recovery probe reads. FaultMaven's case pointer rides on the
+# opening reply of an investigation, so it sits near the top of the replies.
+_RECOVERY_PROBE_LIMIT = 200
+
+# The case pointer as ``rendering.build_turn_blocks`` writes it on a case's
+# opening reply. It is the agent's own output, posted by the agent's own user,
+# so it is proof of something no other signal here can establish: that a case
+# was created for this thread, and which one.
+_CASE_POINTER_RE = re.compile(r":card_index_dividers: `([A-Za-z0-9][\w.-]{0,63})`")
 
 
-def _was_ours(messages: list, *, bot_user_id: str | None, bot_id: str | None) -> bool:
-    """Did *this* app post in the thread? Not "did any bot".
+def case_id_in_message(message: dict, *, bot_user_id, bot_id) -> str | None:
+    """The case id this app announced in ``message``, if it announced one.
 
-    An incident thread is full of other bots — that is usually what started it
-    — so matching a bare ``bot_id`` would adopt every alert thread in the
-    channel.
+    Two things have to hold. The message must be **ours** — an incident thread
+    is usually full of other bots, and one of them is generally what started it,
+    so a bare ``bot_id`` would match the alert rather than the investigation.
+    And it must carry the case pointer, not merely have come from us: the
+    placeholder, the unreadable-file decline and the skipped-attachment note are
+    all posted *before or instead of* a case existing, so "the agent spoke here"
+    is not evidence that it ever opened one.
     """
 
-    for message in messages:
-        if bot_user_id and message.get("user") == bot_user_id:
-            return True
-        if bot_id and message.get("bot_id") == bot_id:
-            return True
-    return False
+    if message.get("user") != bot_user_id and (
+        not bot_id or message.get("bot_id") != bot_id
+    ):
+        return None
+    for block in message.get("blocks") or []:
+        if not isinstance(block, dict):
+            continue
+        for element in block.get("elements") or []:
+            if not isinstance(element, dict):
+                continue
+            found = _CASE_POINTER_RE.search(element.get("text") or "")
+            if found:
+                return found.group(1)
+    return None
 
 
-def _adopt_lost_thread(
+def recover_lost_case(
     client: WebClient,
     store: CaseStore,
     probed: "Dedup",
@@ -133,37 +155,58 @@ def _adopt_lost_thread(
     bot_user_id: str | None,
     bot_id: str | None,
 ) -> bool:
-    """Recover a thread that was ours before the thread→case map was lost.
+    """Re-link a thread whose mapping was lost, from the thread itself.
 
-    A tombstone is written when a turn 404s, so an *absent* row cannot mean
-    that. It means either a thread we never touched, or one we did whose record
-    is gone — an unpersisted ``CASE_STORE_PATH`` (``docs/HOSTING.md``). Slack
-    still holds the answer: in a channel the agent only ever posts after being
-    summoned, so its own message in the thread is proof the thread was an
-    investigation. Found, the thread is tombstoned and rejoins the normal path.
+    A tombstone is only written when a turn 404s, so an *absent* row cannot mean
+    that. It means either a thread the agent never touched, or one it did whose
+    record is gone — an unpersisted ``CASE_STORE_PATH`` (``docs/HOSTING.md``),
+    which loses every mapping on restart. The difference is not knowable from
+    here, but it is written in the thread: the agent announced the case id when
+    it opened the investigation, and that message is still there.
 
-    Sound only on channel threads. The Assistant surface greets every new
-    thread before the first user message, so there the agent's presence proves
-    nothing and this probe would refuse people's opening messages.
+    So the case is not declared lost, it is looked up. The thread re-links to
+    the case it always had and the reply is answered as the ordinary follow-up
+    it is. If that case really is gone too, the turn 404s and the tombstone path
+    takes over with the right message — this only removes the guessing.
 
-    One read per thread per process (``probed``): a thread that turns out not to
-    be ours is remembered, so the ambient-message path pays a lookup, not a
-    lookup per message.
+    Seeded on re-link: the case demonstrably has turns behind it (we just read
+    the reply announcing it), so the thread catch-up an unseen thread gets would
+    re-send it its own history as fresh evidence.
+
+    One read per thread per process, and the key is recorded only once the probe
+    has actually answered — a read that fails leaves the thread to try again
+    rather than spending its one chance on an error.
     """
 
-    if probed.is_duplicate(f"{team_id}:{channel}:{thread_ts}"):
+    key = f"{team_id}:{channel}:{thread_ts}"
+    if probed.seen(key):
         return False
     try:
         resp = client.conversations_replies(
-            channel=channel, ts=thread_ts, limit=_ORPHAN_PROBE_LIMIT
+            channel=channel, ts=thread_ts, limit=_RECOVERY_PROBE_LIMIT
         )
-    except Exception:  # noqa: BLE001 — a failed probe just leaves the thread unknown
+    except Exception:  # noqa: BLE001 — a failed probe leaves the thread unknown
         return False
-    if not _was_ours(
-        resp.get("messages", []), bot_user_id=bot_user_id, bot_id=bot_id
-    ):
+    case_id = next(
+        (
+            found
+            for message in resp.get("messages", [])
+            if (
+                found := case_id_in_message(
+                    message, bot_user_id=bot_user_id, bot_id=bot_id
+                )
+            )
+        ),
+        None,
+    )
+    if case_id is None:
+        probed.is_duplicate(key)  # answered: not ours, and cheap to skip after
         return False
-    store.mark_unlinked(team_id, channel, thread_ts)
+    store.put(team_id, channel, thread_ts, case_id)
+    store.mark_seeded(team_id, channel, thread_ts)
+    logger.info(
+        "Recovered case %s for thread %s from its own history", case_id, thread_ts
+    )
     return True
 
 
@@ -268,10 +311,11 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
 
             # One read of the thread's state, used for both decisions below.
             seeded = store.is_seeded(team_id, channel, thread_ts)
-            # Read BEFORE the turn: opening the replacement case clears the
-            # tombstone, and by then there is nothing left to say this reply
-            # is a restart rather than an ordinary first turn.
-            restarted = store.is_unlinked(team_id, channel, thread_ts)
+            # Read BEFORE the turn. The flag outlives the write that opens
+            # the replacement case and is retired only when a turn lands, so a
+            # restart whose first turn fails still explains itself on the retry
+            # instead of continuing silently on a case nobody was told about.
+            restarted = store.restart_pending(team_id, channel, thread_ts)
 
             # Replay the prior discussion until the case has actually landed a
             # turn (unseeded): a mapping whose first submit failed still needs
@@ -405,55 +449,12 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         channel = event["channel"]
         thread_ts = event["thread_ts"]
         team_id = context.team_id or ""  # install team — see on_app_mention
-        # Only act on threads that are already an investigation. During the
-        # case-OPENING turn the mapping doesn't exist yet (it's committed when
-        # the first turn lands) but the gate is held — a reply in that window
-        # is a real follow-up, so give it the ⏭️ skip signal instead of the
-        # silent drop an unknown thread gets.
-        if store.get(team_id, channel, thread_ts) is None:
-            if is_thread_busy(team_id, channel, thread_ts) and event.get("ts"):
-                if not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
-                    mark_skipped(client, channel, event["ts"])
-                return
-            # A thread that WAS ours, whose case has since gone missing. The
-            # reply can't be answered — the investigation it belongs to is no
-            # longer there — but it was written to us, and dropping it the way
-            # an unknown thread is dropped is what left people typing into
-            # silence. Explain once, then leave the thread alone; an @mention
-            # is how it comes back (and re-linking clears the tombstone).
-            if not (
-                clean_mention(event.get("text") or "").strip()
-                or event.get("files")
-            ):
-                return  # nothing was said; nothing is owed
-            if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
-                return
-            # No tombstone can mean the map that held it is gone rather than
-            # that the thread was never ours — ask Slack which, once.
-            if not store.is_unlinked(team_id, channel, thread_ts):
-                if not _adopt_lost_thread(
-                    client, store, probed_threads,
-                    team_id=team_id, channel=channel, thread_ts=thread_ts,
-                    bot_user_id=context.bot_user_id, bot_id=context.bot_id,
-                ):
-                    return
-            if store.claim_unlink_notice(team_id, channel, thread_ts):
-                if not _post_note(
-                    client, channel, thread_ts, case_gone_text(channel)
-                ):
-                    # Slack refused it, so the thread still hasn't been told.
-                    store.release_unlink_notice(team_id, channel, thread_ts)
-            return
-        if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
-            return
 
         # Decide there's something to investigate BEFORE reserving the thread, so
         # a content-free reply (whitespace, or only another user's mention) can't
         # hold the gate and cause a concurrent real reply to be skipped.
         text = clean_mention(event.get("text") or "").strip()
         has_files = bool(event.get("files"))
-        if not text and not has_files:
-            return
 
         def work() -> None:
             files: list = []
@@ -499,6 +500,79 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 prior_context=prior_context,
                 mention_user=event.get("user"),
             )
+
+
+        # Only act on threads that are already an investigation. During the
+        # case-OPENING turn the mapping doesn't exist yet (it's committed when
+        # the first turn lands) but the gate is held — a reply in that window
+        # is a real follow-up, so give it the ⏭️ skip signal instead of the
+        # silent drop an unknown thread gets.
+        if store.get(team_id, channel, thread_ts) is None:
+            if is_thread_busy(team_id, channel, thread_ts) and event.get("ts"):
+                if not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                    mark_skipped(client, channel, event["ts"])
+                return
+            if not text and not has_files:
+                return  # nothing was said; nothing is owed
+            # Ambient chatter reaches here on every reply in every thread the
+            # agent can see, so the two cheapest reads decide it: a local flag,
+            # and an in-memory note of threads already looked at and found to
+            # belong to someone else. Neither touches Slack.
+            if not store.is_unlinked(
+                team_id, channel, thread_ts
+            ) and probed_threads.seen(f"{team_id}:{channel}:{thread_ts}"):
+                return
+            if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                return
+
+            def orphan_work() -> None:
+                """Answer a reply in a thread with no mapping.
+
+                Gated like a turn, because it can become one: recovery re-links
+                the thread and the reply is then answered normally. The gate
+                also serialises it against an @mention opening a case here, so
+                neither can act on state the other has just replaced.
+                """
+
+                # Under the gate now — an @mention may have opened a case for
+                # this thread while this was queued behind it.
+                if store.get(team_id, channel, thread_ts) is not None:
+                    work()
+                    return
+                if store.is_unlinked(team_id, channel, thread_ts):
+                    # A thread that WAS ours, whose case is confirmed gone. The
+                    # reply can't be answered — the investigation it belongs to
+                    # is not there — but it was written to us, and dropping it
+                    # the way an unknown thread is dropped is what left people
+                    # typing into silence. Explain once, then leave the thread
+                    # alone; an @mention is how it comes back.
+                    if store.claim_unlink_notice(team_id, channel, thread_ts):
+                        if not _post_note(
+                            client, channel, thread_ts, case_gone_text(channel)
+                        ):
+                            # Slack refused it; the thread still hasn't been told.
+                            store.release_unlink_notice(
+                                team_id, channel, thread_ts
+                            )
+                    return
+                # No row at all. Before treating this as a stranger's thread,
+                # ask the thread whether it used to be ours.
+                if recover_lost_case(
+                    client, store, probed_threads,
+                    team_id=team_id, channel=channel, thread_ts=thread_ts,
+                    bot_user_id=context.bot_user_id, bot_id=context.bot_id,
+                ):
+                    work()  # live again — an ordinary follow-up
+
+            run_gated(
+                client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+                skip_ts=None, work=orphan_work,
+            )
+            return
+        if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+            return
+        if not text and not has_files:
+            return
 
         # Reserve the thread and run in the background; if a turn is already
         # running, skip this reply (⏭️) — the sender waits, then resends.

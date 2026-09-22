@@ -111,9 +111,10 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             )
             return
 
-        # Read before the turn: opening the replacement case clears the
-        # tombstone (mirrors on_app_mention).
-        restarted = store.is_unlinked(team_id, channel, thread_ts)
+        # Read before the turn (mirrors on_app_mention). The flag outlives the
+        # write that opens the replacement case, so a restart whose first turn
+        # fails still explains itself on the retry.
+        restarted = store.restart_pending(team_id, channel, thread_ts)
 
         def work() -> None:
             # Placeholder BEFORE the (potentially slow) file download for instant

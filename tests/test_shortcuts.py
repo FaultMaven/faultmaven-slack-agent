@@ -450,9 +450,9 @@ class _FakeClient:
 
 class _LiveThreadStore:
     """A store for a thread whose case is fine — the shortcut only asks whether
-    the thread is tombstoned, to decide if its reply owes a restart note."""
+    this reply owes the "why is this a new case" explanation."""
 
-    def is_unlinked(self, team, channel, thread):
+    def restart_pending(self, team, channel, thread):
         return False
 
 

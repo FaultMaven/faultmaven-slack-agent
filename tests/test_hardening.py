@@ -548,7 +548,8 @@ def test_store_tombstones_rather_than_forgetting(tmp_path):
 def test_a_thread_we_never_owned_is_not_mistaken_for_an_unlinked_one(tmp_path):
     store = CaseStore(str(tmp_path / "cases.db"))
     assert not store.is_unlinked("T", "C", "NEVER")
-    assert not store.unlink_notice_pending("T", "C", "NEVER")
+    assert not store.claim_unlink_notice("T", "C", "NEVER")
+    assert not store.restart_pending("T", "C", "NEVER")
     store.close()
 
 
@@ -561,12 +562,10 @@ def test_the_unlink_notice_is_owed_once(tmp_path):
     store.put("T", "C", "TS", "case_1")
     store.mark_unlinked("T", "C", "TS")
 
-    assert store.unlink_notice_pending("T", "C", "TS")
     # The claim is the lock: replies arrive in bursts across a Bolt thread
     # pool, and exactly one of them may post.
     assert store.claim_unlink_notice("T", "C", "TS")
     assert not store.claim_unlink_notice("T", "C", "TS")
-    assert not store.unlink_notice_pending("T", "C", "TS")
     assert store.is_unlinked("T", "C", "TS")  # told, but still tombstoned
     store.close()
 
@@ -582,7 +581,75 @@ def test_a_notice_slack_refused_is_still_owed(tmp_path):
 
     assert store.claim_unlink_notice("T", "C", "TS")
     store.release_unlink_notice("T", "C", "TS")
-    assert store.unlink_notice_pending("T", "C", "TS")
+    assert store.claim_unlink_notice("T", "C", "TS")  # owed again
+    store.close()
+
+
+def test_a_release_cannot_reach_a_thread_that_was_re_linked(tmp_path):
+    """The claim is conditional on the tombstone, so the release has to be
+    too: if the thread came back to life while the post was in flight, the row
+    belongs to a live case and is none of the releaser's business."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "C", "TS", "case_1")
+    store.mark_unlinked("T", "C", "TS")
+    assert store.claim_unlink_notice("T", "C", "TS")
+
+    store.put("T", "C", "TS", "case_2")  # an @mention got there first
+    store.release_unlink_notice("T", "C", "TS")
+    assert store.get("T", "C", "TS") == "case_2"
+    assert not store.is_unlinked("T", "C", "TS")
+    store.close()
+
+
+def test_the_restart_explanation_outlives_a_failed_opening_turn(tmp_path):
+    """The explanation travels on a reply, and a reply only exists once the
+    turn lands. Retiring it when the replacement case is *written* would mean a
+    restart whose first turn failed continues on an empty case, unexplained —
+    which is the bug this area exists to prevent."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "C", "TS", "case_1")
+    store.mark_unlinked("T", "C", "TS")
+    assert store.restart_pending("T", "C", "TS")
+
+    store.put("T", "C", "TS", "case_2")  # replacement opened; turn not landed
+    assert store.restart_pending("T", "C", "TS"), "still owed"
+
+    store.mark_seeded("T", "C", "TS")  # the turn landed, carrying the note
+    assert not store.restart_pending("T", "C", "TS")
+    store.close()
+
+
+def test_an_ordinary_new_case_owes_no_explanation(tmp_path):
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "C", "TS", "case_1")
+    assert not store.restart_pending("T", "C", "TS")
+    store.close()
+
+
+def test_a_told_thread_can_be_forgotten(tmp_path):
+    """The 1:1 surface has no @mention to come back through, so once it has
+    been told, the row is dropped and the next message opens a case normally."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "D", "TS", "case_1")
+    store.mark_unlinked("T", "D", "TS")
+    store.forget("T", "D", "TS")
+
+    assert not store.is_unlinked("T", "D", "TS")
+    assert store.get("T", "D", "TS") is None
+    store.close()
+
+
+def test_a_tombstone_is_never_conjured_for_a_thread_with_no_row(tmp_path):
+    """mark_unlinked invalidates a mapping; it must not create one. A caller
+    racing an @mention would otherwise be able to tombstone the live case that
+    mention had just opened."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.mark_unlinked("T", "C", "NEVER")
+    assert not store.is_unlinked("T", "C", "NEVER")
     store.close()
 
 
@@ -619,7 +686,7 @@ def test_an_old_schema_store_upgrades_in_place(tmp_path):
     assert store.is_seeded("T", "C", "TS")  # legacy rows had landed turns
     store.mark_unlinked("T", "C", "TS")
     assert store.is_unlinked("T", "C", "TS")
-    assert store.unlink_notice_pending("T", "C", "TS")
+    assert store.claim_unlink_notice("T", "C", "TS")
     store.close()
 
 
@@ -638,7 +705,7 @@ def test_relinking_clears_the_tombstone(tmp_path):
     assert not store.is_unlinked("T", "C", "TS")
 
     store.mark_unlinked("T", "C", "TS")
-    assert store.unlink_notice_pending("T", "C", "TS")
+    assert store.claim_unlink_notice("T", "C", "TS")
     store.close()
 
 

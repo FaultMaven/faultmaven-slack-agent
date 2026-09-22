@@ -61,6 +61,7 @@ class _FakeClient:
         self.updates: list = []
         self.reactions: list = []
         self.history_reads = 0
+        self.fail_history_reads = 0
 
     def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -79,6 +80,9 @@ class _FakeClient:
 
     def conversations_replies(self, **kwargs):
         self.history_reads += 1
+        if self.fail_history_reads:
+            self.fail_history_reads -= 1
+            raise RuntimeError("slack said no")
         return {"messages": self.history}
 
     @property
@@ -180,7 +184,6 @@ def test_a_content_free_reply_does_not_spend_the_notice(tmp_path):
 
     _reply(app, client, ts="2.0", text="   ")
     assert client.posts == []
-    assert store.unlink_notice_pending("T1", "C1", "TS1")
 
     _reply(app, client, ts="3.0", text="so what now?")
     assert len(client.posts) == 1
@@ -244,6 +247,7 @@ def test_the_restarted_investigation_says_it_is_a_restart(tmp_path):
 
     notes = _context_notes(client.updates[-1])
     assert any("couldn't find the earlier case" in n for n in notes)
+    store.close()
 
 
 def test_an_ordinary_first_summons_says_nothing_about_a_restart(tmp_path):
@@ -310,58 +314,101 @@ def test_a_dm_says_the_case_is_gone_instead_of_starting_over_silently(tmp_path):
 # -- the map itself is gone ----------------------------------------------------
 # A tombstone is only written when a turn 404s, so an absent row can also mean
 # the map that held it did not survive a restart (an unpersisted volume, which
-# docs/HOSTING.md warns about). Slack still knows: in a channel the agent only
-# posts after being summoned.
-_OURS = [
-    {"ts": "1.0", "text": "the pods are crashlooping", "user": "U9"},
-    {"ts": "1.1", "text": ":mag: Investigating…", "user": _BOT_USER, "bot_id": _BOT_ID},
-]
+# docs/HOSTING.md warns about). The thread itself still says which case it was:
+# the agent announced the id on the investigation's opening reply.
+def _bot_reply(text: str, *, case_id: str | None = None) -> dict:
+    message = {
+        "ts": "1.1",
+        "text": text,
+        "user": _BOT_USER,
+        "bot_id": _BOT_ID,
+        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+    }
+    if case_id:
+        message["blocks"].append(
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f":card_index_dividers: `{case_id}`"}
+                ],
+            }
+        )
+    return message
 
 
-def test_a_thread_we_were_in_is_recovered_when_the_map_is_lost(tmp_path):
+_HUMAN = {"ts": "1.0", "text": "the pods are crashlooping", "user": "U9"}
+_AN_INVESTIGATION = [_HUMAN, _bot_reply("Looking at the restarts", case_id="case_abc")]
+
+
+def test_a_lost_mapping_is_recovered_from_the_thread_itself(tmp_path):
     """The likelier cause of the reported silence: no 404 ever happened, the
-    row simply isn't there any more."""
+    row simply isn't there any more. The case usually still exists — so the
+    thread is re-linked to it and the reply answered, rather than the
+    conversation being declared lost on the strength of a missing local file."""
 
     store = CaseStore(str(tmp_path / "cases.db"))  # empty, as after the loss
     fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
-    client.history = _OURS
+    client.history = _AN_INVESTIGATION
     register_events(app, fm, store)
 
     _reply(app, client)
 
-    assert "couldn't find" in client.texts[0]
-    assert store.is_unlinked("T1", "C1", "TS1"), "recovered threads are tombstoned"
-    assert not fm.turns
+    assert store.get("T1", "C1", "TS1") == "case_abc"
+    assert [c for c, _ in fm.turns] == ["case_abc"], "answered on its own case"
+    assert not fm.cases, "and no replacement case was invented"
+    # Its history is already in the case; re-sending it as evidence would hand
+    # the engine its own transcript as a fresh symptom.
+    assert store.is_seeded("T1", "C1", "TS1")
+    assert fm.turns[0][1].get("pasted_content") is None
     store.close()
 
 
-def test_another_bots_thread_is_not_adopted(tmp_path):
-    """An incident thread is full of other bots — that is usually what started
-    it — so the probe matches this app, not any bot."""
+def test_a_thread_the_agent_spoke_in_but_never_opened_a_case_for(tmp_path):
+    """The placeholder goes up before the case is created, so a summons whose
+    create_case failed leaves the agent's own message in a thread that never
+    had an investigation. Recovering it would re-link nothing, and telling the
+    thread its case 'could not be found' would describe a case that never
+    existed. Both are wrong; silence is correct here."""
 
     store = CaseStore(str(tmp_path / "cases.db"))
     fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
-    client.history = [
-        {"ts": "1.0", "text": "[FIRING] disk full", "bot_id": "B_ALERTMANAGER"},
-        {"ts": "1.1", "text": "looking", "user": "U9"},
-    ]
+    client.history = [_HUMAN, _bot_reply(":mag: Investigating…")]  # no case id
     register_events(app, fm, store)
 
     _reply(app, client)
 
     assert client.posts == []
-    assert not store.is_unlinked("T1", "C1", "TS1")
+    assert not fm.turns
+    assert store.get("T1", "C1", "TS1") is None
+    store.close()
+
+
+def test_another_bots_case_pointer_is_not_ours_to_adopt(tmp_path):
+    """An incident thread is usually full of other bots — one of them is
+    generally what started it — so the match is on this app, not on any bot."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    impostor = _bot_reply("relayed", case_id="case_xyz")
+    impostor["user"], impostor["bot_id"] = "UOTHER", "B_ALERTMANAGER"
+    client.history = [_HUMAN, impostor]
+    register_events(app, fm, store)
+
+    _reply(app, client)
+
+    assert client.posts == []
+    assert store.get("T1", "C1", "TS1") is None
     store.close()
 
 
 def test_the_thread_history_is_read_once_per_thread(tmp_path):
     """The probe sits on the path that sees every threaded message in every
     channel the agent is in. Reading the history per message would put a Slack
-    call behind ordinary chatter; a thread that turns out not to be ours is
-    remembered instead."""
+    call behind ordinary chatter; a thread already found to be someone else's
+    is remembered instead."""
 
     store = CaseStore(str(tmp_path / "cases.db"))
-    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()  # history: humans only
     register_events(app, fm, store)
 
     _reply(app, client, ts="2.0")
@@ -373,31 +420,90 @@ def test_the_thread_history_is_read_once_per_thread(tmp_path):
     store.close()
 
 
-def test_a_recovered_thread_does_not_keep_probing(tmp_path):
-    """Once adopted the thread has a row, so it rejoins the ordinary path: one
-    notice, and no further history reads."""
+def test_a_probe_that_could_not_read_the_thread_tries_again(tmp_path):
+    """The one-shot key stands for an answer, not an attempt. Recording it
+    before the call would let a single 429 or timeout drop that thread for the
+    life of the process — reintroducing the silence, by the failure path."""
 
     store = CaseStore(str(tmp_path / "cases.db"))
     fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
-    client.history = _OURS
+    client.history = _AN_INVESTIGATION
+    client.fail_history_reads = 1
     register_events(app, fm, store)
 
     _reply(app, client, ts="2.0")
-    _reply(app, client, ts="3.0", text="hello?")
+    assert store.get("T1", "C1", "TS1") is None  # the read failed
 
-    assert client.history_reads == 1
-    assert len(client.posts) == 1
+    _reply(app, client, ts="3.0", text="hello?")
+    assert store.get("T1", "C1", "TS1") == "case_abc"  # retried, and recovered
     store.close()
 
 
 def test_a_content_free_reply_never_costs_a_history_read(tmp_path):
     store = CaseStore(str(tmp_path / "cases.db"))
     fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
-    client.history = _OURS
+    client.history = _AN_INVESTIGATION
     register_events(app, fm, store)
 
     _reply(app, client, ts="2.0", text="   ")
 
     assert client.history_reads == 0
     assert client.posts == []
+    store.close()
+
+
+def test_a_recovered_case_that_is_also_gone_falls_back_to_the_notice(tmp_path):
+    """Recovery removes the guessing, it does not assume. If the case named in
+    the thread is gone too, the turn 404s and the ordinary tombstone path takes
+    over — with the message it was always going to give."""
+
+    from faultmaven import CaseNotFoundError
+
+    class _GoneFM(_FakeFM):
+        def submit_turn(self, case_id, **kwargs):
+            raise CaseNotFoundError("gone", status_code=404)
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _GoneFM(), _FakeClient(), _FakeApp()
+    client.history = _AN_INVESTIGATION
+    register_events(app, fm, store)
+
+    _reply(app, client, ts="2.0")
+
+    assert store.is_unlinked("T1", "C1", "TS1")
+    assert "couldn't find" in client.updates[-1]["text"]
+    store.close()
+
+
+# -- the 1:1 must not be bricked ----------------------------------------------
+def test_a_told_dm_thread_is_not_silenced_for_good(tmp_path):
+    """There is no @mention in a 1:1, so a tombstone that outlived the telling
+    would answer every later message the same way forever — and the 404 behind
+    it is not always a deleted case (a proxy 404 during a deploy arrives as the
+    same error). The user is told once; their next message starts fresh."""
+
+    store = _orphaned(tmp_path, channel="D1", thread="TS1")
+    fm, client = _FakeFM(), _FakeClient()
+    assistant = build_assistant(fm, store)
+    handler = assistant._user_message_listeners[0].ack_function
+    say = _FakeSay()
+
+    def send(text: str, ts: str) -> None:
+        handler(
+            payload={"channel": "D1", "thread_ts": "TS1", "ts": ts, "text": text},
+            context=_ctx(),
+            client=client,
+            set_status=lambda _s: None,
+            say=say,
+            logger=_LOG,
+        )
+        turn_mod.drain_turns(5.0)
+
+    send("still there?", "1.0")
+    assert "couldn't find" in say.posts[0]
+    assert not fm.cases
+
+    send("ok, new problem then", "2.0")
+    assert fm.cases == ["T1"], "the next message opens a case normally"
+    assert "couldn't find" not in (say.posts[-1] or "")
     store.close()

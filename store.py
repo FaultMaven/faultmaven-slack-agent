@@ -39,7 +39,7 @@ class CaseStore:
         # open in Slack now looks like a thread we have never seen — so it is
         # said once, out loud, rather than left for someone to deduce from a
         # user reporting that the bot stopped answering.
-        fresh = not self._conn.execute(
+        had_table = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_cases'"
         ).fetchone()
         # ``seeded`` = the case has landed at least one successful turn. Until
@@ -55,6 +55,7 @@ class CaseStore:
                 seeded         INTEGER NOT NULL DEFAULT 0,
                 unlinked       INTEGER NOT NULL DEFAULT 0,
                 unlink_notified INTEGER NOT NULL DEFAULT 0,
+                restart_pending INTEGER NOT NULL DEFAULT 0,
                 last_turn_ts   TEXT,
                 last_action_ts TEXT,
                 PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -79,7 +80,7 @@ class CaseStore:
                 pass
         # Pre-tombstone stores evicted a dead mapping with DELETE, so every row
         # that survives is a live one: default 0 (not unlinked) is right.
-        for column in ("unlinked", "unlink_notified"):
+        for column in ("unlinked", "unlink_notified", "restart_pending"):
             try:
                 self._conn.execute(
                     f"ALTER TABLE thread_cases "
@@ -88,12 +89,18 @@ class CaseStore:
             except sqlite3.OperationalError:
                 pass
         self._conn.commit()
-        if fresh:
+        # Emptiness, not a missing table: a volume can come back with the schema
+        # and none of the rows (a snapshot from before the first case, a
+        # re-created PVC off an image that already migrated), which is the case
+        # this warning exists for and the one a schema check misses.
+        if not self._conn.execute("SELECT 1 FROM thread_cases LIMIT 1").fetchone():
             logger.warning(
-                "thread→case map at %s is empty: no existing Slack thread will "
-                "be recognised as an investigation. Expected on a first run; "
-                "otherwise this volume did not persist (see docs/HOSTING.md).",
+                "thread→case map at %s is empty%s: no Slack thread already open "
+                "will be recognised as an investigation until it is recovered "
+                "from its own history. Expected on a first run; otherwise this "
+                "volume did not persist (see docs/HOSTING.md).",
                 path,
+                " (schema present)" if had_table else "",
             )
 
     def get(self, team_id: str, channel_id: str, thread_ts: str) -> str | None:
@@ -117,15 +124,25 @@ class CaseStore:
     ) -> None:
         """Map a thread to its (new, not-yet-seeded) case."""
 
-        # Explicitly live and un-notified: re-linking a tombstoned thread (an
-        # @mention after its case went missing) must clear the tombstone, or the
-        # thread would keep answering "I couldn't find the case" forever.
+        # Re-linking a tombstoned thread (an @mention after its case went
+        # missing) must clear the tombstone, or the thread would keep answering
+        # "I couldn't find the case" forever.
+        #
+        # An upsert rather than INSERT OR REPLACE, which writes a whole new row
+        # and so silently resets every column this statement does not name.
+        # ``restart_pending`` is exactly such a column: it records that the case
+        # being opened here REPLACES one that went missing, and it has to
+        # outlive this write, because the turn that will explain that to the
+        # user has not been submitted yet and may fail.
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO thread_cases "
+                "INSERT INTO thread_cases "
                 "(team_id, channel_id, thread_ts, case_id, seeded, "
                 "unlinked, unlink_notified) "
-                "VALUES (?, ?, ?, ?, 0, 0, 0)",
+                "VALUES (?, ?, ?, ?, 0, 0, 0) "
+                "ON CONFLICT (team_id, channel_id, thread_ts) DO UPDATE SET "
+                "case_id=excluded.case_id, seeded=0, unlinked=0, "
+                "unlink_notified=0",
                 (team_id, channel_id, thread_ts, case_id),
             )
             self._conn.commit()
@@ -133,11 +150,17 @@ class CaseStore:
     def mark_seeded(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> None:
-        """Record that the thread's case has landed a successful turn."""
+        """Record that the thread's case has landed a successful turn.
+
+        Also retires ``restart_pending``: the reply carrying the explanation is
+        built from this turn, so once it has landed the explanation is owed no
+        longer. Until then it stays owed, which is what stops a failed opening
+        turn leaving the thread on a silently-replaced case.
+        """
 
         with self._lock:
             self._conn.execute(
-                "UPDATE thread_cases SET seeded=1 "
+                "UPDATE thread_cases SET seeded=1, restart_pending=0 "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )
@@ -261,29 +284,30 @@ class CaseStore:
         reset so the thread gets its one explanation.
 
         The dead ``case_id`` is kept for the log trail; no read returns it.
-        Buttons are cleared: they carry decisions for a case that isn't there.
+        ``restart_pending`` is armed here: whatever case replaces this one owes
+        the thread an explanation for why it is a different investigation.
 
-        Upserts, because a thread can need a tombstone with no row to flag: the
-        map itself can be lost (an unpersisted volume), and a caller that has
-        re-identified the thread from Slack has nothing to update. There is no
-        case id to record in that case — we never knew it — and no read returns
-        one for a tombstoned row, so the column holds the empty string.
+        ``last_action_ts`` is cleared because it points at buttons belonging to
+        a case that is gone. It does NOT take them off the screen — nothing
+        can, from here; there is no Slack client in this layer — it stops
+        ``disable_previous_actions`` trying to strip them on behalf of a case
+        that no longer exists. A click on one is answered by the actions
+        handler, which says the case can't be found and settles the buttons
+        down then.
+
+        Strictly an UPDATE. A thread with no row has no mapping to invalidate,
+        and flagging one into existence here would let a caller racing an
+        ``@mention`` tombstone the live case that mention had just opened.
         """
 
         with self._lock:
-            cursor = self._conn.execute(
+            self._conn.execute(
                 "UPDATE thread_cases "
-                "SET unlinked=1, unlink_notified=0, last_action_ts=NULL "
+                "SET unlinked=1, unlink_notified=0, restart_pending=1, "
+                "last_action_ts=NULL "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )
-            if cursor.rowcount == 0:
-                self._conn.execute(
-                    "INSERT INTO thread_cases (team_id, channel_id, thread_ts, "
-                    "case_id, seeded, unlinked, unlink_notified) "
-                    "VALUES (?, ?, ?, '', 0, 1, 0)",
-                    (team_id, channel_id, thread_ts),
-                )
             self._conn.commit()
 
     def is_unlinked(
@@ -303,25 +327,27 @@ class CaseStore:
             ).fetchone()
         return bool(row and row[0])
 
-    def unlink_notice_pending(
+    def restart_pending(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> bool:
-        """True if this thread is tombstoned and hasn't been told yet.
+        """True if this thread's next reply owes the "why is this a new case"
+        explanation.
 
-        Gates the *unprompted* explanation only — the one posted into a thread
-        whose plain reply the agent would otherwise ignore. Say it once: after
-        that, repeating it on every reply would make the bot the loudest thing
-        in a thread it no longer has any part in. Explicit invocations
-        (@mention, a button) are answered every time regardless.
+        Set when the thread is tombstoned and retired by ``mark_seeded``, NOT by
+        the write that opens the replacement case — the explanation travels on
+        the reply, and that reply only exists once the turn has landed. A
+        restart whose opening turn fails therefore still owes it on the retry,
+        instead of leaving the thread quietly continuing on an empty case, which
+        is the failure this whole area exists to prevent.
         """
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT unlinked, unlink_notified FROM thread_cases "
+                "SELECT restart_pending FROM thread_cases "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             ).fetchone()
-        return bool(row and row[0] and not row[1])
+        return bool(row and row[0])
 
     def claim_unlink_notice(
         self, team_id: str, channel_id: str, thread_ts: str
@@ -350,11 +376,34 @@ class CaseStore:
     def release_unlink_notice(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> None:
-        """Hand back a claim whose notice never reached Slack."""
+        """Hand back a claim whose notice never reached Slack.
+
+        Conditioned on the tombstone, mirroring the claim: if the thread was
+        re-linked while the post was in flight, the claim this releases no
+        longer exists and the row belongs to a live case.
+        """
 
         with self._lock:
             self._conn.execute(
                 "UPDATE thread_cases SET unlink_notified=0 "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? AND unlinked=1",
+                (team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+
+    def forget(self, team_id: str, channel_id: str, thread_ts: str) -> None:
+        """Drop a thread's row entirely.
+
+        For the one surface that has no ``@mention`` to come back through: once
+        a 1:1 thread has been told its case couldn't be found, there is nothing
+        further to remember about it, and remembering anyway would mean a single
+        404 — including one from a proxy during a deploy, which is not a deleted
+        case at all — silencing that conversation permanently.
+        """
+
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM thread_cases "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )

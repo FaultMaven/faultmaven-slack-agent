@@ -259,9 +259,9 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
         return case_gone_text(channel_id)
     # Above the shutdown override for the credential rule's reason: a concluded
     # case is PERMANENT, so "resend it in a minute" is a promise the restart
-    # cannot keep — the resend fails identically, forever. That is exactly what
-    # separates it from CaseNotFoundError below, which evicts the mapping first,
-    # so *its* post-restart resend genuinely does work (on a fresh case).
+    # cannot keep — the resend fails identically, forever. The missing case
+    # above it qualifies on the same ground; what separates the two is only
+    # what the user is left able to do, and each message says which.
     if isinstance(exc, CaseTerminalError):
         return CASE_CLOSED_TEXT
     if _shutting_down.is_set():
@@ -538,6 +538,19 @@ class Dedup:
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._max = maxsize
         self._lock = threading.Lock()
+
+    def seen(self, key: str) -> bool:
+        """Has this key been recorded? Recording nothing either way.
+
+        For a caller whose work can fail: ``is_duplicate`` answers and records
+        in one step, which is right for event delivery (the event arrived, and
+        that is the whole fact) but wrong when the key stands for a conclusion
+        the caller has not reached yet. Marking such a key up front spends it on
+        an attempt that never produced an answer.
+        """
+
+        with self._lock:
+            return bool(key) and key in self._seen
 
     def is_duplicate(self, key: str) -> bool:
         with self._lock:

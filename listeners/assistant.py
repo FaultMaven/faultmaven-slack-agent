@@ -106,11 +106,18 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
             # missing. Opening a fresh one behind the user's back would answer
             # this message as though it were the first thing they had ever
             # said — everything above it in the thread is what gave it its
-            # meaning. Say so instead, and on every message rather than once:
-            # in a 1:1 every message is addressed to us, so none may go
-            # unanswered.
+            # meaning. Say so instead.
+            #
+            # Then forget the thread. This surface has no @mention to come back
+            # through, so a tombstone that outlived the telling would answer
+            # every later message the same way, for good — and the 404 that
+            # caused it is not always a deleted case: a proxy 404 during a
+            # backend deploy arrives as the same error. The user has been told,
+            # so their next message is a deliberate fresh start, not a silent
+            # one, and it opens a case the ordinary way.
             if store.is_unlinked(team_id, channel, thread_ts):
-                post(case_gone_text(channel))
+                if post(case_gone_text(channel)):
+                    store.forget(team_id, channel, thread_ts)
                 return
             try:
                 # No-ops when there are no files. Pasted snippets come back
