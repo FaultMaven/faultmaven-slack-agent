@@ -10,14 +10,14 @@ slack-sdk==3.44.1
 # HTTP transport: FastAPI hosts the Slack request handler (/slack/events,
 # /slack/install, /slack/oauth_redirect) plus /health for k8s liveness.
 fastapi==0.141.1
-uvicorn[standard]==0.52.4
+uvicorn[standard]==0.53.0
 
 # Backs the multi-workspace OAuth stores (per-team bot tokens + OAuth state)
 # via slack_sdk's SQLAlchemy{Installation,OAuthState}Store. One SLACK_DATABASE_URL
 # drives both — SQLite locally, Postgres in the cluster. psycopg2 is SQLAlchemy's
 # default driver for a `postgresql://` URL (the hosted config); without it the
 # first connection raises ModuleNotFoundError and the pod crashes at boot.
-sqlalchemy==2.0.52
+sqlalchemy==2.0.54
 psycopg2-binary==2.9.13
 
 # Settings / validation
