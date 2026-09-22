@@ -21,6 +21,7 @@ from store import CaseStore
 
 from ._turn import (
     UNREADABLE_FILES_TEXT,
+    case_gone_text,
     Dedup,
     deliver_turn_result,
     disable_previous_actions,
@@ -101,6 +102,16 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 return False
 
         def turn_work() -> None:
+            # This thread was an investigation whose case has since gone
+            # missing. Opening a fresh one behind the user's back would answer
+            # this message as though it were the first thing they had ever
+            # said — everything above it in the thread is what gave it its
+            # meaning. Say so instead, and on every message rather than once:
+            # in a 1:1 every message is addressed to us, so none may go
+            # unanswered.
+            if store.is_unlinked(team_id, channel, thread_ts):
+                post(case_gone_text(channel))
+                return
             try:
                 # No-ops when there are no files. Pasted snippets come back
                 # as text so the backend sees paste provenance, not a fake
@@ -141,7 +152,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("assistant user_message failed: %s", exc)
-                post(turn_error_text(exc))
+                post(turn_error_text(exc, channel))
                 return
 
             # The turn is committed — deliver_turn_result owns the

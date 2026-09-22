@@ -48,7 +48,7 @@ not exist.** The real contract is: **create a case**
 
 | State | Surfaces / features |
 |---|---|
-| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · **graceful replies when a case is deleted or concluded** (§6.4) · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport · **install-time workspace→Team binding** (§10.1a) — a per-workspace service account (`slack-<team id>`) holding a rotating refresh credential, stored beside its installation (`binding.py`, `pending_binds.py`, `workspace_credentials.py`). During the beta a workspace is bound by hand rather than through an advertised self-serve install, so the live deployment still runs on one interim shared account. |
+| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · **graceful replies when a case is missing or concluded** (§6.4, §6.4a) · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport · **install-time workspace→Team binding** (§10.1a) — a per-workspace service account (`slack-<team id>`) holding a rotating refresh credential, stored beside its installation (`binding.py`, `pending_binds.py`, `workspace_credentials.py`). During the beta a workspace is bound by hand rather than through an advertised self-serve install, so the live deployment still runs on one interim shared account. |
 | **Designed, not yet built** | per-user FaultMaven account linking (§10.2) — every turn runs as the workspace's service account · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer-to-close / auto-close-on-inactivity (§6.2). |
 | **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
@@ -503,7 +503,7 @@ the next message and answering it clearly.
 | Condition | What the agent sees | Reply |
 |---|---|---|
 | **Terminal, still online** (`resolved`/`closed`) | `409` with no `x-error-code` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
-| **Deleted** | `404` on the turn POST | Says the case was deleted, unlinks the thread, and notes the next message starts a fresh investigation. |
+| **Missing** | `404` on the turn POST | Says it *couldn't find* the case — a 404 is the whole of what we know, and deletion, a DB reset and a restore that predates the case are indistinguishable from here. **Tombstones** the thread (§6.4a) and refuses the turn rather than answering it on a new case: the message was written into a conversation whose history is what has gone missing. Points at the deliberate restart that suits the surface — an `@mention` in a channel, a new chat in a 1:1. |
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
 | **Rate limited** (*not* a lifecycle event) | `429` + `Retry-After` | Says FaultMaven is rate-limiting and quotes the wait ("send it again in 45 seconds" / "about an hour"). Not framed as an error — nothing is broken — and never "re-sending won't help", because a 429 *does* succeed later. |
 | **Archived** | — | Not implemented: the backend has no archive tier yet (**ADR-014**, Proposed). Lands with that ADR, alongside Copilot and the Dashboard. |
@@ -558,11 +558,33 @@ don't own.
 **Ordering against shutdown.** A terminal case is *permanent*, so its reply
 outranks the "I'm restarting — resend in a minute" drain notice: that promise
 can never be kept, since the resend fails identically forever. This is the same
-rule that hoists the dead-credential message, and it is what distinguishes the
-terminal case from a **deleted** one — deletion evicts the thread mapping first,
-so *that* resend genuinely does work after the restart. The version conflict,
-being transient, stays below the drain notice, where "resend in a minute" is
-exactly right.
+rule that hoists the dead-credential and workspace-unlinked messages — and, since
+the thread is tombstoned rather than forgotten, the missing case now sits up
+there too: the resend the drain notice invites would only reach the same
+"couldn't find it" reply a minute later. The version conflict, being transient,
+stays below the drain notice, where "resend in a minute" is exactly right.
+
+### 6.4a Tombstones — why an unlinked thread is not a forgotten one
+
+Unlinking has to stop a thread routing to a case that isn't there. It must not
+also erase the fact that the thread *was* ours, because that fact is the only
+thing separating it from the ambient channel chatter the agent is required to
+ignore. A hard `DELETE` erased it, and every surface then got the next message
+wrong in its own way: a channel reply was dropped in silence, a 1:1 quietly
+opened a fresh case and answered as though nothing had been said before it, and
+a button click reported that the agent had "lost track".
+
+So `mark_unlinked` keeps the row and flags it (`store.py`). Reads treat a
+tombstoned thread as unmapped — `get`, `is_seeded` and the two turn markers all
+filter it out, so a re-link starts genuinely from scratch, catch-up replay and
+all — while `is_unlinked` preserves the memory:
+
+| Surface | A message arrives on a tombstoned thread |
+|---|---|
+| Channel thread reply | Posts the notice **once** (`unlink_notice_pending`), then leaves the thread alone. A war-room thread keeps talking after FaultMaven drops out of it; repeating this on every reply would turn one piece of bad news into a heckle. A content-free reply doesn't spend the notice. |
+| `@mention` | The way back: opens a fresh case, and `put` clears the tombstone. |
+| Assistant Chat / DM | Answers **every** time — in a 1:1 every message is addressed to us, so none may go unanswered — and never opens a case silently. |
+| Suggested-action button | Answers every time, with the same wording. The buttons stay down: the decision one carries belongs to a case that isn't there, and re-arming it would land a stale choice on whatever case the thread opens next. |
 
 ---
 

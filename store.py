@@ -5,6 +5,12 @@ do *not* hand the Slack ``thread_ts`` to the backend as a session id (it would
 fail server-side session validation), this local map is the source of truth for
 "which FaultMaven case is this thread." Keyed by ``(team_id, channel_id,
 thread_ts)`` so it is already multi-workspace safe ahead of P5 OAuth.
+
+A mapping whose case the backend can no longer find is **tombstoned**, not
+deleted (``mark_unlinked``): the thread reads as unmapped everywhere, but the
+agent still remembers that it once owned it. That memory is what lets a reply in
+such a thread be answered ("I couldn't find the case") instead of being dropped
+as the ambient channel chatter an unknown thread is.
 """
 
 from __future__ import annotations
@@ -38,6 +44,8 @@ class CaseStore:
                 thread_ts      TEXT NOT NULL,
                 case_id        TEXT NOT NULL,
                 seeded         INTEGER NOT NULL DEFAULT 0,
+                unlinked       INTEGER NOT NULL DEFAULT 0,
+                unlink_notified INTEGER NOT NULL DEFAULT 0,
                 last_turn_ts   TEXT,
                 last_action_ts TEXT,
                 PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -60,13 +68,30 @@ class CaseStore:
                 )
             except sqlite3.OperationalError:
                 pass
+        # Pre-tombstone stores evicted a dead mapping with DELETE, so every row
+        # that survives is a live one: default 0 (not unlinked) is right.
+        for column in ("unlinked", "unlink_notified"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE thread_cases "
+                    f"ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
 
     def get(self, team_id: str, channel_id: str, thread_ts: str) -> str | None:
+        """The live case for this thread, or None.
+
+        None for a tombstoned thread too (``unlinked=1``): its case is gone, so
+        there is nothing to submit against. Callers that need to tell "never
+        ours" from "ours, and its case went missing" ask ``is_unlinked``.
+        """
+
         with self._lock:
             row = self._conn.execute(
                 "SELECT case_id FROM thread_cases "
-                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? AND unlinked=0",
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return row[0] if row else None
@@ -76,11 +101,15 @@ class CaseStore:
     ) -> None:
         """Map a thread to its (new, not-yet-seeded) case."""
 
+        # Explicitly live and un-notified: re-linking a tombstoned thread (an
+        # @mention after its case went missing) must clear the tombstone, or the
+        # thread would keep answering "I couldn't find the case" forever.
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO thread_cases "
-                "(team_id, channel_id, thread_ts, case_id, seeded) "
-                "VALUES (?, ?, ?, ?, 0)",
+                "(team_id, channel_id, thread_ts, case_id, seeded, "
+                "unlinked, unlink_notified) "
+                "VALUES (?, ?, ?, ?, 0, 0, 0)",
                 (team_id, channel_id, thread_ts, case_id),
             )
             self._conn.commit()
@@ -104,13 +133,15 @@ class CaseStore:
         """True once the thread's case has had a successful turn.
 
         False for unknown threads too, so ``not is_seeded(...)`` uniformly
-        means "the one-time context seed still needs to be (re)sent".
+        means "the one-time context seed still needs to be (re)sent" — and for
+        tombstoned ones, whose next case starts from nothing and so needs the
+        thread catch-up exactly as a never-seen thread would.
         """
 
         with self._lock:
             row = self._conn.execute(
                 "SELECT seeded FROM thread_cases "
-                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? AND unlinked=0",
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return bool(row and row[0])
@@ -128,7 +159,7 @@ class CaseStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT last_turn_ts FROM thread_cases "
-                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? AND unlinked=0",
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return row[0] if row and row[0] else None
@@ -141,7 +172,7 @@ class CaseStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT last_action_ts FROM thread_cases "
-                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? AND unlinked=0",
                 (team_id, channel_id, thread_ts),
             ).fetchone()
         return row[0] if row and row[0] else None
@@ -201,16 +232,76 @@ class CaseStore:
             )
             self._conn.commit()
 
-    def delete(self, team_id: str, channel_id: str, thread_ts: str) -> None:
-        """Evict a mapping whose case no longer exists server-side.
+    def mark_unlinked(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        """Tombstone a mapping whose case the backend can no longer find.
 
-        Without eviction a 404-ing case pins its thread forever: every retry
-        routes back to the same dead case_id.
+        Unlinking is what stops a missing case pinning its thread forever: every
+        retry would otherwise route back to the same dead ``case_id``. It is a
+        tombstone rather than a DELETE because forgetting the thread entirely
+        costs the agent the one fact it needs to answer the next reply — that
+        this thread was once an investigation of ours. ``unlink_notified`` is
+        reset so the thread gets its one explanation.
+
+        The dead ``case_id`` is kept for the log trail; no read returns it.
+        Buttons are cleared: they carry decisions for a case that isn't there.
         """
 
         with self._lock:
             self._conn.execute(
-                "DELETE FROM thread_cases "
+                "UPDATE thread_cases "
+                "SET unlinked=1, unlink_notified=0, last_action_ts=NULL "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+
+    def is_unlinked(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> bool:
+        """True if this thread was ours and its case has since gone missing.
+
+        False for a thread we never owned — the two must not be conflated: one
+        deserves an explanation, the other is someone else's conversation.
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT unlinked FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        return bool(row and row[0])
+
+    def unlink_notice_pending(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> bool:
+        """True if this thread is tombstoned and hasn't been told yet.
+
+        Gates the *unprompted* explanation only — the one posted into a thread
+        whose plain reply the agent would otherwise ignore. Say it once: after
+        that, repeating it on every reply would make the bot the loudest thing
+        in a thread it no longer has any part in. Explicit invocations
+        (@mention, a button) are answered every time regardless.
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT unlinked, unlink_notified FROM thread_cases "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=?",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        return bool(row and row[0] and not row[1])
+
+    def mark_unlink_notified(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        """Record that the thread has been told its case couldn't be found."""
+
+        with self._lock:
+            self._conn.execute(
+                "UPDATE thread_cases SET unlink_notified=1 "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )

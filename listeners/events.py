@@ -25,6 +25,7 @@ from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
+    case_gone_text,
     Dedup,
     is_thread_busy,
     mark_skipped,
@@ -40,13 +41,18 @@ from ._turn import (
 
 def _post_note(
     client: WebClient, channel: str, thread_ts: str, text: str
-) -> None:
-    """Best-effort threaded info note (e.g. skipped-attachments); never raises."""
+) -> bool:
+    """Best-effort threaded info note (e.g. skipped-attachments); never raises.
+
+    Reports whether it landed, so a caller recording "this thread has been
+    told" only records it when the thread actually was.
+    """
 
     try:
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return True
     except Exception:  # noqa: BLE001 — a notice must never cost the turn
-        pass
+        return False
 
 # Cap the replayed-context size (the backend size-guards turn fields too).
 _THREAD_CONTEXT_LIMIT = 8000
@@ -333,6 +339,23 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             if is_thread_busy(team_id, channel, thread_ts) and event.get("ts"):
                 if not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
                     mark_skipped(client, channel, event["ts"])
+                return
+            # A thread that WAS ours, whose case has since gone missing. The
+            # reply can't be answered — the investigation it belongs to is no
+            # longer there — but it was written to us, and dropping it the way
+            # an unknown thread is dropped is what left people typing into
+            # silence. Explain once, then leave the thread alone; an @mention
+            # is how it comes back (and re-linking clears the tombstone).
+            if (
+                (
+                    clean_mention(event.get("text") or "").strip()
+                    or event.get("files")
+                )
+                and store.unlink_notice_pending(team_id, channel, thread_ts)
+                and not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}")
+                and _post_note(client, channel, thread_ts, case_gone_text(channel))
+            ):
+                store.mark_unlink_notified(team_id, channel, thread_ts)
             return
         if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
             return

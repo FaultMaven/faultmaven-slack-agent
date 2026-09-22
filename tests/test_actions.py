@@ -357,15 +357,16 @@ class _LifecycleStore:
         self.turn_ts_error = turn_ts_error
         self.last_turn_ts = last_turn_ts
         self.last_action_ts = last_turn_ts
-        self.deleted: list[tuple] = []
+        self.unlinked: list[tuple] = []
 
     def get(self, team, channel, thread):
         if self.get_error:
             raise self.get_error
         return self.case_id
 
-    def delete(self, team, channel, thread):
-        self.deleted.append((team, channel, thread))
+    def mark_unlinked(self, team, channel, thread):
+        self.unlinked.append((team, channel, thread))
+        self.case_id = None
 
     def get_last_turn_ts(self, team, channel, thread):
         if self.turn_ts_error:
@@ -503,9 +504,9 @@ def test_closed_case_leaves_the_buttons_down():
     assert not _has_buttons(client.updates[-1])
 
 
-def test_deleted_case_leaves_the_buttons_down_after_unlinking():
-    """The sharp one: the thread is unlinked here, so its next message opens a
-    FRESH case. A re-armed button still carries the old decision, which would
+def test_missing_case_leaves_the_buttons_down_after_unlinking():
+    """The sharp one: the thread is unlinked here, so its next investigation is
+    a FRESH case. A re-armed button still carries the old decision, which would
     then land on that unrelated case."""
 
     from faultmaven import CaseNotFoundError
@@ -514,16 +515,31 @@ def test_deleted_case_leaves_the_buttons_down_after_unlinking():
     client = _run_click(
         _FailingFM(CaseNotFoundError("gone", status_code=404)), store
     )
-    assert store.deleted == [("T1", "C1", "111.222")]  # mapping evicted
+    assert store.unlinked == [("T1", "C1", "111.222")]  # tombstoned, not forgotten
     assert not _has_buttons(client.updates[-1])  # and no stale decision left armed
+    assert any("couldn't find" in p.get("text", "") for p in client.posts)
 
 
-def test_lost_mapping_leaves_the_buttons_down():
-    # Same stale-decision hazard: no case to submit against, and the next
-    # @mention opens a fresh one.
+def test_a_click_is_answered_even_when_the_mapping_is_gone():
+    """A click is a deliberate act on a control we drew, so it is always
+    answered — and with the same "couldn't find the case" wording a typed
+    message gets, rather than a second vocabulary for the same fact."""
+
     client = _run_click(FakeFM(), _LifecycleStore(case_id=None))
     assert not _has_buttons(client.updates[-1])
-    assert any("lost track" in p.get("text", "") for p in client.posts)
+    assert any("couldn't find" in p.get("text", "") for p in client.posts)
+
+
+def test_the_restart_hint_follows_the_surface():
+    """@mention is how a channel thread starts over; it is not how a DM does.
+    One string, worded from the channel id, so neither surface is told to do
+    something that doesn't exist there."""
+
+    from listeners._turn import case_gone_text
+
+    assert "@mention me" in case_gone_text("C123")
+    assert "@mention" not in case_gone_text("D123")
+    assert "new chat" in case_gone_text("D123")
 
 
 def test_store_failure_still_settles_the_message():

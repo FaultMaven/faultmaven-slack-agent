@@ -140,15 +140,9 @@ def test_indeterminate_failure_during_shutdown_still_warns_not_restart():
 
     turn_mod.begin_shutdown()  # autouse fixture clears it again after
     assert turn_error_text(FaultMavenTimeoutError("x")) == TURN_TIMEOUT_TEXT
-    # a genuine 404 or a generic teardown error during shutdown DOES say
-    # restarting (shutdown wins over those, matching the original ordering)
+    # A generic teardown error during shutdown DOES say restarting: it really
+    # is our teardown talking, and a resend in a minute really does work.
     assert turn_error_text(RuntimeError("store closed")) == RESTARTING_TEXT
-    from faultmaven import CaseNotFoundError
-
-    assert (
-        turn_error_text(CaseNotFoundError("gone", status_code=404))
-        == RESTARTING_TEXT
-    )
 
 
 def test_terminal_case_reads_as_concluded_not_as_a_failure():
@@ -185,14 +179,13 @@ def test_generic_4xx_still_reports_its_status():
     assert "won't help" in text
 
 
-def test_terminal_case_outranks_the_shutdown_notice():
-    """A concluded case is PERMANENT, so it must pierce the drain message for
-    the same reason a dead credential does: "resend it in a minute" is a promise
-    the restart cannot keep — the resend fails identically, forever.
-
-    This is what separates it from CaseNotFoundError, which evicts the mapping
-    first, so that resend genuinely does work after the restart (on a fresh
-    case) and the restart notice is honest for it."""
+def test_the_permanent_failures_outrank_the_shutdown_notice():
+    """Both are PERMANENT, so both must pierce the drain message for the reason
+    a dead credential does: "resend it in a minute" is a promise the restart
+    cannot keep. A concluded case stays concluded; a case the backend cannot
+    find will not be found after the restart either, and the thread is
+    tombstoned by then, so the invited resend only reaches the same reply a
+    minute later."""
 
     turn_mod.begin_shutdown()  # autouse fixture clears it again after
     assert (
@@ -201,10 +194,9 @@ def test_terminal_case_outranks_the_shutdown_notice():
     )
     from faultmaven import CaseNotFoundError
 
-    assert (
-        turn_error_text(CaseNotFoundError("gone", status_code=404))
-        == RESTARTING_TEXT
-    )
+    assert turn_error_text(
+        CaseNotFoundError("gone", status_code=404), "C1"
+    ) == turn_mod.case_gone_text("C1")
 
 
 def test_version_conflict_yields_to_the_shutdown_notice():
@@ -230,7 +222,7 @@ def test_retry_may_help_refuses_the_do_not_resend_family():
         FaultMavenTimeoutError("x"),  # may have COMMITTED — a re-click duplicates it
         FaultMavenCredentialError("dead"),  # retrying can't fix a dead credential
         CaseTerminalError("closed", status_code=409),  # permanent, forever
-        CaseNotFoundError("gone", status_code=404),  # thread unlinked, see below
+        CaseNotFoundError("gone", status_code=404),  # its case isn't there
         FaultMavenAPIError("bad", status_code=422),  # same input, same rejection
     ):
         assert retry_may_help(exc) is False, type(exc).__name__
@@ -283,16 +275,18 @@ def test_retry_may_help_agrees_with_turn_error_text():
         assert retry_may_help(exc) is invites_resend, f"{type(exc).__name__}: {text}"
 
 
-def test_deleted_case_refuses_retry_even_though_a_resend_would_work():
-    """The one place retry_may_help deliberately parts from "would a resend
-    work?": CASE_GONE_TEXT says the next message starts fresh, which is true for
-    a TYPED message. A restored BUTTON is different — it carries the old
-    decision, so re-arming it would land a stale choice on the fresh case."""
+def test_missing_case_refuses_retry_and_asks_for_a_deliberate_restart():
+    """Nothing here is retryable. The turn can't be re-sent (its case is gone)
+    and the button can't be re-armed (it carries a decision that would land on
+    whatever case the thread opens next), so the message asks for a fresh start
+    the user makes on purpose rather than promising one that happens by
+    itself."""
 
     from faultmaven import CaseNotFoundError
 
     exc = CaseNotFoundError("gone", status_code=404)
-    assert "starts a fresh investigation" in turn_error_text(exc)
+    text = turn_error_text(exc, "C1")
+    assert "start a fresh investigation" in text
     assert retry_may_help(exc) is False
 
 
