@@ -21,6 +21,7 @@ from store import CaseStore
 
 from ._turn import (
     UNREADABLE_FILES_TEXT,
+    case_gone_text,
     Dedup,
     deliver_turn_result,
     disable_previous_actions,
@@ -101,6 +102,23 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 return False
 
         def turn_work() -> None:
+            # This thread was an investigation whose case has since gone
+            # missing. Opening a fresh one behind the user's back would answer
+            # this message as though it were the first thing they had ever
+            # said — everything above it in the thread is what gave it its
+            # meaning. Say so instead.
+            #
+            # Then forget the thread. This surface has no @mention to come back
+            # through, so a tombstone that outlived the telling would answer
+            # every later message the same way, for good — and the 404 that
+            # caused it is not always a deleted case: a proxy 404 during a
+            # backend deploy arrives as the same error. The user has been told,
+            # so their next message is a deliberate fresh start, not a silent
+            # one, and it opens a case the ordinary way.
+            if store.is_unlinked(team_id, channel, thread_ts):
+                if post(case_gone_text(channel)):
+                    store.forget(team_id, channel, thread_ts)
+                return
             try:
                 # No-ops when there are no files. Pasted snippets come back
                 # as text so the backend sees paste provenance, not a fake
@@ -141,7 +159,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("assistant user_message failed: %s", exc)
-                post(turn_error_text(exc))
+                post(turn_error_text(exc, channel))
                 return
 
             # The turn is committed — deliver_turn_result owns the

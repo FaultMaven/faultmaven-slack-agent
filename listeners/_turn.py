@@ -68,12 +68,52 @@ TURN_TIMEOUT_TEXT = (
     "completing on the case. Give it a moment before re-sending the same "
     "message or files."
 )
-# Stale mapping evicted; unlike TURN_ERROR_TEXT, a retry WILL work (fresh case).
-CASE_GONE_TEXT = (
-    ":card_index_dividers: That investigation's case has been deleted, so "
-    "there's nothing left for me to look up — I've unlinked this thread. Your "
-    "next message here starts a fresh investigation. (This conversation stays "
-    "in Slack either way.)"
+#: How a thread starts over once its case is gone, by surface. Slack marks a
+#: 1:1 conversation with a ``D`` channel-id prefix; this is the one thing that
+#: rides on it, and a wrong guess costs a wrong sentence, never a wrong action.
+_RESTART_HINT_CHANNEL = "@mention me in this thread to start a fresh investigation"
+_RESTART_HINT_DM = "start a new chat with me to open a fresh investigation"
+
+
+def is_dm_channel(channel_id: str) -> bool:
+    """True for a 1:1 conversation (Slack IM channel ids begin with ``D``)."""
+
+    return channel_id.startswith("D")
+
+
+def case_gone_text(channel_id: str) -> str:
+    """What a thread is told when its case can't be found.
+
+    Says the case could not be FOUND rather than that it was deleted: a 404 is
+    all we know, and "deleted" asserts a cause (and an intent) we have no
+    evidence for — a restored-from-backup backend and a wiped thread map look
+    identical from here.
+
+    The refusal is the point. The message the user just sent was written into a
+    conversation that had a history behind it, and that history is what has gone
+    missing — so answering it on a blank new case would not be continuing their
+    investigation, it would be answering a question stripped of everything that
+    gave it meaning. Starting over is left to them, as a deliberate act.
+    """
+
+    hint = _RESTART_HINT_DM if is_dm_channel(channel_id) else _RESTART_HINT_CHANNEL
+    return (
+        ":card_index_dividers: I couldn't find this investigation's case, so I "
+        "can't pick this up where we left off — the context behind your message "
+        f"is gone. When you're ready, {hint}. (This conversation stays in Slack "
+        "either way.)"
+    )
+
+
+#: Shown on the first reply of an investigation that REPLACES one whose case
+#: went missing. A re-summons is the one place opening a new case is right — the
+#: user asked for it — but the reply would otherwise arrive carrying a case id
+#: they never saw created, answering as though the thread had no history. It
+#: says which of those two things happened.
+RESTARTED_AFTER_MISSING_CASE = (
+    ":card_index_dividers: I couldn't find the earlier case for this thread, so "
+    "this is a new investigation — anything FaultMaven had worked out before is "
+    "gone, though the thread itself is all still here."
 )
 # The case concluded and is read-only, but it still EXISTS and is still online:
 # the backend answers text-only questions about it and refuses only evidence and
@@ -177,8 +217,12 @@ def _rate_limited_text(retry_after: int | None) -> str:
     )
 
 
-def turn_error_text(exc: Exception) -> str:
+def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     """The user-facing message for a failed turn, by failure class.
+
+    ``channel_id`` only picks the wording of the "start over" hint in the
+    case-not-found branch (see :func:`case_gone_text`); every other branch
+    reads the same on every surface.
 
     One generic "try again" for everything actively misleads: a 4xx reproduces
     identically on retry, and a timeout's turn may have committed — only
@@ -207,17 +251,21 @@ def turn_error_text(exc: Exception) -> str:
     # another tenant.
     if isinstance(exc, FaultMavenWorkspaceUnlinkedError):
         return WORKSPACE_UNLINKED_TEXT
+    # Also above the override, and for the same reason. A case the backend can't
+    # find will not be there after the restart either, and the thread has just
+    # been tombstoned — so the resend the drain notice invites gets the
+    # case-not-found reply anyway. Better to say that now than a minute from now.
+    if isinstance(exc, CaseNotFoundError):
+        return case_gone_text(channel_id)
     # Above the shutdown override for the credential rule's reason: a concluded
     # case is PERMANENT, so "resend it in a minute" is a promise the restart
-    # cannot keep — the resend fails identically, forever. That is exactly what
-    # separates it from CaseNotFoundError below, which evicts the mapping first,
-    # so *its* post-restart resend genuinely does work (on a fresh case).
+    # cannot keep — the resend fails identically, forever. The missing case
+    # above it qualifies on the same ground; what separates the two is only
+    # what the user is left able to do, and each message says which.
     if isinstance(exc, CaseTerminalError):
         return CASE_CLOSED_TEXT
     if _shutting_down.is_set():
         return RESTARTING_TEXT
-    if isinstance(exc, CaseNotFoundError):
-        return CASE_GONE_TEXT
     # Transient — the turn never committed — so this one stays BELOW the
     # shutdown override, where "resend in a minute" is exactly right. It sits
     # above the generic 4xx branch, whose "re-sending the same input won't help"
@@ -262,7 +310,7 @@ def retry_may_help(exc: Exception) -> bool:
     False for the whole "don't re-send" family, each for its own reason:
     a timeout's turn may have COMMITTED (a re-click double-submits it against
     state the user never saw), a dead credential and a concluded case reproduce
-    identically forever, a 4xx rejects the same input every time, and a deleted
+    identically forever, a 4xx rejects the same input every time, and a missing
     case has already been unlinked — its retry wouldn't repeat the failure, it
     would land the stale decision on whatever fresh case the thread opens next,
     which is worse than refusing it.
@@ -275,13 +323,12 @@ def retry_may_help(exc: Exception) -> bool:
             FaultMavenCredentialError,
             FaultMavenWorkspaceUnlinkedError,
             CaseTerminalError,
+            CaseNotFoundError,
         ),
     ):
         return False
     if _shutting_down.is_set():
         return True  # RESTARTING_TEXT: "please resend it in a minute"
-    if isinstance(exc, CaseNotFoundError):
-        return False
     if isinstance(exc, (CaseVersionConflictError, FaultMavenRateLimitError)):
         return True
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
@@ -456,12 +503,20 @@ def deliver_turn_result(
 def unlink_stale_case(
     store: CaseStore, team_id: str, channel: str, thread_ts: str, case_id: str
 ) -> None:
-    """Evict a thread's mapping after the backend 404ed its case."""
+    """Tombstone the thread whose case the backend could not find.
 
-    store.delete(team_id, channel, thread_ts)
+    Not a DELETE: the thread stops routing to the missing case either way, but
+    the tombstone is what lets the next reply here be answered instead of
+    silently dropped as chatter in a thread we don't know (see
+    :meth:`CaseStore.mark_unlinked`).
+    """
+
+    store.mark_unlinked(team_id, channel, thread_ts)
     logger.warning(
-        "Case %s vanished server-side; unlinked thread %s", case_id, thread_ts
+        "Case %s could not be found; unlinked thread %s", case_id, thread_ts
     )
+
+
 # Reaction added to a message that was skipped because the thread was busy.
 SKIPPED_REACTION = "track_next"  # ⏭️
 # One-time etiquette note on the first reply in a channel thread.
@@ -483,6 +538,19 @@ class Dedup:
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._max = maxsize
         self._lock = threading.Lock()
+
+    def seen(self, key: str) -> bool:
+        """Has this key been recorded? Recording nothing either way.
+
+        For a caller whose work can fail: ``is_duplicate`` answers and records
+        in one step, which is right for event delivery (the event arrived, and
+        that is the whole fact) but wrong when the key stands for a conclusion
+        the caller has not reached yet. Marking such a key up front spends it on
+        an attempt that never produced an answer.
+        """
+
+        with self._lock:
+            return bool(key) and key in self._seen
 
     def is_duplicate(self, key: str) -> bool:
         with self._lock:
@@ -794,9 +862,10 @@ def run_turn(
         else:
             result = fm.submit_turn(case_id, query=text, team_id=team_id)
     except CaseNotFoundError:
-        # Case deleted server-side (dashboard delete, DB reset) — evict the
-        # stale mapping so the NEXT message starts fresh instead of routing
-        # to the same dead case_id forever.
+        # The case is gone server-side (deleted from the dashboard, a DB reset,
+        # a restore that predates it) — tombstone the mapping so this thread
+        # stops routing to a case that isn't there, while still remembering it
+        # was ours, which is what lets the next reply get an explanation.
         unlink_stale_case(store, team_id, channel_id, thread_ts, case_id)
         raise
 
@@ -957,7 +1026,7 @@ def run_turn_and_post(
                 raise
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
         logger.exception("turn failed in %s: %s", channel, exc)
-        update(turn_error_text(exc))
+        update(turn_error_text(exc, channel))
         return
 
     # The turn is committed backend-side; deliver_turn_result owns the

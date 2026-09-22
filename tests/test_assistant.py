@@ -46,11 +46,20 @@ class _FakeStore:
     def __init__(self) -> None:
         self.m: dict = {}
         self.seeded: set = set()
+        self.unlinked: set = set()
         self.last_turn: dict = {}
         self.last_action: dict = {}
 
     def get(self, t, c, th):
         return self.m.get((t, c, th))
+
+    def mark_unlinked(self, t, c, th):
+        self.unlinked.add((t, c, th))
+        self.m.pop((t, c, th), None)
+        self.seeded.discard((t, c, th))
+
+    def is_unlinked(self, t, c, th):
+        return (t, c, th) in self.unlinked
 
     def put(self, t, c, th, cid):
         self.m[(t, c, th)] = cid

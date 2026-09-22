@@ -23,7 +23,7 @@ from rendering import SUGGESTED_ACTION_PATTERN
 from store import CaseStore
 
 from ._turn import (
-    CASE_GONE_TEXT,
+    case_gone_text,
     deliver_turn_result,
     record_posted_turn,
     retry_may_help,
@@ -253,13 +253,13 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 try:
                     case_id = store.get(team_id, channel, thread_ts)
                     if not case_id:
-                        # No mapping to submit against, and the next @mention
-                        # opens a fresh case — same stale-decision hazard as a
-                        # deleted case, so the buttons stay down.
-                        post(
-                            ":warning: I lost track of this investigation's "
-                            "case. Please @mention me to continue."
-                        )
+                        # No mapping to submit against — the thread was
+                        # tombstoned by an earlier failure, or its row is gone
+                        # with the store. Either way the case can't be found,
+                        # which is exactly what the click needs to be told; the
+                        # buttons stay down, because the decision this one
+                        # carries belongs to a case that isn't there.
+                        post(case_gone_text(channel))
                         return None
                     return apply_action(
                         fm, case_id, action["value"], team_id=team_id
@@ -267,11 +267,11 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 except CaseNotFoundError:
                     # Only apply_action raises this, so case_id is set.
                     unlink_stale_case(store, team_id, channel, thread_ts, case_id)
-                    post(CASE_GONE_TEXT)
+                    post(case_gone_text(channel))
                     return None
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("suggested-action failed: %s", exc)
-                    post(turn_error_text(exc))
+                    post(turn_error_text(exc, channel))
                     restore = retry_may_help(exc)
                     return None
 
