@@ -574,14 +574,27 @@ wrong in its own way: a channel reply was dropped in silence, a 1:1 quietly
 opened a fresh case and answered as though nothing had been said before it, and
 a button click reported that the agent had "lost track".
 
-> **Limit.** The tombstone is written when a turn 404s, so it cannot exist if
-> the thread→case map itself was lost — an unpersisted `CASE_STORE_PATH`
-> volume (§10.1). There is no row to flag, so a *typed* reply in a channel
-> thread is still dropped silently; an `@mention`, a shortcut or a button click
-> all answer normally. Detecting it at runtime would mean a
-> `conversations_replies` read per unknown thread, on the firehose path, to ask
-> whether the bot ever posted there — so instead the store logs a warning when
-> it starts empty, which is the moment the loss is diagnosable.
+**When the map itself is lost.** A tombstone is written when a turn 404s, so an
+*absent* row cannot mean that — it means either a thread the agent never touched
+or one it did whose record is gone, which is what an unpersisted
+`CASE_STORE_PATH` volume (§10.1) produces on every restart. Slack still holds
+the answer: in a channel the agent only ever posts after being summoned, so its
+own message in the thread is proof the thread was an investigation.
+`_adopt_lost_thread` reads the thread once, and on a match tombstones it
+(`mark_unlinked` upserts) so it rejoins the path above.
+
+Three things keep that read off the firehose: it runs only for a reply that said
+something, only on a thread with no row, and only once per thread per process —
+a thread that turns out not to be ours is remembered. It matches *this* app's
+messages, not any `bot_id`, because an incident thread is usually full of other
+bots and matching them would adopt every alert thread in the channel.
+
+The probe is sound **only on channel threads**. The Assistant surface greets
+every new thread before the first user message arrives, so there the agent's
+presence proves nothing and the same probe would refuse people's opening
+messages. The store also logs a warning when it starts empty, which is the
+moment the loss is diagnosable rather than the moment someone reports that the
+bot stopped answering.
 
 So `mark_unlinked` keeps the row and flags it (`store.py`). The one-time
 channel notice is claimed with a conditional `UPDATE` (`claim_unlink_notice`)

@@ -262,15 +262,28 @@ class CaseStore:
 
         The dead ``case_id`` is kept for the log trail; no read returns it.
         Buttons are cleared: they carry decisions for a case that isn't there.
+
+        Upserts, because a thread can need a tombstone with no row to flag: the
+        map itself can be lost (an unpersisted volume), and a caller that has
+        re-identified the thread from Slack has nothing to update. There is no
+        case id to record in that case — we never knew it — and no read returns
+        one for a tombstoned row, so the column holds the empty string.
         """
 
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE thread_cases "
                 "SET unlinked=1, unlink_notified=0, last_action_ts=NULL "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )
+            if cursor.rowcount == 0:
+                self._conn.execute(
+                    "INSERT INTO thread_cases (team_id, channel_id, thread_ts, "
+                    "case_id, seeded, unlinked, unlink_notified) "
+                    "VALUES (?, ?, ?, '', 0, 1, 0)",
+                    (team_id, channel_id, thread_ts),
+                )
             self._conn.commit()
 
     def is_unlinked(

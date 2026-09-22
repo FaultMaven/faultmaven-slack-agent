@@ -24,6 +24,12 @@ from listeners.events import register_events
 from store import CaseStore
 
 _LOG = logging.getLogger("test")
+_BOT_USER, _BOT_ID = "UBOT", "B1"
+
+
+def _ctx():
+    """Bolt's context, as the listeners read it."""
+    return SimpleNamespace(team_id="T1", bot_user_id=_BOT_USER, bot_id=_BOT_ID)
 
 
 class _FakeFM:
@@ -54,6 +60,7 @@ class _FakeClient:
         self.posts: list = []
         self.updates: list = []
         self.reactions: list = []
+        self.history_reads = 0
 
     def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -66,8 +73,13 @@ class _FakeClient:
     def reactions_add(self, **kwargs):
         self.reactions.append(kwargs)
 
+    #: Thread history the probe reads. Default: humans only — a thread the
+    #: agent has never been in.
+    history: list = [{"ts": "1.0", "text": "the pods are crashlooping", "user": "U9"}]
+
     def conversations_replies(self, **kwargs):
-        return {"messages": [{"ts": "1.0", "text": "the pods are crashlooping"}]}
+        self.history_reads += 1
+        return {"messages": self.history}
 
     @property
     def texts(self) -> list[str]:
@@ -105,7 +117,7 @@ def _reply(app, client, *, ts="2.0", text="can we continue the conversation"):
             "ts": ts,
             "text": text,
         },
-        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        context=_ctx(),
         client=client,
         logger=_LOG,
     )
@@ -189,7 +201,7 @@ def test_a_mention_is_the_way_back(tmp_path):
             "thread_ts": "TS1",
             "text": "<@UBOT> let's pick this back up",
         },
-        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        context=_ctx(),
         client=client,
         logger=_LOG,
     )
@@ -224,7 +236,7 @@ def test_the_restarted_investigation_says_it_is_a_restart(tmp_path):
 
     app.handlers["app_mention"](
         event={"channel": "C1", "ts": "5.0", "thread_ts": "TS1", "text": "<@UBOT> hi"},
-        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        context=_ctx(),
         client=client,
         logger=_LOG,
     )
@@ -244,7 +256,7 @@ def test_an_ordinary_first_summons_says_nothing_about_a_restart(tmp_path):
 
     app.handlers["app_mention"](
         event={"channel": "C1", "ts": "5.0", "thread_ts": "TS1", "text": "<@UBOT> hi"},
-        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        context=_ctx(),
         client=client,
         logger=_LOG,
     )
@@ -292,4 +304,100 @@ def test_a_dm_says_the_case_is_gone_instead_of_starting_over_silently(tmp_path):
     assert "couldn't find" in say.posts[0]
     # A DM has no @mention to offer, so it must not ask for one.
     assert "@mention" not in say.posts[0]
+    store.close()
+
+
+# -- the map itself is gone ----------------------------------------------------
+# A tombstone is only written when a turn 404s, so an absent row can also mean
+# the map that held it did not survive a restart (an unpersisted volume, which
+# docs/HOSTING.md warns about). Slack still knows: in a channel the agent only
+# posts after being summoned.
+_OURS = [
+    {"ts": "1.0", "text": "the pods are crashlooping", "user": "U9"},
+    {"ts": "1.1", "text": ":mag: Investigating…", "user": _BOT_USER, "bot_id": _BOT_ID},
+]
+
+
+def test_a_thread_we_were_in_is_recovered_when_the_map_is_lost(tmp_path):
+    """The likelier cause of the reported silence: no 404 ever happened, the
+    row simply isn't there any more."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))  # empty, as after the loss
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    client.history = _OURS
+    register_events(app, fm, store)
+
+    _reply(app, client)
+
+    assert "couldn't find" in client.texts[0]
+    assert store.is_unlinked("T1", "C1", "TS1"), "recovered threads are tombstoned"
+    assert not fm.turns
+    store.close()
+
+
+def test_another_bots_thread_is_not_adopted(tmp_path):
+    """An incident thread is full of other bots — that is usually what started
+    it — so the probe matches this app, not any bot."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    client.history = [
+        {"ts": "1.0", "text": "[FIRING] disk full", "bot_id": "B_ALERTMANAGER"},
+        {"ts": "1.1", "text": "looking", "user": "U9"},
+    ]
+    register_events(app, fm, store)
+
+    _reply(app, client)
+
+    assert client.posts == []
+    assert not store.is_unlinked("T1", "C1", "TS1")
+    store.close()
+
+
+def test_the_thread_history_is_read_once_per_thread(tmp_path):
+    """The probe sits on the path that sees every threaded message in every
+    channel the agent is in. Reading the history per message would put a Slack
+    call behind ordinary chatter; a thread that turns out not to be ours is
+    remembered instead."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    register_events(app, fm, store)
+
+    _reply(app, client, ts="2.0")
+    _reply(app, client, ts="3.0", text="still broken")
+    _reply(app, client, ts="4.0", text="anyone?")
+
+    assert client.history_reads == 1
+    assert client.posts == []
+    store.close()
+
+
+def test_a_recovered_thread_does_not_keep_probing(tmp_path):
+    """Once adopted the thread has a row, so it rejoins the ordinary path: one
+    notice, and no further history reads."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    client.history = _OURS
+    register_events(app, fm, store)
+
+    _reply(app, client, ts="2.0")
+    _reply(app, client, ts="3.0", text="hello?")
+
+    assert client.history_reads == 1
+    assert len(client.posts) == 1
+    store.close()
+
+
+def test_a_content_free_reply_never_costs_a_history_read(tmp_path):
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    client.history = _OURS
+    register_events(app, fm, store)
+
+    _reply(app, client, ts="2.0", text="   ")
+
+    assert client.history_reads == 0
+    assert client.posts == []
     store.close()

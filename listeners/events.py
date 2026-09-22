@@ -99,6 +99,74 @@ def _fetch_thread_context(
     return "\n".join(lines)[:_THREAD_CONTEXT_LIMIT]
 
 
+# How far back the orphan probe reads. FaultMaven's first post in a thread is
+# the placeholder it answers the summons with, so it sits near the top of the
+# replies — a bounded read finds it. A thread long enough to bury it past this
+# is one where the agent joined very late and said very little.
+_ORPHAN_PROBE_LIMIT = 200
+
+
+def _was_ours(messages: list, *, bot_user_id: str | None, bot_id: str | None) -> bool:
+    """Did *this* app post in the thread? Not "did any bot".
+
+    An incident thread is full of other bots — that is usually what started it
+    — so matching a bare ``bot_id`` would adopt every alert thread in the
+    channel.
+    """
+
+    for message in messages:
+        if bot_user_id and message.get("user") == bot_user_id:
+            return True
+        if bot_id and message.get("bot_id") == bot_id:
+            return True
+    return False
+
+
+def _adopt_lost_thread(
+    client: WebClient,
+    store: CaseStore,
+    probed: "Dedup",
+    *,
+    team_id: str,
+    channel: str,
+    thread_ts: str,
+    bot_user_id: str | None,
+    bot_id: str | None,
+) -> bool:
+    """Recover a thread that was ours before the thread→case map was lost.
+
+    A tombstone is written when a turn 404s, so an *absent* row cannot mean
+    that. It means either a thread we never touched, or one we did whose record
+    is gone — an unpersisted ``CASE_STORE_PATH`` (``docs/HOSTING.md``). Slack
+    still holds the answer: in a channel the agent only ever posts after being
+    summoned, so its own message in the thread is proof the thread was an
+    investigation. Found, the thread is tombstoned and rejoins the normal path.
+
+    Sound only on channel threads. The Assistant surface greets every new
+    thread before the first user message, so there the agent's presence proves
+    nothing and this probe would refuse people's opening messages.
+
+    One read per thread per process (``probed``): a thread that turns out not to
+    be ours is remembered, so the ambient-message path pays a lookup, not a
+    lookup per message.
+    """
+
+    if probed.is_duplicate(f"{team_id}:{channel}:{thread_ts}"):
+        return False
+    try:
+        resp = client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=_ORPHAN_PROBE_LIMIT
+        )
+    except Exception:  # noqa: BLE001 — a failed probe just leaves the thread unknown
+        return False
+    if not _was_ours(
+        resp.get("messages", []), bot_user_id=bot_user_id, bot_id=bot_id
+    ):
+        return False
+    store.mark_unlinked(team_id, channel, thread_ts)
+    return True
+
+
 def is_thread_followup_candidate(event: dict, *, bot_user_id: str | None) -> bool:
     """Cheap gate: is this a plain human reply *inside a thread* worth checking?
 
@@ -169,6 +237,7 @@ def mention_text(cleaned: str, *, seeded: bool) -> str:
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     dedup = Dedup()
     followup_dedup = Dedup()
+    probed_threads = Dedup()
 
     @app.event("app_mention")
     def on_app_mention(
@@ -352,14 +421,23 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             # an unknown thread is dropped is what left people typing into
             # silence. Explain once, then leave the thread alone; an @mention
             # is how it comes back (and re-linking clears the tombstone).
-            if (
-                (
-                    clean_mention(event.get("text") or "").strip()
-                    or event.get("files")
-                )
-                and not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}")
-                and store.claim_unlink_notice(team_id, channel, thread_ts)
+            if not (
+                clean_mention(event.get("text") or "").strip()
+                or event.get("files")
             ):
+                return  # nothing was said; nothing is owed
+            if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
+                return
+            # No tombstone can mean the map that held it is gone rather than
+            # that the thread was never ours — ask Slack which, once.
+            if not store.is_unlinked(team_id, channel, thread_ts):
+                if not _adopt_lost_thread(
+                    client, store, probed_threads,
+                    team_id=team_id, channel=channel, thread_ts=thread_ts,
+                    bot_user_id=context.bot_user_id, bot_id=context.bot_id,
+                ):
+                    return
+            if store.claim_unlink_notice(team_id, channel, thread_ts):
                 if not _post_note(
                     client, channel, thread_ts, case_gone_text(channel)
                 ):
