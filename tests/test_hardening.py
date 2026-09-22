@@ -8,6 +8,7 @@ Block Kit limit handling, typed backend errors (404 eviction / preset-token
 from __future__ import annotations
 
 import re
+import sqlite3
 
 import httpx
 import pytest
@@ -561,9 +562,64 @@ def test_the_unlink_notice_is_owed_once(tmp_path):
     store.mark_unlinked("T", "C", "TS")
 
     assert store.unlink_notice_pending("T", "C", "TS")
-    store.mark_unlink_notified("T", "C", "TS")
+    # The claim is the lock: replies arrive in bursts across a Bolt thread
+    # pool, and exactly one of them may post.
+    assert store.claim_unlink_notice("T", "C", "TS")
+    assert not store.claim_unlink_notice("T", "C", "TS")
     assert not store.unlink_notice_pending("T", "C", "TS")
     assert store.is_unlinked("T", "C", "TS")  # told, but still tombstoned
+    store.close()
+
+
+def test_a_notice_slack_refused_is_still_owed(tmp_path):
+    """The claim is taken before the post, so a post that never lands has to
+    hand it back — otherwise one Slack hiccup costs the thread the only
+    explanation it was ever going to get."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "C", "TS", "case_1")
+    store.mark_unlinked("T", "C", "TS")
+
+    assert store.claim_unlink_notice("T", "C", "TS")
+    store.release_unlink_notice("T", "C", "TS")
+    assert store.unlink_notice_pending("T", "C", "TS")
+    store.close()
+
+
+def test_a_live_thread_cannot_claim_an_unlink_notice(tmp_path):
+    """The claim is conditional on the tombstone, not just on the flag: a live
+    thread must never be able to consume a notice it isn't owed."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    store.put("T", "C", "TS", "case_1")
+    assert not store.claim_unlink_notice("T", "C", "TS")
+    assert not store.claim_unlink_notice("T", "C", "NEVER")
+    store.close()
+
+
+def test_an_old_schema_store_upgrades_in_place(tmp_path):
+    """The tombstone columns land on deployed databases by ALTER, so the
+    oldest shape on disk — no seeded, no turn markers, no tombstone — has to
+    open, keep its rows, and support the new behaviour."""
+
+    path = str(tmp_path / "legacy.db")
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE thread_cases ("
+        "team_id TEXT NOT NULL, channel_id TEXT NOT NULL, "
+        "thread_ts TEXT NOT NULL, case_id TEXT NOT NULL, "
+        "PRIMARY KEY (team_id, channel_id, thread_ts))"
+    )
+    legacy.execute("INSERT INTO thread_cases VALUES ('T', 'C', 'TS', 'old_case')")
+    legacy.commit()
+    legacy.close()
+
+    store = CaseStore(path)
+    assert store.get("T", "C", "TS") == "old_case"  # the mapping survives
+    assert store.is_seeded("T", "C", "TS")  # legacy rows had landed turns
+    store.mark_unlinked("T", "C", "TS")
+    assert store.is_unlinked("T", "C", "TS")
+    assert store.unlink_notice_pending("T", "C", "TS")
     store.close()
 
 
@@ -575,7 +631,7 @@ def test_relinking_clears_the_tombstone(tmp_path):
     store = CaseStore(str(tmp_path / "cases.db"))
     store.put("T", "C", "TS", "case_1")
     store.mark_unlinked("T", "C", "TS")
-    store.mark_unlink_notified("T", "C", "TS")
+    assert store.claim_unlink_notice("T", "C", "TS")
 
     store.put("T", "C", "TS", "case_2")
     assert store.get("T", "C", "TS") == "case_2"

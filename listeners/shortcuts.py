@@ -23,6 +23,7 @@ from store import CaseStore
 from ._turn import (
     Dedup,
     post_placeholder,
+    RESTARTED_AFTER_MISSING_CASE,
     run_gated,
     run_turn_and_post,
     skipped_files_note,
@@ -110,6 +111,10 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             )
             return
 
+        # Read before the turn: opening the replacement case clears the
+        # tombstone (mirrors on_app_mention).
+        restarted = store.is_unlinked(team_id, channel, thread_ts)
+
         def work() -> None:
             # Placeholder BEFORE the (potentially slow) file download for instant
             # feedback; reuse it for the reply.
@@ -190,6 +195,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 files=files or None,
                 placeholder_ts=placeholder_ts,
                 mention_user=context.user_id,
+                intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
             )
 
         # Reserve the thread and run in the background. If a turn is already

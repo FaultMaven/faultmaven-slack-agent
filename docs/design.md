@@ -574,7 +574,21 @@ wrong in its own way: a channel reply was dropped in silence, a 1:1 quietly
 opened a fresh case and answered as though nothing had been said before it, and
 a button click reported that the agent had "lost track".
 
-So `mark_unlinked` keeps the row and flags it (`store.py`). Reads treat a
+> **Limit.** The tombstone is written when a turn 404s, so it cannot exist if
+> the thread→case map itself was lost — an unpersisted `CASE_STORE_PATH`
+> volume (§10.1). There is no row to flag, so a *typed* reply in a channel
+> thread is still dropped silently; an `@mention`, a shortcut or a button click
+> all answer normally. Detecting it at runtime would mean a
+> `conversations_replies` read per unknown thread, on the firehose path, to ask
+> whether the bot ever posted there — so instead the store logs a warning when
+> it starts empty, which is the moment the loss is diagnosable.
+
+So `mark_unlinked` keeps the row and flags it (`store.py`). The one-time
+channel notice is claimed with a conditional `UPDATE` (`claim_unlink_notice`)
+rather than a read-then-write, because replies arrive in bursts and Bolt
+dispatches them across a thread pool — the row is the lock — and the claim is
+released if the post never lands, so a notice lost to a Slack failure is still
+owed. Reads treat a
 tombstoned thread as unmapped — `get`, `is_seeded` and the two turn markers all
 filter it out, so a re-link starts genuinely from scratch, catch-up replay and
 all — while `is_unlinked` preserves the memory:
@@ -582,9 +596,9 @@ all — while `is_unlinked` preserves the memory:
 | Surface | A message arrives on a tombstoned thread |
 |---|---|
 | Channel thread reply | Posts the notice **once** (`unlink_notice_pending`), then leaves the thread alone. A war-room thread keeps talking after FaultMaven drops out of it; repeating this on every reply would turn one piece of bad news into a heckle. A content-free reply doesn't spend the notice. |
-| `@mention` | The way back: opens a fresh case, and `put` clears the tombstone. |
+| `@mention` / **Ask** shortcut | The way back: opens a fresh case, and `put` clears the tombstone. Its first reply carries a note saying *why* it is a new case — a re-summons that arrives with an unfamiliar case id and no explanation reads as the agent having quietly forgotten the conversation, which is precisely what happened. |
 | Assistant Chat / DM | Answers **every** time — in a 1:1 every message is addressed to us, so none may go unanswered — and never opens a case silently. |
-| Suggested-action button | Answers every time, with the same wording. The buttons stay down: the decision one carries belongs to a case that isn't there, and re-arming it would land a stale choice on whatever case the thread opens next. |
+| Suggested-action button | Answers every time, with the same wording — including when the row is missing entirely rather than tombstoned, since "the case can't be found" is true either way. The buttons stay down: the decision one carries belongs to a case that isn't there, and re-arming it would land a stale choice on whatever case the thread opens next. |
 
 ---
 

@@ -105,6 +105,16 @@ def case_gone_text(channel_id: str) -> str:
     )
 
 
+#: Shown on the first reply of an investigation that REPLACES one whose case
+#: went missing. A re-summons is the one place opening a new case is right — the
+#: user asked for it — but the reply would otherwise arrive carrying a case id
+#: they never saw created, answering as though the thread had no history. It
+#: says which of those two things happened.
+RESTARTED_AFTER_MISSING_CASE = (
+    ":card_index_dividers: I couldn't find the earlier case for this thread, so "
+    "this is a new investigation — anything FaultMaven had worked out before is "
+    "gone, though the thread itself is all still here."
+)
 # The case concluded and is read-only, but it still EXISTS and is still online:
 # the backend answers text-only questions about it and refuses only evidence and
 # state changes. So this says what still works, rather than reading as a fault.

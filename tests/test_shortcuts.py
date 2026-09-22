@@ -448,6 +448,14 @@ class _FakeClient:
         return {"permalink": f"https://slack/archives/{channel}/p{message_ts}"}
 
 
+class _LiveThreadStore:
+    """A store for a thread whose case is fine — the shortcut only asks whether
+    the thread is tombstoned, to decide if its reply owes a restart note."""
+
+    def is_unlinked(self, team, channel, thread):
+        return False
+
+
 def _drive_shortcut(monkeypatch, message: dict) -> dict:
     """Invoke the registered shortcut handler and return run_turn_and_post's kwargs."""
     from listeners import shortcuts as sc
@@ -460,7 +468,7 @@ def _drive_shortcut(monkeypatch, message: dict) -> dict:
     )
 
     app = _CapturingApp()
-    sc.register_shortcuts(app, object(), object())
+    sc.register_shortcuts(app, object(), _LiveThreadStore())
     app.handlers["fm_investigate_message"](
         ack=lambda: None,
         shortcut={

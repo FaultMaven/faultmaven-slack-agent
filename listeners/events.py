@@ -27,6 +27,7 @@ from store import CaseStore
 from ._turn import (
     case_gone_text,
     Dedup,
+    RESTARTED_AFTER_MISSING_CASE,
     is_thread_busy,
     mark_skipped,
     post_placeholder,
@@ -198,6 +199,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
 
             # One read of the thread's state, used for both decisions below.
             seeded = store.is_seeded(team_id, channel, thread_ts)
+            # Read BEFORE the turn: opening the replacement case clears the
+            # tombstone, and by then there is nothing left to say this reply
+            # is a restart rather than an ordinary first turn.
+            restarted = store.is_unlinked(team_id, channel, thread_ts)
 
             # Replay the prior discussion until the case has actually landed a
             # turn (unseeded): a mapping whose first submit failed still needs
@@ -239,6 +244,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 files=files or None,
                 placeholder_ts=placeholder_ts,
                 mention_user=event.get("user"),
+                intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
                 empty_turn_fallback=SUMMONS_TEXT,
             )
 
@@ -351,11 +357,14 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     clean_mention(event.get("text") or "").strip()
                     or event.get("files")
                 )
-                and store.unlink_notice_pending(team_id, channel, thread_ts)
                 and not followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}")
-                and _post_note(client, channel, thread_ts, case_gone_text(channel))
+                and store.claim_unlink_notice(team_id, channel, thread_ts)
             ):
-                store.mark_unlink_notified(team_id, channel, thread_ts)
+                if not _post_note(
+                    client, channel, thread_ts, case_gone_text(channel)
+                ):
+                    # Slack refused it, so the thread still hasn't been told.
+                    store.release_unlink_notice(team_id, channel, thread_ts)
             return
         if followup_dedup.is_duplicate(f"{channel}:{event.get('ts')}"):
             return

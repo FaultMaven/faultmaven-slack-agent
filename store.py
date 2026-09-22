@@ -33,6 +33,15 @@ class CaseStore:
         # check_same_thread=False: Bolt dispatches listeners across a thread
         # pool; we serialize access ourselves with ``_lock``.
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        # A store that starts empty is either a first run or a lost volume, and
+        # the two are indistinguishable from in here. The consequence is the
+        # same either way and it is invisible at runtime — every thread already
+        # open in Slack now looks like a thread we have never seen — so it is
+        # said once, out loud, rather than left for someone to deduce from a
+        # user reporting that the bot stopped answering.
+        fresh = not self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_cases'"
+        ).fetchone()
         # ``seeded`` = the case has landed at least one successful turn. Until
         # then the one-time context seed (thread catch-up) has NOT been
         # delivered, so callers re-fetch and re-send it on the next attempt.
@@ -79,6 +88,13 @@ class CaseStore:
             except sqlite3.OperationalError:
                 pass
         self._conn.commit()
+        if fresh:
+            logger.warning(
+                "thread→case map at %s is empty: no existing Slack thread will "
+                "be recognised as an investigation. Expected on a first run; "
+                "otherwise this volume did not persist (see docs/HOSTING.md).",
+                path,
+            )
 
     def get(self, team_id: str, channel_id: str, thread_ts: str) -> str | None:
         """The live case for this thread, or None.
@@ -294,14 +310,38 @@ class CaseStore:
             ).fetchone()
         return bool(row and row[0] and not row[1])
 
-    def mark_unlink_notified(
+    def claim_unlink_notice(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> bool:
+        """Take the right to post this thread's one notice; True if you got it.
+
+        Claimed with a conditional UPDATE rather than a read followed by a
+        write, because the read and the write would not be one step: replies
+        arrive in bursts and Bolt dispatches them across a thread pool, so two
+        of them can both see "not told yet" and both post. The row is the lock.
+
+        The caller releases the claim if its post never lands, so a notice lost
+        to a Slack failure is still owed to the thread.
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE thread_cases SET unlink_notified=1 "
+                "WHERE team_id=? AND channel_id=? AND thread_ts=? "
+                "AND unlinked=1 AND unlink_notified=0",
+                (team_id, channel_id, thread_ts),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def release_unlink_notice(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> None:
-        """Record that the thread has been told its case couldn't be found."""
+        """Hand back a claim whose notice never reached Slack."""
 
         with self._lock:
             self._conn.execute(
-                "UPDATE thread_cases SET unlink_notified=1 "
+                "UPDATE thread_cases SET unlink_notified=0 "
                 "WHERE team_id=? AND channel_id=? AND thread_ts=?",
                 (team_id, channel_id, thread_ts),
             )

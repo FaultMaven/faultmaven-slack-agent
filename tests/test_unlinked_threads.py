@@ -204,6 +204,57 @@ def test_a_mention_is_the_way_back(tmp_path):
     store.close()
 
 
+def _context_notes(update: dict) -> list[str]:
+    return [
+        e["text"]
+        for b in update.get("blocks", [])
+        if b.get("type") == "context"
+        for e in b.get("elements", [])
+    ]
+
+
+def test_the_restarted_investigation_says_it_is_a_restart(tmp_path):
+    """The other half of the reported bug: a new case is the right answer to a
+    re-summons, but arriving with a case id the user never saw created, on a
+    thread they were mid-conversation in, reads as the agent having quietly
+    forgotten everything. Which is what happened — so it says so."""
+
+    store, fm, client, app = _orphaned(tmp_path), _FakeFM(), _FakeClient(), _FakeApp()
+    register_events(app, fm, store)
+
+    app.handlers["app_mention"](
+        event={"channel": "C1", "ts": "5.0", "thread_ts": "TS1", "text": "<@UBOT> hi"},
+        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        client=client,
+        logger=_LOG,
+    )
+    turn_mod.drain_turns(5.0)
+
+    notes = _context_notes(client.updates[-1])
+    assert any("couldn't find the earlier case" in n for n in notes)
+
+
+def test_an_ordinary_first_summons_says_nothing_about_a_restart(tmp_path):
+    """The note is about something that happened. A thread opening its first
+    investigation has nothing to be told."""
+
+    store = CaseStore(str(tmp_path / "cases.db"))
+    fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
+    register_events(app, fm, store)
+
+    app.handlers["app_mention"](
+        event={"channel": "C1", "ts": "5.0", "thread_ts": "TS1", "text": "<@UBOT> hi"},
+        context=SimpleNamespace(team_id="T1", bot_user_id="UBOT"),
+        client=client,
+        logger=_LOG,
+    )
+    turn_mod.drain_turns(5.0)
+
+    notes = _context_notes(client.updates[-1])
+    assert not any("earlier case" in n for n in notes)
+    store.close()
+
+
 # -- the 1:1 that quietly started over ----------------------------------------
 class _FakeSay:
     def __init__(self) -> None:
