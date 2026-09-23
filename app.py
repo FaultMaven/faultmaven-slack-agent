@@ -380,7 +380,7 @@ def shutdown_runtime(store: CaseStore, fm: FaultMavenClient) -> None:
     the teardown itself must say "restarting", not blame the turn or advise a
     retry — :func:`begin_shutdown` flips that message. The drain must outlast
     the turn timeout, or a live worker gets its resources yanked mid-turn and
-    the thread's ":mag: Investigating…" placeholder strands forever.
+    the thread's ":hourglass_flowing_sand: Working…" placeholder strands forever.
     """
 
     begin_shutdown()

@@ -166,7 +166,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
             # Best-effort permalink back to the alert, for case provenance.
             # Broad guard: a TRANSPORT error here (reset, timeout) is not a
             # SlackApiError, and letting it escape after the placeholder was
-            # posted would strand ":mag: Investigating…" with no turn run.
+            # posted would strand ":hourglass_flowing_sand: Working…" with no turn run.
             source_url = None
             try:
                 source_url = client.chat_getPermalink(

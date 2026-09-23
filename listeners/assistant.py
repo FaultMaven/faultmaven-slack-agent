@@ -178,13 +178,19 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 store, team_id, channel, thread_ts, last_posted_ts, delivered_blocks
             )
 
-        # set_status shows the native "investigating" indicator immediately, so
-        # the offloaded download/turn has visible feedback in front of it. It's
-        # cosmetic, and it can fail on a thread that wasn't opened via
+        # set_status puts Slack's native in-flight indicator in front of the
+        # offloaded download/turn. "is working…" rather than "is investigating…"
+        # for the same reason the channel placeholder changed: INVESTIGATING is
+        # a formal case state, so that word asserted a transition that had not
+        # happened — on every turn, including the ones the engine deliberately
+        # keeps in INQUIRY. Leaving it here would have left the DM surface
+        # making the claim the channel surface just stopped making.
+        #
+        # Cosmetic, and it can fail on a thread that wasn't opened via
         # assistant_thread_started (e.g. a DM summons rooted by the events
         # handler), so a status failure must never abort the actual turn.
         try:
-            set_status("is investigating…")
+            set_status("is working…")
         except Exception as status_exc:  # noqa: BLE001
             logger.warning("set_status failed; continuing turn: %s", status_exc)
 

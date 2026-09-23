@@ -54,7 +54,17 @@ def begin_shutdown() -> None:
 
     _shutting_down.set()
 
-INVESTIGATING_PLACEHOLDER = ":mag: Investigating…"
+#: What the thread shows while a turn is in flight.
+#:
+#: NOT "Investigating…". INVESTIGATING is a formal case state, so that word
+#: asserted a transition that had not happened — on every turn, including the
+#: ones the engine deliberately keeps in INQUIRY (a greeting, a how-to
+#: question, a case that never becomes an investigation at all). The ``:mag:``
+#: magnifier carried the same claim.
+#:
+#: "Working" is true of every turn type, which is the only property a
+#: placeholder needs. Matches the Copilot, which said "Thinking…".
+WORKING_PLACEHOLDER = ":hourglass_flowing_sand: Working…"
 TURN_ERROR_TEXT = (
     ":warning: FaultMaven hit an error on that turn. Please try again or "
     "@mention me."
@@ -597,7 +607,7 @@ class _ThreadGate:
 _gate = _ThreadGate()
 
 # Turn worker threads currently in flight, so shutdown can drain them (a
-# daemon thread killed mid-turn strands its placeholder at "Investigating…").
+# daemon thread killed mid-turn strands its placeholder at "Working…").
 _active_turns: set[threading.Thread] = set()
 _active_turns_lock = threading.Lock()
 
@@ -771,7 +781,7 @@ def slack_ts_to_iso(ts: str | None) -> str | None:
     out-of-range values raise ``OSError`` on some platforms — neither is a
     ``ValueError``. The only call site runs inside ``work()`` AFTER the
     placeholder is posted and outside any try, so an escaping exception is not
-    "a bad timestamp is ignored", it is ":mag: Investigating…" left in the
+    "a bad timestamp is ignored", it is ":hourglass_flowing_sand: Working…" left in the
     channel forever with no reply.
     """
 
@@ -886,7 +896,7 @@ def run_turn(
 def post_placeholder(
     client: WebClient, channel: str, thread_ts: str
 ) -> str | None:
-    """Post the "investigating…" placeholder and return its ``ts``.
+    """Post the "Working…" placeholder and return its ``ts``.
 
     Returns ``None`` (with actionable logging) if the bot can't post — e.g. it
     isn't in the channel — so callers stop rather than crash. Posting this
@@ -896,7 +906,7 @@ def post_placeholder(
 
     try:
         resp = client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=INVESTIGATING_PLACEHOLDER
+            channel=channel, thread_ts=thread_ts, text=WORKING_PLACEHOLDER
         )
     except SlackApiError as exc:
         error = exc.response.get("error", "")
