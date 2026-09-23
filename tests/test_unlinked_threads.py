@@ -372,7 +372,7 @@ def test_a_thread_the_agent_spoke_in_but_never_opened_a_case_for(tmp_path):
 
     store = CaseStore(str(tmp_path / "cases.db"))
     fm, client, app = _FakeFM(), _FakeClient(), _FakeApp()
-    client.history = [_HUMAN, _bot_reply(":mag: Investigating…")]  # no case id
+    client.history = [_HUMAN, _bot_reply(":hourglass_flowing_sand: Working…")]  # no case id
     register_events(app, fm, store)
 
     _reply(app, client)

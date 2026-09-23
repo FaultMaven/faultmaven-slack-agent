@@ -524,7 +524,7 @@ def test_out_of_range_slack_ts_does_not_escape():
     """`datetime.fromtimestamp` raises OverflowError for inf/1e20 and OSError on
     some platforms — neither is a ValueError. The only call site runs inside
     work() AFTER the placeholder is posted and outside any try, so an escaping
-    exception is not "a bad timestamp is ignored", it is ":mag: Investigating…"
+    exception is not "a bad timestamp is ignored", it is ":hourglass_flowing_sand: Working…"
     left in the channel forever with no reply."""
 
     _turn = _load_turn("_turn_ts_overflow")
