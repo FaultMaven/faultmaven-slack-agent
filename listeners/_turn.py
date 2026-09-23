@@ -896,7 +896,7 @@ def run_turn(
 def post_placeholder(
     client: WebClient, channel: str, thread_ts: str
 ) -> str | None:
-    """Post the "investigating…" placeholder and return its ``ts``.
+    """Post the "Working…" placeholder and return its ``ts``.
 
     Returns ``None`` (with actionable logging) if the bot can't post — e.g. it
     isn't in the channel — so callers stop rather than crash. Posting this

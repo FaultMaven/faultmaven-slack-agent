@@ -122,7 +122,7 @@ Leave it running. Then invite the bot to a test channel: `/invite @FaultMaven`
 ## 6. Smoke the four surfaces
 
 Run each and check the **Expect** line. The agent posts a
-`:mag: FaultMaven is investigating…` placeholder, then edits it in place with the
+`:hourglass_flowing_sand: Working…` placeholder, then edits it in place with the
 result — so a flash-then-update is the healthy signal.
 
 ### A. Assistant side panel (1:1)

@@ -79,7 +79,7 @@ collaborate in the thread:
 - **It shows suggested-action buttons.** When there's a decision to make or a
   next step to run, FaultMaven renders buttons — click one to advance the case
   instead of retyping.
-- **It shows live status** while it works ("investigating…"), then edits its
+- **It shows live status** while it works ("Working…"), then edits its
   reply in place with the result — a brief flash-then-update is the healthy
   signal.
 - **It grounds every step** in your runbooks and past fixes, and shows the
@@ -132,7 +132,7 @@ FaultMaven requests least-privilege scopes, each tied to a capability:
 | Scope | Why |
 |---|---|
 | `assistant:write` | the Assistant side-panel surface |
-| `chat:write` | post replies and the "investigating…" placeholder |
+| `chat:write` | post replies and the "Working…" placeholder |
 | `app_mentions:read` | receive `@FaultMaven` summons |
 | `commands` | register the **Ask FaultMaven** message shortcut |
 | `files:read` | download attached logs/configs/screenshots for analysis |
