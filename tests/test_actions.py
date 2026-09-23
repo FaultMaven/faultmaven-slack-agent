@@ -175,9 +175,15 @@ def test_decide_becomes_primary_button_carrying_intent():
         suggested_actions=[
             {
                 "type": "DECIDE",
-                "label": "Mark resolved",
-                "payload": "The issue is fixed.",
-                "intent": {"type": "status_transition", "to_state": "resolved"},
+                "label": "Yes, mark as resolved",
+                "payload": "Yes, the issue is resolved.",
+                # The engine's resolve pair carries a CONFIRMATION intent, not
+                # a status_transition: RESOLVED stopped being a user-selectable
+                # case action in contract 9.0.0, so a server cannot emit the
+                # shape this fixture used to carry. The pass-through under test
+                # is intent-agnostic either way — but a fixture describing an
+                # impossible response teaches the next reader the wrong shape.
+                "intent": {"type": "confirmation", "confirmation_value": True},
             }
         ],
     )
@@ -186,9 +192,9 @@ def test_decide_becomes_primary_button_carrying_intent():
     assert buttons[0]["style"] == "primary"
     assert buttons[0]["action_id"].startswith("fm_suggested_action:")
     value = json.loads(buttons[0]["value"])
-    assert value["it"] == "status_transition"
-    assert value["q"] == "The issue is fixed."
-    assert value["id"]["to_state"] == "resolved"
+    assert value["it"] == "confirmation"
+    assert value["q"] == "Yes, the issue is resolved."
+    assert value["id"]["confirmation_value"] is True
     assert value["id"]["user_confirmed"] is True
 
 
@@ -241,7 +247,7 @@ def test_multiple_buttons_get_unique_action_ids():
         agent_response="?",
         suggested_actions=[
             {"type": "DECIDE", "label": "A", "payload": "a",
-             "intent": {"type": "status_transition", "to_state": "resolved"}},
+             "intent": {"type": "confirmation", "confirmation_value": True}},
             {"type": "DECIDE", "label": "B", "payload": "b",
              "intent": {"type": "status_transition", "to_state": "closed"}},
             {"type": "DECIDE", "label": "C", "payload": "c",
