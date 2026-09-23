@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from enum import Enum
-from pydantic import AwareDatetime, BaseModel, Field, RootModel, confloat, conint, constr
+from pydantic import AwareDatetime, BaseModel, EmailStr, Field, RootModel, confloat, conint, constr
 from typing import Any, Literal
 
 
@@ -163,6 +163,12 @@ class BodySubmitTurnApiV1CasesCaseIdTurnsPost(BaseModel):
     source_url: str | None = Field(None, title="Source Url")
 
 
+class Scope(Enum):
+    personal = "personal"
+    team = "team"
+    global_ = "global"
+
+
 class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
     category: str | None = Field(None, title="Category")
     description: str | None = Field(None, title="Description")
@@ -170,8 +176,10 @@ class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
     file: str = Field(
         ..., json_schema_extra={"contentMediaType": "application/octet-stream"}, title="File"
     )
+    scope: Scope | None = Field("personal", title="Scope")
     source_url: str | None = Field(None, title="Source Url")
     tags: str | None = Field(None, title="Tags")
+    team_id: str | None = Field(None, title="Team Id")
     title: str = Field(..., title="Title")
 
 
@@ -229,7 +237,7 @@ class CaseCreateRequest(BaseModel):
     )
     session_id: str | None = Field(
         None,
-        description="Session ID for authentication and case association (restored from old implementation)",
+        description="The caller's OWN session, to associate the new case with. It is NOT how this request is authenticated — the bearer token is, and a session id naming a session that is not the bearer's is refused (401 SESSION_EXPIRED, the same answer as an expired one, so the two cannot be told apart). The description said 'for authentication' until contract 6.0.0, which is the confusion that PR removed.",
         title="Session Id",
     )
     title: constr(max_length=200) | None = Field(
@@ -270,6 +278,11 @@ class DerivedEvidenceSummary(BaseModel):
     )
     collected_at_turn: int = Field(..., title="Collected At Turn")
     evidence_id: str = Field(..., title="Evidence Id")
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `collected_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     primary_purpose: str | None = Field(None, title="Primary Purpose")
     related_hypothesis_ids: list[str] | None = Field(None, title="Related Hypothesis Ids")
     source_type: str = Field(
@@ -330,6 +343,11 @@ class EvidenceSummary(BaseModel):
         0, description="Turn number when evidence was collected", title="Collected At Turn"
     )
     evidence_id: str = Field(..., description="Evidence identifier", title="Evidence Id")
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `collected_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     relevance_score: confloat(ge=0.0, le=1.0) = Field(
         ..., description="Relevance to current investigation (0.0-1.0)", title="Relevance Score"
     )
@@ -412,11 +430,6 @@ class ImpactData(BaseModel):
 
 
 class InquiryResponseData(BaseModel):
-    decided_to_investigate: bool | None = Field(
-        False,
-        description="Whether agent has enough info to start investigation",
-        title="Decided To Investigate",
-    )
     inquiry_turns: conint(ge=0) | None = Field(
         0, description="Number of conversation turns during inquiry phase", title="Inquiry Turns"
     )
@@ -439,6 +452,26 @@ class InvestigationStage(Enum):
     diagnosis = "diagnosis"
     mitigation = "mitigation"
     treatment = "treatment"
+
+
+class InvitationCreateRequest(BaseModel):
+    email: EmailStr = Field(..., title="Email")
+
+
+class InvitationResponse(BaseModel):
+    accepted_at: AwareDatetime | None = Field(None, title="Accepted At")
+    created_at: AwareDatetime = Field(..., title="Created At")
+    email: str = Field(..., title="Email")
+    enterprise_id: str = Field(..., title="Enterprise Id")
+    expires_at: AwareDatetime | None = Field(None, title="Expires At")
+    invitation_id: str = Field(..., title="Invitation Id")
+    invited_by: str | None = Field(None, title="Invited By")
+    invited_user_id: str | None = Field(None, title="Invited User Id")
+    revoked_at: AwareDatetime | None = Field(None, title="Revoked At")
+    revoked_by: str | None = Field(None, title="Revoked By")
+    status: str = Field(..., title="Status")
+    team_id: str = Field(..., title="Team Id")
+    team_name: str | None = Field(None, title="Team Name")
 
 
 class KnowledgeBaseDocument(BaseModel):
@@ -532,10 +565,56 @@ class LLMProviderDetail(BaseModel):
     selected_model: str | None = Field(
         None, description="Currently active model for this provider", title="Selected Model"
     )
+    selected_model_priced: bool | None = Field(
+        None,
+        description="Whether selected_model has a rate in the cost table. False means this provider's calls report $0 spend. None when no model is resolved yet (provider not initialized).",
+        title="Selected Model Priced",
+    )
     state: str | None = Field(
         "not_configured",
         description="Provider lifecycle state: not_configured, configured, or active",
         title="State",
+    )
+
+
+class LLMRoleRouting(BaseModel):
+    model: str = Field(
+        ...,
+        description="Model this role runs on; empty string when that provider has no model configured",
+        title="Model",
+    )
+    model_key: str = Field(
+        ...,
+        description="Environment key carrying the model decision, e.g. GEMINI_CLASSIFIER_MODEL or GEMINI_MODEL; empty when unset. A per-task key does not move when the provider's model is changed",
+        title="Model Key",
+    )
+    model_source: str = Field(
+        ...,
+        description="Where the model came from: 'env-default', 'admin-override', or 'unset' (no model configured for this provider)",
+        title="Model Source",
+    )
+    provider: str = Field(
+        ..., description="Provider this role's calls are routed to", title="Provider"
+    )
+    provider_initialized: bool = Field(
+        ...,
+        description="The named provider was built by the registry. False means its credential is missing, the routing is inert, and this role's calls fall back to fallback_chain",
+        title="Provider Initialized",
+    )
+    provider_key: str = Field(
+        ...,
+        description="Environment key carrying the provider decision, e.g. CLASSIFIER_PROVIDER",
+        title="Provider Key",
+    )
+    provider_source: str = Field(
+        ...,
+        description="Where the provider came from: 'env-default' (this role's own key is set), 'admin-override' (dashboard-written), or 'inherited' (no role key — follows CHAT_PROVIDER and moves with it)",
+        title="Provider Source",
+    )
+    role: str = Field(
+        ...,
+        description="Capability role: chat, multimodal, synthesis, classifier, code, da, knowledge, structured_output",
+        title="Role",
     )
 
 
@@ -581,6 +660,11 @@ class Message(BaseModel):
     created_at: str = Field(
         ..., description="ISO 8601 datetime string (matches SQL schema)", title="Created At"
     )
+    investigation_turn: int | None = Field(
+        None,
+        description='Which turn OF THE INVESTIGATION this row belongs to (#1387): the message clock at this row minus the out-of-band turns at or before it. `turn_number` is the message clock and advances on every exchange, asides included (small talk, trivia, questions about FaultMaven itself); this does not, so an aside carries the same value as the investigation turn before it. A client displaying "Turn N" against a conversation row should prefer this, and keep `turn_number` for anything that ADDRESSES a turn (anchors, `uploaded_at_turn` lookups) — those are message-clock references and re-basing them breaks jump-to-turn. On the newest row this equals `TurnResponse.investigation_turn`, which is the same quantity read at the case level. Null on a row that owns no turn — a `system` notice reporting a background job, stamped with whichever turn was open when the job finished — and on a server that predates the field.',
+        title="Investigation Turn",
+    )
     message_id: str = Field(..., title="Message Id")
     metadata: dict[str, Any] | None = Field(
         None, description="Sources, tools used, etc.", title="Metadata"
@@ -614,6 +698,8 @@ class OAuthConfigResponse(BaseModel):
     client_id: str = Field(..., title="Client Id")
     hosted_login_url: str | None = Field(None, title="Hosted Login Url")
     scopes: list[str] = Field(..., title="Scopes")
+    self_service_signup_enabled: bool | None = Field(False, title="Self Service Signup Enabled")
+    supports_screen_hint: bool | None = Field(False, title="Supports Screen Hint")
     token_url: str = Field(..., title="Token Url")
 
 
@@ -918,12 +1004,6 @@ class SessionResponse(BaseModel):
     user_id: str | None = Field(None, title="User Id")
 
 
-class SessionRestoreRequest(BaseModel):
-    include_data: bool | None = Field(True, title="Include Data")
-    restore_point: constr(min_length=1) = Field(..., title="Restore Point")
-    type: str | None = Field("full", title="Type")
-
-
 class SessionState(Enum):
     active = "active"
     paused = "paused"
@@ -964,7 +1044,21 @@ class SolutionVerificationData(BaseModel):
 class SourceFileReference(BaseModel):
     file_id: str = Field(..., title="File Id")
     filename: str = Field(..., title="Filename")
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `uploaded_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     uploaded_at_turn: int = Field(..., title="Uploaded At Turn")
+
+
+class SourceType(Enum):
+    knowledge_base = "knowledge_base"
+    log_file = "log_file"
+    web_search = "web_search"
+    documentation = "documentation"
+    previous_analysis = "previous_analysis"
+    user_provided = "user_provided"
 
 
 class SuggestedActionResponse(BaseModel):
@@ -975,6 +1069,18 @@ class SuggestedActionResponse(BaseModel):
     label: str = Field(..., title="Label")
     payload: str | None = Field(None, title="Payload")
     type: str = Field(..., title="Type")
+
+
+class TeamCreateRequest(BaseModel):
+    description: constr(max_length=2000) | None = Field(None, title="Description")
+    name: constr(min_length=1, max_length=200) = Field(..., title="Name")
+
+
+class TeamMemberResponse(BaseModel):
+    joined_at: AwareDatetime = Field(..., title="Joined At")
+    team_id: str = Field(..., title="Team Id")
+    team_role: str | None = Field(None, title="Team Role")
+    user_id: str = Field(..., title="User Id")
 
 
 class TeamResponse(BaseModel):
@@ -1042,37 +1148,6 @@ class TokenResponse(BaseModel):
     username: str = Field(..., description="Username", title="Username")
 
 
-class TurnResponse(BaseModel):
-    agent_response: str = Field(..., title="Agent Response")
-    attachments_processed: list[AttachmentResult] | None = Field(
-        None, title="Attachments Processed"
-    )
-    case_state: CaseState
-    cause_assurance: str | None = Field(
-        None,
-        description="Engine-derived assurance grade behind the case's identified cause (no_root | mechanistic | confirmed), recomputed from the causal graph. Present whenever the case has stated a root cause. Lets a narration-only client (e.g. Slack) show the #572/INV-28 read-time label beside the cause claim carried in agent_response, rather than presenting every conclusion at equal certainty.",
-        title="Cause Assurance",
-    )
-    cause_overclaim: bool | None = Field(
-        None,
-        description="True when the case's conclusion claims 'verified' certainty while the assurance grade is below 'confirmed' (conclusion_overclaims seam). None when no cause is stated.",
-        title="Cause Overclaim",
-    )
-    investigation_turn: int | None = Field(
-        None,
-        description="How many of the case's turns so far were investigation work. turn_number is the message clock and advances on every exchange; this excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation and recorded as such (#1329). Every message, aside or not, is charged against the tenant's daily turn cap. Clients that display a turn counter should prefer this.",
-        title="Investigation Turn",
-    )
-    milestones_completed: list[str] = Field(..., title="Milestones Completed")
-    progress_made: bool = Field(..., title="Progress Made")
-    progress_transparency: ProgressTransparencyInfo | None = Field(
-        None,
-        description="Progress transparency state. Present when investigation has stalled and agent is surfacing milestone dependencies.",
-    )
-    suggested_actions: list[SuggestedActionResponse] | None = Field(None, title="Suggested Actions")
-    turn_number: int = Field(..., title="Turn Number")
-
-
 class UploadedFileDetailsResponse(BaseModel):
     content_hash: str | None = Field(
         None, description="SHA-256 of file contents (storage-backend dedup)", title="Content Hash"
@@ -1084,6 +1159,11 @@ class UploadedFileDetailsResponse(BaseModel):
     evidence_count: conint(ge=0) = Field(..., title="Evidence Count")
     file_id: str = Field(..., title="File Id")
     filename: str = Field(..., title="Filename")
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `uploaded_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     size_bytes: int = Field(..., title="Size Bytes")
     size_display: str = Field(..., title="Size Display")
     summary: str | None = Field(
@@ -1106,6 +1186,11 @@ class UploadedFileMetadata(BaseModel):
     )
     file_id: str = Field(..., description="Evidence/File identifier", title="File Id")
     filename: str = Field(..., description="Original or generated filename", title="Filename")
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `uploaded_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     size_bytes: conint(ge=0) = Field(..., description="File size in bytes", title="Size Bytes")
     size_display: str = Field(
         ..., description="Human-readable size (e.g., '2.3 MB')", title="Size Display"
@@ -1222,6 +1307,7 @@ class AdminCaseMetadata(BaseModel):
     created_at: AwareDatetime = Field(..., title="Created At")
     current_turn: int = Field(..., title="Current Turn")
     enterprise_id: str = Field(..., title="Enterprise Id")
+    investigation_turn: int | None = Field(None, title="Investigation Turn")
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
     organization_id: str | None = Field(None, title="Organization Id")
@@ -1279,12 +1365,21 @@ class CaseDetail(BaseModel):
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
     current_stage: InvestigationStage | None
-    current_turn: int = Field(..., title="Current Turn")
+    current_turn: int = Field(
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
+    )
     description: str = Field(..., title="Description")
     enterprise_id: str = Field(..., title="Enterprise Id")
     escalated: bool = Field(..., title="Escalated")
     evidence_count: int = Field(..., title="Evidence Count")
     hypothesis_count: int = Field(..., title="Hypothesis Count")
+    investigation_turn: int | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` and `CaseUIResponse.investigation_turn` report. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
     milestones_completed: list[str] = Field(..., title="Milestones Completed")
@@ -1301,7 +1396,7 @@ class CaseDetail(BaseModel):
     user_id: str = Field(..., title="User Id")
     valid_next_states: list[str] | None = Field(
         None,
-        description="Allowed state transitions from current state for user-initiated changes",
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
 
@@ -1329,19 +1424,18 @@ class CaseMessagesResponse(BaseModel):
 
 class CaseSearchRequest(BaseModel):
     limit: conint(ge=1, le=100) | None = Field(20, description="Maximum results", title="Limit")
-    organization_id: str | None = Field(
-        None, description="Limit to organization's cases", title="Organization Id"
-    )
     query: constr(min_length=1, max_length=500) = Field(
         ..., description="Search query", title="Query"
     )
-    state: CaseState | None = Field(None, description="Filter by state")
+    state: CaseState | None = Field(
+        None,
+        description="Narrow the results to one lifecycle state. Applied in the same query as the text search, so it constrains what the `limit` returns rather than thinning an already-limited page.",
+    )
     team_id: str | None = Field(
         None,
         description="Filter to cases shared with this Team (ADR-013 §D4). Only Teams the caller belongs to yield results; ignored in standalone (no teams).",
         title="Team Id",
     )
-    user_id: str | None = Field(None, description="Limit to user's cases", title="User Id")
 
 
 class CaseSummary(BaseModel):
@@ -1349,9 +1443,18 @@ class CaseSummary(BaseModel):
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
-    current_turn: int = Field(..., title="Current Turn")
+    current_turn: int = Field(
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
+    )
     description: str = Field(..., title="Description")
     enterprise_id: str = Field(..., title="Enterprise Id")
+    investigation_turn: int | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` and `CaseUIResponse.investigation_turn` report. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     is_terminal: bool = Field(..., title="Is Terminal")
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
     organization_id: str | None = Field(None, title="Organization Id")
@@ -1366,7 +1469,7 @@ class CaseSummary(BaseModel):
     user_id: str = Field(..., title="User Id")
     valid_next_states: list[str] | None = Field(
         None,
-        description="Allowed state transitions from current state for user-initiated changes",
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
 
@@ -1375,14 +1478,21 @@ class CaseUIResponseInquiry(BaseModel):
     case_id: str = Field(..., description="Case identifier", title="Case Id")
     created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
     current_turn: conint(ge=0) = Field(
-        ..., description="Current turn counter", title="Current Turn"
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
     )
     disposition_eligibility: dict[str, str] | None = Field(
         None,
-        description="Per-disposition eligibility for UI affordance gating. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — disposition is appropriate; render the affordance enabled with the default 'click to confirm' UX.\n- ``needs_info`` — disposition is allowed but the case is partial; user must ADD information (root cause / solution) before transitioning. UX: prompt the user for the missing data. Currently only the Resolve side surfaces this.\n- ``suggests_alternative`` — disposition is allowed but the system recommends the OTHER disposition for this case. UX: warn and offer the alternative; if the user confirms anyway, proceed. Distinct from ``needs_info`` — no data is missing; the user is asked to RE-DIRECT, not to add. Currently only the Close side surfaces this (when the case has root cause + solution → resolving preserves attribution).\n- ``not_eligible`` — disposition is not available; hide the affordance entirely.\n\nDifferent from ``valid_next_states`` — that field is the structural action graph (which edges exist), this field is the content-readiness layer on top.",
+        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when a qualifying causal-absence row is on the case, which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
         title="Disposition Eligibility",
     )
     inquiry: InquiryResponseData = Field(..., description="Nested inquiry phase data")
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
     state: Literal["inquiry"] = Field(
         "inquiry", description="Always 'inquiry' for this response type", title="State"
     )
@@ -1393,7 +1503,7 @@ class CaseUIResponseInquiry(BaseModel):
     )
     valid_next_states: list[str] | None = Field(
         None,
-        description="Allowed state transitions from current state for user-initiated changes",
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
 
@@ -1402,12 +1512,19 @@ class CaseUIResponseResolved(BaseModel):
     case_id: str = Field(..., description="Case identifier", title="Case Id")
     created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
     current_turn: conint(ge=0) = Field(
-        ..., description="Current turn counter", title="Current Turn"
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
     )
     disposition_eligibility: dict[str, str] | None = Field(
         None,
-        description="Per-disposition eligibility for UI affordance gating. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — disposition is appropriate; render the affordance enabled with the default 'click to confirm' UX.\n- ``needs_info`` — disposition is allowed but the case is partial; user must ADD information (root cause / solution) before transitioning. UX: prompt the user for the missing data. Currently only the Resolve side surfaces this.\n- ``suggests_alternative`` — disposition is allowed but the system recommends the OTHER disposition for this case. UX: warn and offer the alternative; if the user confirms anyway, proceed. Distinct from ``needs_info`` — no data is missing; the user is asked to RE-DIRECT, not to add. Currently only the Close side surfaces this (when the case has root cause + solution → resolving preserves attribution).\n- ``not_eligible`` — disposition is not available; hide the affordance entirely.\n\nDifferent from ``valid_next_states`` — that field is the structural action graph (which edges exist), this field is the content-readiness layer on top.",
+        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when a qualifying causal-absence row is on the case, which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
         title="Disposition Eligibility",
+    )
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
     )
     problem_statement: constr(max_length=1000) | None = Field(
         None,
@@ -1439,7 +1556,7 @@ class CaseUIResponseResolved(BaseModel):
     )
     valid_next_states: list[str] | None = Field(
         None,
-        description="Allowed state transitions from current state for user-initiated changes",
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
     verification_status: SolutionVerificationData = Field(
@@ -1486,6 +1603,11 @@ class EvidenceDetailsResponse(BaseModel):
         None,
         description="Optional verbatim quote backing the summary. NULL when the LLM omitted it (the summary is self-contained).",
         title="Extract",
+    )
+    investigation_turn: int | None = Field(
+        None,
+        description="Which turn OF THE INVESTIGATION this row sits on (#1387/#1391): the message clock at that turn minus the out-of-band turns at or before it. An aside does not advance it. `collected_at_turn` keeps its meaning as the message clock and is what anchors and jump-to-turn are keyed on, so ADDRESS a turn with that and DISPLAY this one. Null when the server predates the field.",
+        title="Investigation Turn",
     )
     primary_purpose: str = Field(..., title="Primary Purpose")
     related_hypotheses: list[RelatedHypothesis] | None = Field(None, title="Related Hypotheses")
@@ -1563,6 +1685,11 @@ class LLMConfigResponse(BaseModel):
     fallback_chain: list[str] = Field(..., title="Fallback Chain")
     primary_provider: str = Field(..., title="Primary Provider")
     providers: dict[str, LLMProviderDetail] = Field(..., title="Providers")
+    role_routing: list[LLMRoleRouting] | None = Field(
+        None,
+        description="Resolved (provider, model) per capability role, with provenance. Read-only: role routing is set in the environment and is not in the dashboard's override allowlist.",
+        title="Role Routing",
+    )
     strict_mode: bool = Field(..., title="Strict Mode")
     timestamp: AwareDatetime = Field(..., title="Timestamp")
 
@@ -1627,6 +1754,51 @@ class RunbookMetadata(BaseModel):
     )
     source: RunbookSource = Field(..., description="Origin of runbook")
     tags: list[str] | None = Field(None, description="Classification tags", title="Tags")
+
+
+class Source(BaseModel):
+    confidence: float | None = Field(None, title="Confidence")
+    content: str = Field(..., title="Content")
+    metadata: dict[str, Any] | None = Field(None, title="Metadata")
+    type: SourceType
+    verification_reason: str | None = Field(None, title="Verification Reason")
+    verification_status: VerificationStatus | None = Field(None, title="Verification Status")
+
+
+class TurnResponse(BaseModel):
+    agent_response: str = Field(..., title="Agent Response")
+    attachments_processed: list[AttachmentResult] | None = Field(
+        None, title="Attachments Processed"
+    )
+    case_state: CaseState
+    cause_assurance: str | None = Field(
+        None,
+        description="Engine-derived assurance grade behind the case's identified cause (no_root | mechanistic | confirmed), recomputed from the causal graph. Present whenever the case has stated a root cause. Lets a narration-only client (e.g. Slack) show the #572/INV-28 read-time label beside the cause claim carried in agent_response, rather than presenting every conclusion at equal certainty.",
+        title="Cause Assurance",
+    )
+    cause_overclaim: bool | None = Field(
+        None,
+        description="True when the case's conclusion claims 'verified' certainty while the assurance grade is below 'confirmed' (conclusion_overclaims seam). None when no cause is stated.",
+        title="Cause Overclaim",
+    )
+    investigation_turn: int | None = Field(
+        None,
+        description="How many of the case's turns so far were investigation work. turn_number is the message clock and advances on every exchange; this excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation and recorded as such (#1329). Every message, aside or not, is charged against the tenant's daily turn cap. Clients that display a turn counter should prefer this.",
+        title="Investigation Turn",
+    )
+    milestones_completed: list[str] = Field(..., title="Milestones Completed")
+    progress_made: bool = Field(..., title="Progress Made")
+    progress_transparency: ProgressTransparencyInfo | None = Field(
+        None,
+        description="Progress transparency state. Present when investigation has stalled and agent is surfacing milestone dependencies.",
+    )
+    sources: list[Source] | None = Field(
+        None,
+        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED). Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary.",
+        title="Sources",
+    )
+    suggested_actions: list[SuggestedActionResponse] | None = Field(None, title="Suggested Actions")
+    turn_number: int = Field(..., title="Turn Number")
 
 
 class AdminCaseContentResponse(BaseModel):
@@ -1716,12 +1888,19 @@ class CaseUIResponseInvestigating(BaseModel):
     case_id: str = Field(..., description="Case identifier", title="Case Id")
     created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
     current_turn: conint(ge=0) = Field(
-        ..., description="Current turn counter", title="Current Turn"
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
     )
     disposition_eligibility: dict[str, str] | None = Field(
         None,
-        description="Per-disposition eligibility for UI affordance gating. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — disposition is appropriate; render the affordance enabled with the default 'click to confirm' UX.\n- ``needs_info`` — disposition is allowed but the case is partial; user must ADD information (root cause / solution) before transitioning. UX: prompt the user for the missing data. Currently only the Resolve side surfaces this.\n- ``suggests_alternative`` — disposition is allowed but the system recommends the OTHER disposition for this case. UX: warn and offer the alternative; if the user confirms anyway, proceed. Distinct from ``needs_info`` — no data is missing; the user is asked to RE-DIRECT, not to add. Currently only the Close side surfaces this (when the case has root cause + solution → resolving preserves attribution).\n- ``not_eligible`` — disposition is not available; hide the affordance entirely.\n\nDifferent from ``valid_next_states`` — that field is the structural action graph (which edges exist), this field is the content-readiness layer on top.",
+        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when a qualifying causal-absence row is on the case, which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
         title="Disposition Eligibility",
+    )
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
     )
     latest_evidence: list[EvidenceSummary] | None = Field(
         None, description="Most recent evidence collected (last 5)", title="Latest Evidence"
@@ -1754,7 +1933,7 @@ class CaseUIResponseInvestigating(BaseModel):
     )
     valid_next_states: list[str] | None = Field(
         None,
-        description="Allowed state transitions from current state for user-initiated changes",
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
     working_conclusion: WorkingConclusionSummary | None = Field(

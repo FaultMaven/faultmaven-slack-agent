@@ -228,7 +228,9 @@ def test_intent_bearing_decide_button_still_carries_intent():
         suggested_actions=[{
             "type": "DECIDE", "label": "Yes, mark resolved",
             "payload": "Mark this case resolved.",
-            "intent": {"type": "status_transition", "to_state": "resolved"},
+            # See tests/test_actions.py: a resolve pair is a `confirmation`
+            # intent from 9.0.0 on; `status_transition` carries only `closed`.
+            "intent": {"type": "status_transition", "to_state": "closed"},
         }],
     )
     buttons = _buttons(build_turn_blocks(result))
@@ -236,7 +238,7 @@ def test_intent_bearing_decide_button_still_carries_intent():
     value = json.loads(buttons[0]["value"])
     assert value["q"] == "Mark this case resolved."
     assert value["it"] == "status_transition"
-    assert value["id"]["to_state"] == "resolved"
+    assert value["id"]["to_state"] == "closed"
     assert value["id"]["user_confirmed"] is True
 
 
