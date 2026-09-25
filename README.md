@@ -22,16 +22,19 @@ up.
 
 **How a workspace is bound.** Each workspace is answered as its own FaultMaven
 service account (`slack-<team id>`), anchored to one enterprise — the isolation
-boundary — once it is *bound* by the install-time flow (a Workspace Owner or
-Admin authorizes on the FaultMaven dashboard; `binding.py`). `GET
-/slack/install` is served whenever the HTTP transport runs (`web.py`), so what
-happens to a workspace that installs *without* being bound is decided by
-**`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`**: at its default, `false`, the workspace
-is answered on the process-wide default account and its cases are filed in
-whatever enterprise that account acts for; at `true` it is refused instead. Set
-it to `true` on any multi-tenant backend, where the default account acts for
-one particular enterprise. Operators deploying this against Cloud should treat
-that as required, not optional. See [docs/design.md](docs/design.md) §10.1a.
+boundary — once it is *bound* by the install-time flow: a Workspace Owner or
+Admin authorizes on the FaultMaven dashboard (`binding.py`). `GET
+/slack/install` is served whenever the HTTP transport runs (`web.py`), but the
+install-time bind itself only runs when **both** `FAULTMAVEN_DASHBOARD_URL` and
+`FAULTMAVEN_OAUTH_REDIRECT_URI` are set (`config.install_binding_enabled`) —
+otherwise a workspace can only be bound by an operator, out of band. What
+happens to a workspace that installs without being bound is decided by
+`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`: at its default, `false`, it's answered
+on the process-wide default account; at `true`, it's refused instead — so with
+binding not enabled and this set to `true`, every workspace an operator hasn't
+bound by hand is refused on every turn. See the "Multi-workspace (hosted)
+deployments" paragraph under [Run locally](#run-locally) below for the
+operator guidance, and [docs/design.md](docs/design.md) §10.1 / §10.1a.
 
 **Slack Marketplace listing.** The listing's landing page, privacy policy and
 support URLs, and the `app_directory` block of `manifest.json` that declares
@@ -120,7 +123,7 @@ fallback used by workspaces that have not been bound yet. Set
 **`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`** against a multi-tenant backend to
 refuse an unbound workspace instead: the fallback account acts for one particular
 enterprise, so answering on it would file another customer's incident inside that
-tenant. See [docs/design.md](docs/design.md) §10.1.
+tenant. See [docs/design.md](docs/design.md) §10.1 / §10.1a.
 
 **Testing in a real workspace?** Follow the step-by-step runbook in
 [docs/LIVE_TEST.md](docs/LIVE_TEST.md) — install from the manifest, run preflight,
@@ -158,8 +161,10 @@ transport), and **install-time workspace→team binding** to a per-workspace
 service account (see [Getting it](#getting-it)). A **preflight doctor**
 (`scripts/preflight.py`) verifies the wiring before a live test.
 
-**Not yet:** per-user FaultMaven account linking (every turn authenticates as a
-service account), a token-streaming reasoning timeline, and
+**Not yet:** per-user FaultMaven account linking (every turn authenticates as
+the workspace's bound service account, or the deployment's default principal
+when it isn't bound — never as the individual Slack user), a
+token-streaming reasoning timeline, and
 terminal-state reports — see the roadmap in [docs/design.md](docs/design.md) §16.
 
 ## Privacy

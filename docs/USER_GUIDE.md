@@ -15,16 +15,19 @@ backend contract, see [design.md](design.md); for self-hosting the server, see
 
 ## 1. Install
 
-**FaultMaven's hosted app:** ask in the [FaultMaven Community
-Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
-and we'll add it to your workspace. There's no API key to paste and nothing to
-configure on your end; permissions are least-privilege (see
-[§6](#6-permissions--why)).
+**FaultMaven's hosted app:** ask in the FaultMaven Community Slack — see
+[README.md § Getting it](README.md#getting-it) for the invite — and a
+Workspace Owner or Admin can connect your workspace. That's two steps: they
+install the Slack app itself, reviewing the requested permissions (see
+[§6](#6-permissions--why)) and clicking **Allow**; then they sign in on the
+FaultMaven dashboard to complete the binding. See [README.md § Getting
+it](README.md#getting-it) ("How a workspace is bound") for exactly what that
+involves.
 
-**Running your own deployment?** If you're self-hosting this agent against
-your own FaultMaven backend, you install it into a workspace yourself over
-standard Slack OAuth — see [HOSTING.md](HOSTING.md) for the `/slack/install`
-flow.
+**Running your own deployment?** [HOSTING.md](HOSTING.md) documents how
+FaultMaven's own hosted Slack app is deployed and operated. Adapt its hosts and
+URLs to your own deployment — your install flow is served at
+`https://<your host>/slack/install`.
 
 **Invite it to a channel.** Like any Slack app, FaultMaven can only post in
 channels it belongs to. In any channel you'll use it in, run:
@@ -119,10 +122,11 @@ next time this happens, the investigation starts from what this one learned.
 - **Deep artifacts live in the Dashboard.** Full reports, the knowledge base,
   and case browsing are on the FaultMaven Dashboard; Slack owns the in-flow
   investigation and links out for the rest.
-- **Workspace identity.** Investigations run as a FaultMaven service account,
-  not as your personal FaultMaven account (per-user account
-  linking is on the roadmap). See [HOSTING.md](HOSTING.md) for how a workspace
-  is bound to it.
+- **Workspace identity.** Investigations run as the workspace's bound service
+  account, or the deployment's default principal if the workspace isn't bound
+  — never as your personal FaultMaven account (per-user account linking is on
+  the roadmap). See [README.md § Getting it](README.md#getting-it) ("How a
+  workspace is bound") for how that's decided.
 
 ---
 

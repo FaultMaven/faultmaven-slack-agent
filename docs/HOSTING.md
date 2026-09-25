@@ -7,12 +7,14 @@ local-dev path against a **separate** dev app; it can never satisfy the *Agents
 for Organizations* track, which needs a live public server + Marketplace
 distribution.)
 
-> **This is the operator's doc.** If you just want FaultMaven's hosted app in
-> your workspace, don't follow this — ask in the [FaultMaven Community
-> Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
-> and we'll add it. This page is for whoever is standing up and running their
-> own deployment of this agent, including the `/slack/install` OAuth flow it
-> exposes for that deployment's workspaces.
+> **This documents FaultMaven's own hosted Slack app** — how
+> `slack.faultmaven.ai` is deployed and operated against `api.faultmaven.ai`
+> via `faultmaven-enterprise-infra`, and how its Slack Marketplace listing is
+> maintained. If you just want FaultMaven's hosted app in your workspace, don't
+> follow this — see [README.md § Getting it](README.md#getting-it) and ask in
+> the community workspace instead. Standing up your own deployment of this
+> agent? Adapt the hosts, URLs, and infra references below to your own — your
+> install flow is served at `https://<your host>/slack/install`.
 
 Public host: **`https://slack.faultmaven.ai`** → serves `/slack/events`,
 `/slack/install`, `/slack/oauth_redirect`, `/health`.
@@ -206,6 +208,14 @@ rejected. All three are served by `faultmaven-website` (Vercel, deploys from
 The listing uses the **apex** host (`faultmaven.ai`), which 301s to `www` — all
 three resolve 200. The site canonicalises to `www`, so leave the manifest on the
 apex form to match what is set rather than "fixing" it into a mismatch.
+
+**The installation landing page does not currently offer an install path.**
+`manifest.json`'s `app_directory.installation_landing_page` is
+`https://faultmaven.ai/slack`, and that page (`src/app/slack/page.tsx` in
+`faultmaven-website`) offers the community workspace invite, not an install
+link. A listing resubmission needs one of the two changed: either the page
+adds an install path, or `installation_landing_page` points at a page that has
+one.
 
 These pages must be live **before** the listing is submitted — Slack fetches
 each URL during review.
