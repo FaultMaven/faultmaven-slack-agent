@@ -7,6 +7,13 @@ local-dev path against a **separate** dev app; it can never satisfy the *Agents
 for Organizations* track, which needs a live public server + Marketplace
 distribution.)
 
+> **This is the operator's doc.** If you just want FaultMaven's hosted app in
+> your workspace, don't follow this — ask in the [FaultMaven Community
+> Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
+> and we'll add it. This page is for whoever is standing up and running their
+> own deployment of this agent, including the `/slack/install` OAuth flow it
+> exposes for that deployment's workspaces.
+
 Public host: **`https://slack.faultmaven.ai`** → serves `/slack/events`,
 `/slack/install`, `/slack/oauth_redirect`, `/health`.
 Backend: the cluster FM API at **`https://api.faultmaven.ai`**.

@@ -15,15 +15,16 @@ backend contract, see [design.md](design.md); for self-hosting the server, see
 
 ## 1. Install
 
-FaultMaven installs into your workspace over standard Slack OAuth — one click,
-no configuration.
+**FaultMaven's hosted app:** ask in the [FaultMaven Community
+Slack](https://join.slack.com/t/faultmaven-community/shared_invite/zt-493fv3w3o-mPBBI2v3mMYQKS4649mY1A)
+and we'll add it to your workspace. There's no API key to paste and nothing to
+configure on your end; permissions are least-privilege (see
+[§6](#6-permissions--why)).
 
-1. Go to **`https://slack.faultmaven.ai/slack/install`** (or find **FaultMaven**
-   in the Slack App Directory) and click **Add to Slack**.
-2. Pick your workspace and review the permissions (they're least-privilege —
-   see [§6](#6-permissions--why)). Click **Allow**.
-3. You're returned to Slack with FaultMaven installed. That's it — there is no
-   API key to paste and nothing to configure.
+**Running your own deployment?** If you're self-hosting this agent against
+your own FaultMaven backend, you install it into a workspace yourself over
+standard Slack OAuth — see [HOSTING.md](HOSTING.md) for the `/slack/install`
+flow.
 
 **Invite it to a channel.** Like any Slack app, FaultMaven can only post in
 channels it belongs to. In any channel you'll use it in, run:
