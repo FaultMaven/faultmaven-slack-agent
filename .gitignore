@@ -31,3 +31,6 @@ htmlcov/
 .idea/
 .vscode/
 docs/demo-assets/
+
+# Claude Code worktrees
+.claude/worktrees/
