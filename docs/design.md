@@ -48,7 +48,7 @@ not exist.** The real contract is: **create a case**
 
 | State | Surfaces / features |
 |---|---|
-| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · **graceful replies when a case is missing or concluded** (§6.4, §6.4a) · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport · **install-time workspace→Team binding** (§10.1a) — a per-workspace service account (`slack-<team id>`) holding a rotating refresh credential, stored beside its installation (`binding.py`, `pending_binds.py`, `workspace_credentials.py`). During the beta a workspace is bound by hand rather than through an advertised self-serve install, so the live deployment still runs on one interim shared account. |
+| **Built** | Assistant side panel (§4.1) · `@mention` + **auto-continue** (§4.2, §5.2) · **Ask** message shortcut (§4.3) · file-evidence ingestion (§5.4) · **one-turn-per-thread drop-if-busy** with ⏭️ + replier `@mention` (§5.3) · suggested-action buttons (§9.2) · thread→case map · **graceful replies when a case is missing or concluded** (§6.4, §6.4a) · preflight doctor · **HTTP/Events transport + multi-workspace OAuth** with a Postgres `InstallationStore`/`OAuthStateStore` (§10.1) — `SLACK_TRANSPORT=http`, hosted per `docs/HOSTING.md`; Socket Mode remains the local-dev transport · **install-time workspace→Team binding** (§10.1a) — a per-workspace service account (`slack-<team id>`) holding a rotating refresh credential, stored beside its installation (`binding.py`, `pending_binds.py`, `workspace_credentials.py`). A workspace that is not bound falls back to the process-wide default account, or is refused under `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`. |
 | **Designed, not yet built** | per-user FaultMaven account linking (§10.2) — every turn runs as the workspace's service account · token-streaming reasoning timeline (§9.1 v2) · terminal-state reports (§8.2) · case-lifecycle drivers — offer-to-close / auto-close-on-inactivity (§6.2). |
 | **Cut (dashboard-duplicative)** | slash commands and an App-Home *case list* (see §4.4, §4.5). Managing/browsing cases, KB, and full reports live on the **Dashboard**; Slack owns the *in-flow* investigation and deep-links out for the rest (§1 non-goals). |
 
@@ -844,7 +844,7 @@ read a case, so the agent neither requires one at install nor reads the
 > (find-or-create inside it) → the `slack` **service account**, anchored to that
 > same enterprise → its **Team** membership, which is what makes
 > `_auto_share_slack_case` resolve to anything at all. **No organization step**:
-> an organization is a billing fact, absent for every beta account, and
+> an organization is a billing fact that an account need not have, and
 > requiring one was the dead end ADR-017 D6 removes.
 
 **What the service account is.** `users.account_kind='service'` with
@@ -887,7 +887,7 @@ consequences the agent is built around:
    tenant.
 
 The `organization_id` claim, when a token carries one, is read for nothing: it
-is billing context (ADR-017 D2), it is absent for every beta account, and
+is billing context (ADR-017 D2), an account need not have one at all, and
 treating it as a tenant is exactly the confusion this design no longer has.
 
 **An unbound workspace is refused, not absorbed.** With

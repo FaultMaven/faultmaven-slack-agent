@@ -7,6 +7,15 @@ local-dev path against a **separate** dev app; it can never satisfy the *Agents
 for Organizations* track, which needs a live public server + Marketplace
 distribution.)
 
+> **This documents FaultMaven's own hosted Slack app** — how
+> `slack.faultmaven.ai` is deployed and operated against `api.faultmaven.ai`
+> via `faultmaven-enterprise-infra`, and how its Slack Marketplace listing is
+> maintained. If you just want FaultMaven's hosted app in your workspace, don't
+> follow this — see [README.md § Getting it](README.md#getting-it) and ask in
+> the community workspace instead. Standing up your own deployment of this
+> agent? Adapt the hosts, URLs, and infra references below to your own — your
+> install flow is served at `https://<your host>/slack/install`.
+
 Public host: **`https://slack.faultmaven.ai`** → serves `/slack/events`,
 `/slack/install`, `/slack/oauth_redirect`, `/health`.
 Backend: the cluster FM API at **`https://api.faultmaven.ai`**.
@@ -106,13 +115,17 @@ kubectl exec -it deploy/faultmaven-api -- \
     fm-provision-service-account -u slack-agent -o <enterprise-id> --token-only
 ```
 
-`slack-agent` is the **interim shared account** — the one process-wide principal
-that every *unbound* workspace falls back to, and the only account the live beta
-deployment uses. It is not the design. The per-workspace form is
-`slack-<team id>`, minted by the install-time bind rather than by this command,
-and it is what a multi-tenant deployment runs on;
-`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the shared account
-entirely (see *Deferred* below).
+`slack-agent` is the **process-wide default account** — the one principal that
+every *unbound* workspace falls back to. The per-workspace form is
+`slack-<team id>`, minted by the install-time bind (design.md §10.1a) rather than
+by this command, and it is what a multi-tenant deployment runs on. Provisioned
+this way, the default account is a service account with a rotating credential,
+not a static token, anchored to a single **enterprise** — so against a
+multi-tenant backend an unbound workspace answered on it has its cases filed in
+that enterprise.
+`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the default account
+entirely, refusing an unbound workspace instead; set it on any multi-tenant
+backend.
 
 `fm-provision-service-account` is a console entrypoint shipped with the
 installed package. Invoking the source file by path (`python
@@ -156,7 +169,7 @@ authenticate through WorkOS/PKCE.
 The Postgres OAuth store is replica-safe, but the **thread→case map** and the
 **in-process drop-if-busy gate + event dedup** are per-process. The infra
 Deployment must pin **one replica** (`strategy: Recreate`) until the case store is
-externalized. Horizontal scale is a follow-up, not required for the beta.
+externalized. Horizontal scale is a follow-up.
 
 ## Deploy sequence (executed from the infra repo)
 
@@ -195,6 +208,14 @@ rejected. All three are served by `faultmaven-website` (Vercel, deploys from
 The listing uses the **apex** host (`faultmaven.ai`), which 301s to `www` — all
 three resolve 200. The site canonicalises to `www`, so leave the manifest on the
 apex form to match what is set rather than "fixing" it into a mismatch.
+
+**The installation landing page does not currently offer an install path.**
+`manifest.json`'s `app_directory.installation_landing_page` is
+`https://faultmaven.ai/slack`, and that page (`src/app/slack/page.tsx` in
+`faultmaven-website`) offers the community workspace invite, not an install
+link. A listing resubmission needs one of the two changed: either the page
+adds an install path, or `installation_landing_page` points at a page that has
+one.
 
 These pages must be live **before** the listing is submitted — Slack fetches
 each URL during review.
@@ -263,13 +284,6 @@ config and `--diff` pushed, so there was no safe way to compare — the
   (`POST /api/v1/admin/integrations/slack/workspaces`), and the install-time flow
   lives in `binding.py` / `pending_binds.py` / `workspace_credentials.py`
   (design.md §10.1a).
-- **Self-service binding at install.** The flow works, but during the beta a
-  workspace is bound by hand rather than through an advertised install link, so
-  the live deployment still answers every workspace on the one interim shared
-  account described above — a service account with a rotating credential, not a
-  static token, anchored to a single **enterprise**. Set
-  `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` on a multi-tenant backend so an
-  unbound workspace is refused rather than filed in the wrong tenant.
 - **Multi-replica / HA** — gated on externalizing the case store.
 
 ## Local development (Socket Mode)

@@ -18,7 +18,7 @@ consequence of that, and is pinned here:
 * a token minted for the wrong enterprise — or for none — is refused, because a
   credential can be valid and still belong to somebody else;
 * the ``organization_id`` claim decides nothing and is read for nothing: under
-  ADR-017 D2 it is billing context, and it is absent for every beta account.
+  ADR-017 D2 it is billing context, and an account need not have one at all.
 
 **Two enterprises, one word.** ``enterprise_id`` here is Slack's Enterprise Grid
 id; the FaultMaven tenant is always ``fm_enterprise_id``.
@@ -58,7 +58,7 @@ def jwt_with_enterprise(
     ``enterprise`` is the ISOLATION claim — ``None`` leaves it out, which is what
     a backend speaking JWT but naming no tenant looks like. ``organization`` is
     the BILLING claim beside it, present only so a test can prove the client
-    ignores it; it is absent from a real token for every beta account.
+    ignores it; a real token for an account with no organization omits it.
     """
 
     def seg(data: dict) -> str:
@@ -243,7 +243,7 @@ def test_a_rotation_is_persisted_against_the_workspace_not_the_default(tmp_path)
 
 # -- the unbound workspace ----------------------------------------------------
 def test_an_unbound_workspace_falls_back_when_binding_is_not_required(tmp_path):
-    """The interim posture for a deployment still running one shared account."""
+    """An unbound workspace falls back to the default account while the flag is off."""
     store = make_store(tmp_path)
     client = make_client(
         lambda r: token_response(), workspaces=store, refresh_token="default-rt"

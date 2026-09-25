@@ -15,15 +15,19 @@ backend contract, see [design.md](design.md); for self-hosting the server, see
 
 ## 1. Install
 
-FaultMaven installs into your workspace over standard Slack OAuth — one click,
-no configuration.
+**FaultMaven's hosted app:** ask in the FaultMaven Community Slack — see
+[README.md § Getting it](README.md#getting-it) for the invite — and a
+Workspace Owner or Admin can connect your workspace. That's two steps: they
+install the Slack app itself, reviewing the requested permissions (see
+[§6](#6-permissions--why)) and clicking **Allow**; then they sign in on the
+FaultMaven dashboard to complete the binding. See [README.md § Getting
+it](README.md#getting-it) ("How a workspace is bound") for exactly what that
+involves.
 
-1. Go to **`https://slack.faultmaven.ai/slack/install`** (or find **FaultMaven**
-   in the Slack App Directory) and click **Add to Slack**.
-2. Pick your workspace and review the permissions (they're least-privilege —
-   see [§6](#6-permissions--why)). Click **Allow**.
-3. You're returned to Slack with FaultMaven installed. That's it — there is no
-   API key to paste and nothing to configure for the beta.
+**Running your own deployment?** [HOSTING.md](HOSTING.md) documents how
+FaultMaven's own hosted Slack app is deployed and operated. Adapt its hosts and
+URLs to your own deployment — your install flow is served at
+`https://<your host>/slack/install`.
 
 **Invite it to a channel.** Like any Slack app, FaultMaven can only post in
 channels it belongs to. In any channel you'll use it in, run:
@@ -109,7 +113,7 @@ next time this happens, the investigation starts from what this one learned.
 
 ---
 
-## 5. Tips & limits (beta)
+## 5. Tips & limits
 
 - **Seed it with real signal.** The richer the first message or attachment (the
   actual error, the alert payload, the config), the faster it converges.
@@ -118,10 +122,11 @@ next time this happens, the investigation starts from what this one learned.
 - **Deep artifacts live in the Dashboard.** Full reports, the knowledge base,
   and case browsing are on the FaultMaven Dashboard; Slack owns the in-flow
   investigation and links out for the rest.
-- **Beta identity.** During the beta, investigations across all workspaces run
-  under a single FaultMaven service identity (per-user account linking is on the
-  roadmap). Cases are not fabricated into separate tenants — see
-  [HOSTING.md](HOSTING.md) for the honest scope.
+- **Workspace identity.** Investigations run as the workspace's bound service
+  account, or the deployment's default principal if the workspace isn't bound
+  — never as your personal FaultMaven account (per-user account linking is on
+  the roadmap). See [README.md § Getting it](README.md#getting-it) ("How a
+  workspace is bound") for how that's decided.
 
 ---
 
