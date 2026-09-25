@@ -152,10 +152,9 @@ class Settings(BaseSettings):
     # MUST be true against a multi-tenant (cloud) backend. There, the default
     # account acts for some *particular* enterprise — the isolation boundary —
     # so answering an unbound workspace does not degrade: it files that
-    # customer's incident inside another tenant. Off by default only so a
-    # deployment running today's single shared service account keeps working
-    # until its workspaces are bound; each fallback logs a warning naming the
-    # workspace.
+    # customer's incident inside another tenant. Off by default so a deployment
+    # that has not yet bound its workspaces keeps working; each fallback logs a
+    # warning naming the workspace.
     faultmaven_require_workspace_binding: bool = Field(
         default=False,
         validation_alias="FAULTMAVEN_REQUIRE_WORKSPACE_BINDING",

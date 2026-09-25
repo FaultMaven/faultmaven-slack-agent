@@ -109,10 +109,11 @@ kubectl exec -it deploy/faultmaven-api -- \
 `slack-agent` is the **process-wide default account** — the one principal that
 every *unbound* workspace falls back to. The per-workspace form is
 `slack-<team id>`, minted by the install-time bind (design.md §10.1a) rather than
-by this command, and it is what a multi-tenant deployment runs on. The default
-account is a service account with a rotating credential, not a static token,
-anchored to a single **enterprise** — so against a multi-tenant backend an
-unbound workspace answered on it has its cases filed in that enterprise.
+by this command, and it is what a multi-tenant deployment runs on. Provisioned
+this way, the default account is a service account with a rotating credential,
+not a static token, anchored to a single **enterprise** — so against a
+multi-tenant backend an unbound workspace answered on it has its cases filed in
+that enterprise.
 `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the default account
 entirely, refusing an unbound workspace instead; set it on any multi-tenant
 backend.

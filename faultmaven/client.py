@@ -97,7 +97,7 @@ def _enterprise_claim(token: str) -> str:
     every caller reads "this token names no tenant" from one place rather than
     inventing its own idea of an absent claim. Deliberately the isolation claim
     and not the billing one: under ADR-017 the organization claim is context,
-    optional, and absent for every beta account — reading it as a tenant is the
+    optional, and an account need not have one — reading it as a tenant is the
     mistake this rename exists to make impossible.
     """
 

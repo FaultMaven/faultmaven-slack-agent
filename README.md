@@ -22,17 +22,16 @@ up.
 
 **How a workspace is bound.** Each workspace is answered as its own FaultMaven
 service account (`slack-<team id>`), anchored to one enterprise — the isolation
-boundary — once it is *bound*: by the install-time flow (a Workspace Owner or
-Admin authorizes on the FaultMaven dashboard; `binding.py`) or by an operator
-writing the credential directly (`workspace_credentials.py`). `GET
+boundary — once it is *bound* by the install-time flow (a Workspace Owner or
+Admin authorizes on the FaultMaven dashboard; `binding.py`). `GET
 /slack/install` is served whenever the HTTP transport runs (`web.py`), so what
 happens to a workspace that installs *without* being bound is decided by
 **`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`**: at its default, `false`, the workspace
 is answered on the process-wide default account and its cases are filed in
 whatever enterprise that account acts for; at `true` it is refused instead. Set
 it to `true` on any multi-tenant backend, where the default account acts for
-one particular enterprise. Operators deploying this against Cloud should treat that as
-required, not optional. See [docs/design.md](docs/design.md) §10.1a.
+one particular enterprise. Operators deploying this against Cloud should treat
+that as required, not optional. See [docs/design.md](docs/design.md) §10.1a.
 
 **Slack Marketplace listing.** The listing's landing page, privacy policy and
 support URLs, and the `app_directory` block of `manifest.json` that declares
@@ -159,8 +158,8 @@ transport), and **install-time workspace→team binding** to a per-workspace
 service account (see [Getting it](#getting-it)). A **preflight doctor**
 (`scripts/preflight.py`) verifies the wiring before a live test.
 
-**Not yet:** per-user FaultMaven account linking (every turn authenticates as the
-workspace's service account), a token-streaming reasoning timeline, and
+**Not yet:** per-user FaultMaven account linking (every turn authenticates as a
+service account), a token-streaming reasoning timeline, and
 terminal-state reports — see the roadmap in [docs/design.md](docs/design.md) §16.
 
 ## Privacy
