@@ -23,7 +23,7 @@ no configuration.
 2. Pick your workspace and review the permissions (they're least-privilege —
    see [§6](#6-permissions--why)). Click **Allow**.
 3. You're returned to Slack with FaultMaven installed. That's it — there is no
-   API key to paste and nothing to configure for the beta.
+   API key to paste and nothing to configure.
 
 **Invite it to a channel.** Like any Slack app, FaultMaven can only post in
 channels it belongs to. In any channel you'll use it in, run:
@@ -109,7 +109,7 @@ next time this happens, the investigation starts from what this one learned.
 
 ---
 
-## 5. Tips & limits (beta)
+## 5. Tips & limits
 
 - **Seed it with real signal.** The richer the first message or attachment (the
   actual error, the alert payload, the config), the faster it converges.
@@ -118,10 +118,10 @@ next time this happens, the investigation starts from what this one learned.
 - **Deep artifacts live in the Dashboard.** Full reports, the knowledge base,
   and case browsing are on the FaultMaven Dashboard; Slack owns the in-flow
   investigation and links out for the rest.
-- **Beta identity.** During the beta, investigations across all workspaces run
-  under a single FaultMaven service identity (per-user account linking is on the
-  roadmap). Cases are not fabricated into separate tenants — see
-  [HOSTING.md](HOSTING.md) for the honest scope.
+- **Workspace identity.** Investigations run as a FaultMaven service account,
+  not as your personal FaultMaven account (per-user account
+  linking is on the roadmap). See [HOSTING.md](HOSTING.md) for how a workspace
+  is bound to it.
 
 ---
 

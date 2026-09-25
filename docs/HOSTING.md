@@ -106,13 +106,16 @@ kubectl exec -it deploy/faultmaven-api -- \
     fm-provision-service-account -u slack-agent -o <enterprise-id> --token-only
 ```
 
-`slack-agent` is the **interim shared account** — the one process-wide principal
-that every *unbound* workspace falls back to, and the only account the live beta
-deployment uses. It is not the design. The per-workspace form is
-`slack-<team id>`, minted by the install-time bind rather than by this command,
-and it is what a multi-tenant deployment runs on;
-`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the shared account
-entirely (see *Deferred* below).
+`slack-agent` is the **process-wide default account** — the one principal that
+every *unbound* workspace falls back to. The per-workspace form is
+`slack-<team id>`, minted by the install-time bind (design.md §10.1a) rather than
+by this command, and it is what a multi-tenant deployment runs on. The default
+account is a service account with a rotating credential, not a static token,
+anchored to a single **enterprise** — so against a multi-tenant backend an
+unbound workspace answered on it has its cases filed in that enterprise.
+`FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` withdraws the default account
+entirely, refusing an unbound workspace instead; set it on any multi-tenant
+backend.
 
 `fm-provision-service-account` is a console entrypoint shipped with the
 installed package. Invoking the source file by path (`python
@@ -156,7 +159,7 @@ authenticate through WorkOS/PKCE.
 The Postgres OAuth store is replica-safe, but the **thread→case map** and the
 **in-process drop-if-busy gate + event dedup** are per-process. The infra
 Deployment must pin **one replica** (`strategy: Recreate`) until the case store is
-externalized. Horizontal scale is a follow-up, not required for the beta.
+externalized. Horizontal scale is a follow-up.
 
 ## Deploy sequence (executed from the infra repo)
 
@@ -263,13 +266,6 @@ config and `--diff` pushed, so there was no safe way to compare — the
   (`POST /api/v1/admin/integrations/slack/workspaces`), and the install-time flow
   lives in `binding.py` / `pending_binds.py` / `workspace_credentials.py`
   (design.md §10.1a).
-- **Self-service binding at install.** The flow works, but during the beta a
-  workspace is bound by hand rather than through an advertised install link, so
-  the live deployment still answers every workspace on the one interim shared
-  account described above — a service account with a rotating credential, not a
-  static token, anchored to a single **enterprise**. Set
-  `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true` on a multi-tenant backend so an
-  unbound workspace is refused rather than filed in the wrong tenant.
 - **Multi-replica / HA** — gated on externalizing the case store.
 
 ## Local development (Socket Mode)
