@@ -205,7 +205,7 @@ def _download_all(
 def _safe_name(raw: str | None) -> str:
     """Reduce a Slack-supplied filename to a bare, bounded basename.
 
-    Defense in depth (parent CLAUDE.md: "sanitized filenames"): strip any path
+    Defense in depth (CLAUDE.md: "Sanitized filenames"): strip any path
     components and control chars so the name can't traverse or inject when the
     backend writes/echoes it.
     """
