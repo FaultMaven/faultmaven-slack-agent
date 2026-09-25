@@ -72,9 +72,8 @@ jobs:
         run: echo "Published image with digest ${{ steps.meta.outputs.digest }}"
 
       # Cross-repo queue update via the faultmaven-infra-queue-bot GitHub App.
-      # This repo is PRIVATE, so the App ID/private key are stored REPO-LEVEL
-      # (GitHub Free does not expose org secrets to private repos) — same as
-      # faultmaven-cloud. Runs only on the canonical repo's main.
+      # The App private key is a repo-level secret. Runs only on the canonical
+      # repo's main.
       - name: Mint infra token (GitHub App)
         id: infra-token
         if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
