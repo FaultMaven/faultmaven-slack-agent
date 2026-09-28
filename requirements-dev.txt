@@ -6,4 +6,4 @@ ruff==0.16.8
 # OpenAPI -> Pydantic models for the FaultMaven API contract
 # (scripts/generate_api_models.py; the CI drift job regenerates and diffs, so
 # this pin is what keeps the committed models reproducible).
-datamodel-code-generator==0.82.0
+datamodel-code-generator==0.83.0
