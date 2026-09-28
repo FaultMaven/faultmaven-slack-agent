@@ -2,7 +2,8 @@
 
 Covers the P5 transport surface (docs/design.md §10, §16):
 * per-transport credential validation fails fast at boot;
-* the SQLAlchemy Installation/OAuthState stores round-trip;
+* the stores ``build_oauth_stores`` returns round-trip on SQLite, and on
+  Postgres when ``TEST_POSTGRES_URL`` names one (CI's service container);
 * the FastAPI app exposes /health + the three /slack/* routes with the right
   status codes (unsigned events rejected, bad redirect 4xx — never 500);
 * build_app() selects OAuth vs. static-token wiring by transport.
@@ -10,6 +11,7 @@ Covers the P5 transport surface (docs/design.md §10, §16):
 
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
@@ -110,11 +112,25 @@ def test_explicit_postgres_url_passes_through(monkeypatch):
 # --- OAuth stores ------------------------------------------------------------
 
 
-def test_oauth_stores_create_tables_and_roundtrip(tmp_path):
+@pytest.fixture(params=["sqlite", "postgres"])
+def database_url(request, tmp_path):
+    """A store URL per backend. The cluster runs the stores on Postgres, and a
+    SQLite-only suite let #81's boot crash through, so CI sets TEST_POSTGRES_URL
+    to a bare ``postgresql://`` — the hosted shape — and the Postgres case runs.
+    """
+
+    if request.param == "sqlite":
+        return f"sqlite:///{tmp_path / 'oauth.db'}"
+    url = os.environ.get("TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("TEST_POSTGRES_URL is not set")
+    return url
+
+
+def test_oauth_stores_create_tables_and_roundtrip(database_url):
     from oauth_store import build_oauth_stores
 
-    url = f"sqlite:///{tmp_path / 'oauth.db'}"
-    stores = build_oauth_stores(database_url=url, client_id="123.456")
+    stores = build_oauth_stores(database_url=database_url, client_id="123.456")
 
     inst = Installation(
         app_id="A1",
@@ -137,6 +153,19 @@ def test_oauth_stores_create_tables_and_roundtrip(tmp_path):
     # A state is single-use — a replayed redirect must fail.
     assert stores.state_store.consume(state) is False
 
+    # The agent's own tables ride the same engine.
+    stores.workspace_credentials.bind(
+        team_id="T1", fm_enterprise_id="ent-1", refresh_token="rt-1"
+    )
+    stores.workspace_credentials.put_refresh_token("T1", "rt-2")
+    assert stores.workspace_credentials.get("T1").refresh_token == "rt-2"
+
+    pending = stores.pending_binds.create(
+        team_id="T1", enterprise_id="", installer_user_id="U1", team_name="t"
+    )
+    assert stores.pending_binds.consume(state=pending.state, bind_id=pending.bind_id)
+    stores.engine.dispose()
+
 
 def test_oauth_stores_create_missing_parent_dir(tmp_path):
     from oauth_store import build_oauth_stores
@@ -149,31 +178,48 @@ def test_oauth_stores_create_missing_parent_dir(tmp_path):
     stores.engine.dispose()
 
 
-def test_bare_postgres_url_resolves_to_the_installed_driver():
+def test_oauth_stores_name_the_installed_driver_for_a_bare_postgres_url(monkeypatch):
     # The hosted SLACK_DATABASE_URL is a bare postgresql:// URL. SQLAlchemy 2.1
     # resolves that to psycopg 3, which is not installed, and create_engine
-    # imports the DBAPI eagerly — the boot crash #81 shipped. No connection is
-    # made here; resolving the dialect is the whole failure.
-    from sqlalchemy import create_engine
+    # imports the DBAPI eagerly — the boot crash #81 shipped. Resolving the
+    # driver is the whole failure, so stop at the engine: no server needed.
+    import sqlalchemy
 
-    from oauth_store import _engine_url
+    import oauth_store
 
-    engine = create_engine(_engine_url("postgresql://u:p@db:5432/faultmaven_slack"))
-    assert engine.dialect.driver == "psycopg2"
-    assert engine.url.render_as_string(hide_password=False) == (
-        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack"
-    )
+    class EngineBuilt(Exception):
+        pass
+
+    engines = []
+
+    def create_engine(url, **kwargs):
+        engines.append(sqlalchemy.create_engine(url, **kwargs))
+        raise EngineBuilt
+
+    monkeypatch.setattr(oauth_store, "create_engine", create_engine)
+    with pytest.raises(EngineBuilt):
+        oauth_store.build_oauth_stores(
+            database_url="postgresql://u:p@db:5432/faultmaven_slack",
+            client_id="123.456",
+        )
+    (engine,) = engines
+    assert engine.url.drivername == "postgresql+psycopg2"
+    # The URL object was passed, not its string form, which masks the password.
+    assert engine.url.password == "p"
 
 
-def test_explicit_driver_and_sqlite_urls_are_left_alone():
-    from oauth_store import _engine_url
-
-    for raw in (
+@pytest.mark.parametrize(
+    "raw",
+    [
         "postgresql+psycopg2://u:p@db:5432/faultmaven_slack",
         "postgresql+psycopg://u:p@db:5432/faultmaven_slack",
         "sqlite:///data/oauth.db",
-    ):
-        assert _engine_url(raw).render_as_string(hide_password=False) == raw
+    ],
+)
+def test_explicit_driver_and_sqlite_urls_are_left_alone(raw):
+    from oauth_store import _engine_url
+
+    assert _engine_url(raw).render_as_string(hide_password=False) == raw
 
 
 # --- FastAPI app -------------------------------------------------------------

@@ -39,10 +39,10 @@ logger = logging.getLogger("faultmaven.slack.oauth")
 # CSRF posture.
 _STATE_EXPIRATION_SECONDS = 600
 
-# The one Postgres driver requirements.txt installs. The hosted config is a bare
-# ``postgresql://`` URL (provision-slack-db.sh), which leaves the driver to
-# SQLAlchemy's default — psycopg2 through 2.0, psycopg 3 from 2.1 — so name it
-# here, beside the pin that installs it, rather than in every deployment's URL.
+# The Postgres driver requirements.txt installs. The hosted SLACK_DATABASE_URL is
+# a bare ``postgresql://`` (provision-slack-db.sh), which leaves the driver to
+# SQLAlchemy's default — psycopg2 through 2.0, psycopg 3 (not installed) from
+# 2.1 — so the agent names it rather than every deployment's URL.
 _POSTGRES_DRIVERNAME = "postgresql+psycopg2"
 
 
@@ -120,11 +120,11 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
 
 
 def _engine_url(database_url: str) -> URL:
-    """Parse ``database_url``, naming the installed driver for bare Postgres.
+    """Parse ``database_url``, naming ``_POSTGRES_DRIVERNAME`` for bare Postgres.
 
-    ``create_engine`` imports the dialect's DBAPI eagerly, so a URL that resolves
-    to an uninstalled driver fails at boot with ``ModuleNotFoundError`` (#81's
-    CrashLoopBackOff). An explicit ``postgresql+<driver>://`` is left alone.
+    ``create_engine`` imports the DBAPI eagerly, so a URL that resolves to an
+    uninstalled driver fails at boot. An explicit ``postgresql+<driver>://`` is
+    the operator's choice and is left alone.
     """
 
     url = make_url(database_url)
