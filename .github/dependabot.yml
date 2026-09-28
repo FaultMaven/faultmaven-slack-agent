@@ -7,8 +7,10 @@
 # security advisory only surfaces as a warning on `git push`, which is how
 # CVE-2025-71176 in pytest sat open for months (#55).
 #
-# Weekly, grouped so routine minor/patch bumps arrive as one reviewable PR;
-# majors come on their own, because those are the ones that need a real look.
+# Weekly, grouped so routine patch bumps arrive as one reviewable PR; minor
+# and major bumps come on their own, because those are the ones that need a
+# real look (e.g. SQLAlchemy 2.0→2.1 dropped greenlet from its default
+# dependencies, breaking slack_sdk's asyncio import — caught only in CI).
 version: 2
 updates:
   - package-ecosystem: "pip"
@@ -24,9 +26,8 @@ updates:
     labels:
       - "dependencies"
     groups:
-      python-minor-and-patch:
+      python-patch:
         patterns:
           - "*"
         update-types:
-          - "minor"
           - "patch"
