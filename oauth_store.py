@@ -26,7 +26,7 @@ from slack_sdk.oauth.installation_store.sqlalchemy import (
 )
 from slack_sdk.oauth.state_store.sqlalchemy import SQLAlchemyOAuthStateStore
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.engine import URL, Engine, make_url
 
 from pending_binds import PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
@@ -38,6 +38,12 @@ logger = logging.getLogger("faultmaven.slack.oauth")
 # slower than this just restarts the install, so a tight window is the safer
 # CSRF posture.
 _STATE_EXPIRATION_SECONDS = 600
+
+# The Postgres driver requirements.txt installs. The hosted SLACK_DATABASE_URL is
+# a bare ``postgresql://`` (provision-slack-db.sh), which leaves the driver to
+# SQLAlchemy's default — psycopg2 through 2.0, psycopg 3 (not installed) from
+# 2.1 — so the agent names it rather than every deployment's URL.
+_POSTGRES_DRIVERNAME = "postgresql+psycopg2"
 
 
 @dataclass(slots=True)
@@ -66,19 +72,22 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     can't read each other's tokens.
     """
 
+    url = _engine_url(database_url)
+
     # SQLite under a threaded web server: the same engine is used across worker
     # threads, so disable the single-thread guard (the stores open short-lived
     # connections per call; SQLite serializes writes itself). Harmless for
     # Postgres, which ignores the connect arg.
-    is_sqlite = database_url.startswith("sqlite")
+    is_sqlite = url.get_backend_name() == "sqlite"
     if is_sqlite:
         # SQLite won't create a missing parent directory — it raises "unable to
         # open database file". Create it (as CaseStore does for its own path).
-        db_path = make_url(database_url).database
+        db_path = url.database
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     connect_args = {"check_same_thread": False} if is_sqlite else {}
-    engine = create_engine(database_url, connect_args=connect_args)
+    # The URL object, not str(url): its string form masks the password.
+    engine = create_engine(url, connect_args=connect_args)
 
     installation_store = SQLAlchemyInstallationStore(
         client_id=client_id, engine=engine, logger=logger
@@ -108,3 +117,17 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
         workspace_credentials=workspace_credentials,
         pending_binds=pending_binds,
     )
+
+
+def _engine_url(database_url: str) -> URL:
+    """Parse ``database_url``, naming ``_POSTGRES_DRIVERNAME`` for bare Postgres.
+
+    ``create_engine`` imports the DBAPI eagerly, so a URL that resolves to an
+    uninstalled driver fails at boot. An explicit ``postgresql+<driver>://`` is
+    the operator's choice and is left alone.
+    """
+
+    url = make_url(database_url)
+    if url.drivername == "postgresql":
+        url = url.set(drivername=_POSTGRES_DRIVERNAME)
+    return url
