@@ -149,26 +149,31 @@ def test_oauth_stores_create_missing_parent_dir(tmp_path):
     stores.engine.dispose()
 
 
-def test_oauth_stores_postgresql_url_normalizes_to_psycopg2(monkeypatch):
-    from unittest.mock import MagicMock
-    from oauth_store import build_oauth_stores
+def test_bare_postgres_url_resolves_to_the_installed_driver():
+    # The hosted SLACK_DATABASE_URL is a bare postgresql:// URL. SQLAlchemy 2.1
+    # resolves that to psycopg 3, which is not installed, and create_engine
+    # imports the DBAPI eagerly — the boot crash #81 shipped. No connection is
+    # made here; resolving the dialect is the whole failure.
+    from sqlalchemy import create_engine
 
-    monkeypatch.setattr("sqlalchemy.MetaData.create_all", MagicMock())
-    monkeypatch.setattr(
-        "workspace_credentials.WorkspaceCredentialStore.__init__",
-        lambda self, engine: None,
-    )
-    monkeypatch.setattr(
-        "pending_binds.PendingBindStore.__init__",
-        lambda self, engine: None,
+    from oauth_store import _engine_url
+
+    engine = create_engine(_engine_url("postgresql://u:p@db:5432/faultmaven_slack"))
+    assert engine.dialect.driver == "psycopg2"
+    assert engine.url.render_as_string(hide_password=False) == (
+        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack"
     )
 
-    for prefix in ("postgresql://", "postgres://", "postgresql+psycopg2://"):
-        raw_url = f"{prefix}test_user:test_pass@localhost:5432/test_db"
-        stores = build_oauth_stores(database_url=raw_url, client_id="123.456")
-        assert stores.engine.dialect.driver == "psycopg2"
-        assert str(stores.engine.url).startswith("postgresql+psycopg2://")
-        stores.engine.dispose()
+
+def test_explicit_driver_and_sqlite_urls_are_left_alone():
+    from oauth_store import _engine_url
+
+    for raw in (
+        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack",
+        "postgresql+psycopg://u:p@db:5432/faultmaven_slack",
+        "sqlite:///data/oauth.db",
+    ):
+        assert _engine_url(raw).render_as_string(hide_password=False) == raw
 
 
 # --- FastAPI app -------------------------------------------------------------
