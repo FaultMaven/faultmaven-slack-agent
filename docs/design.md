@@ -652,9 +652,10 @@ all — while `is_unlinked` preserves the memory:
 
 ## 8. Backend integration contract (corrected)
 
-> Verified against the live backend on 2026-06-22:
-> `faultmaven/modules/case/api/routes.py` (`create_case` @624, `submit_turn`
-> @2194) and `faultmaven/models/api_models.py` (`IntentType` @321). Still confirm
+> Verified against the live backend on 2026-06-22. The routes now live in the
+> `faultmaven/modules/case/api/routes/` package (`create_case` in `cases.py`,
+> `submit_turn` in `conversation.py`); `IntentType` is in
+> `faultmaven/models/api_models.py`. Still confirm
 > response-model field names against `api_models.py` before coding the client.
 
 ### 8.1 Case + turn lifecycle
