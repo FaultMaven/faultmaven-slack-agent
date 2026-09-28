@@ -4,7 +4,9 @@ The Slack agent is a thin translation layer: a Slack thread becomes a FaultMaven
 *case*, each message becomes a *turn*, and the structured ``TurnResponse`` is
 rendered back into Slack. This module owns that boundary.
 
-Contract (verified against faultmaven/modules/case/api/routes.py on 2026-06-22):
+Contract (verified on 2026-06-22 against what is now the
+``faultmaven/modules/case/api/routes/`` package: ``create_case`` in ``cases.py``,
+``submit_turn`` in ``conversation.py``):
 
 * **Create a case** — ``POST /api/v1/cases`` with a JSON ``CaseCreateRequest``
   body. We pass only ``title`` (null → backend auto-titles ``Case-MMDD-N``); we
