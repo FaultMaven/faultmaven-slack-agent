@@ -149,28 +149,6 @@ def test_oauth_stores_create_missing_parent_dir(tmp_path):
     stores.engine.dispose()
 
 
-def test_oauth_stores_postgresql_url_normalizes_to_psycopg2(monkeypatch):
-    from unittest.mock import MagicMock
-    from oauth_store import build_oauth_stores
-
-    monkeypatch.setattr("sqlalchemy.MetaData.create_all", MagicMock())
-    monkeypatch.setattr(
-        "workspace_credentials.WorkspaceCredentialStore.__init__",
-        lambda self, engine: None,
-    )
-    monkeypatch.setattr(
-        "pending_binds.PendingBindStore.__init__",
-        lambda self, engine: None,
-    )
-
-    for prefix in ("postgresql://", "postgres://", "postgresql+psycopg2://"):
-        raw_url = f"{prefix}test_user:test_pass@localhost:5432/test_db"
-        stores = build_oauth_stores(database_url=raw_url, client_id="123.456")
-        assert stores.engine.dialect.driver == "psycopg2"
-        assert str(stores.engine.url).startswith("postgresql+psycopg2://")
-        stores.engine.dispose()
-
-
 # --- FastAPI app -------------------------------------------------------------
 
 

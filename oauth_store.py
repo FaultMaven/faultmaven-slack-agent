@@ -66,14 +66,6 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     can't read each other's tokens.
     """
 
-    # For a plain `postgresql://` or `postgres://` URL, explicitly use psycopg2
-    # so dialect resolution does not depend on SQLAlchemy's default driver choice
-    # (which changed from psycopg2 to psycopg3 in SQLAlchemy 2.1).
-    if database_url.startswith("postgresql://"):
-        database_url = "postgresql+psycopg2://" + database_url[len("postgresql://"):]
-    elif database_url.startswith("postgres://"):
-        database_url = "postgresql+psycopg2://" + database_url[len("postgres://"):]
-
     # SQLite under a threaded web server: the same engine is used across worker
     # threads, so disable the single-thread guard (the stores open short-lived
     # connections per call; SQLite serializes writes itself). Harmless for
