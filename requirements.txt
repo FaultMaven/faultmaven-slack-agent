@@ -17,7 +17,7 @@ uvicorn[standard]==0.53.0
 # drives both — SQLite locally, Postgres in the cluster. psycopg2 is SQLAlchemy's
 # default driver for a `postgresql://` URL (the hosted config); without it the
 # first connection raises ModuleNotFoundError and the pod crashes at boot.
-sqlalchemy[asyncio]==2.1.0
+sqlalchemy[asyncio]==2.0.54
 psycopg2-binary==2.9.13
 
 # Settings / validation
