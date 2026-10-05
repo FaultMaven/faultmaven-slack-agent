@@ -16,7 +16,7 @@ uvicorn[standard]==0.53.0
 # via slack_sdk's SQLAlchemy{Installation,OAuthState}Store. One SLACK_DATABASE_URL
 # drives both — SQLite locally, Postgres in the cluster. psycopg2 is the Postgres
 # driver; oauth_store._engine_url names it in the URL (see why there).
-sqlalchemy[asyncio]==2.1.0
+sqlalchemy[asyncio]==2.1.1
 psycopg2-binary==2.9.13
 
 # Settings / validation
