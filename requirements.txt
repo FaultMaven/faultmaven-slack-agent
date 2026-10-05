@@ -10,7 +10,7 @@ slack-sdk==3.44.1
 # HTTP transport: FastAPI hosts the Slack request handler (/slack/events,
 # /slack/install, /slack/oauth_redirect) plus /health for k8s liveness.
 fastapi==0.141.1
-uvicorn[standard]==0.53.0
+uvicorn[standard]==0.54.0
 
 # Backs the multi-workspace OAuth stores (per-team bot tokens + OAuth state)
 # via slack_sdk's SQLAlchemy{Installation,OAuthState}Store. One SLACK_DATABASE_URL
