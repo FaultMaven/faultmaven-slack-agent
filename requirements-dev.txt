@@ -2,7 +2,7 @@
 -r requirements.txt
 pytest==9.1.1
 # linter — single source of truth; CI's lint job installs this exact pin
-ruff==0.16.9
+ruff==0.16.10
 # OpenAPI -> Pydantic models for the FaultMaven API contract
 # (scripts/generate_api_models.py; the CI drift job regenerates and diffs, so
 # this pin is what keeps the committed models reproducible).
