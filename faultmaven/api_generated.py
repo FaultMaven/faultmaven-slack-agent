@@ -12,15 +12,41 @@ class Access(Enum):
     break_glass = "break_glass"
 
 
+class AccountKind(Enum):
+    individual = "individual"
+    service = "service"
+
+
 class AdminUserListItem(BaseModel):
+    account_kind: AccountKind = Field(
+        ...,
+        description="'individual' for a person, 'service' for an integration's service account.",
+        title="Account Kind",
+    )
     created_at: AwareDatetime = Field(..., title="Created At")
     email: str = Field(..., title="Email")
-    enterprise_id: str = Field(..., title="Enterprise Id")
+    enterprise_id: str = Field(
+        ..., description="The enterprise the account is anchored to.", title="Enterprise Id"
+    )
     full_name: str = Field(..., title="Full Name")
     is_active: bool = Field(..., title="Is Active")
     is_verified: bool = Field(..., title="Is Verified")
     last_login_at: AwareDatetime | None = Field(None, title="Last Login At")
-    roles: list[str] = Field(..., title="Roles")
+    manageable: bool = Field(
+        ...,
+        description="Whether the operator can administer this account (deactivate, activate, change its roles). True for every account in the operator's own enterprise — every account under single-tenancy. False for an account in another enterprise, which the administration routes answer with 404. Per-target refusals still apply on a manageable row: an operator cannot deactivate or re-role their own account.",
+        title="Manageable",
+    )
+    roles: list[str] = Field(
+        ...,
+        description="The account's organization-scoped roles. Reported only for an account the operator can manage (`manageable`); on a row outside the operator's enterprise the list is empty, which means 'not reported', not 'holds no role'.",
+        title="Roles",
+    )
+    service_channel: str | None = Field(
+        None,
+        description="Which integration a service account serves (for example 'slack'); null for a person.",
+        title="Service Channel",
+    )
     updated_at: AwareDatetime = Field(..., title="Updated At")
     user_id: str = Field(..., title="User Id")
 
@@ -381,7 +407,6 @@ class FeatureStatus(BaseModel):
 
 
 class HypothesisState(Enum):
-    captured = "captured"
     active = "active"
     validated = "validated"
     refuted = "refuted"
@@ -410,7 +435,7 @@ class HypothesisSummary(BaseModel):
         title="Retirement Reason",
     )
     state: HypothesisState = Field(
-        ..., description="Status: CAPTURED | ACTIVE | VALIDATED | REFUTED | INCONCLUSIVE | RETIRED"
+        ..., description="Status: ACTIVE | VALIDATED | REFUTED | INCONCLUSIVE | RETIRED"
     )
     text: constr(max_length=500) = Field(..., description="Hypothesis statement", title="Text")
 
@@ -1312,6 +1337,7 @@ class AdminCaseMetadata(BaseModel):
     last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
     organization_id: str | None = Field(None, title="Organization Id")
     resolved_at: AwareDatetime | None = Field(..., title="Resolved At")
+    shared_team_ids: list[str] | None = Field(None, title="Shared Team Ids")
     source: str | None = Field("copilot", title="Source")
     stage: InvestigationStage | None
     state: CaseState
@@ -1566,7 +1592,11 @@ class CaseUIResponseResolved(BaseModel):
 
 class EnvConfigStatusResponse(BaseModel):
     auth_mode: str = Field(..., description="'local' or 'oauth'", title="Auth Mode")
-    db_backend: str = Field(..., description="'sqlite' or 'postgresql'", title="Db Backend")
+    db_backend: str = Field(
+        ...,
+        description="'sqlite' or 'postgresql' — the dialect of the database engine the running process built; 'not initialized' before it has built one",
+        title="Db Backend",
+    )
     deployment: str = Field(
         ...,
         description="'standalone' or 'cloud' — from DEPLOYMENT_MODE (ADR-004)",
@@ -1586,9 +1616,17 @@ class EnvConfigStatusResponse(BaseModel):
         description="Rate limiting middleware is installed on this deployment. Read from the running middleware stack rather than from configuration: no rate-limit setting exists, the protection presets decide by environment name, and no environment variable turns it off. A deployment reports false here only if protection setup raised and the development carve-out let it boot anyway.",
         title="Rate Limit Enabled",
     )
-    session_storage: str = Field(..., description="'inmemory' or 'redis'", title="Session Storage")
+    session_storage: str = Field(
+        ...,
+        description="'redis' or 'fakeredis (inmemory)' — the Redis client the session store actually uses, not the configured one; 'not initialized' before the composition root has set it",
+        title="Session Storage",
+    )
     timestamp: AwareDatetime = Field(..., title="Timestamp")
-    vector_storage: str = Field(..., description="'inmemory' or 'chromadb'", title="Vector Storage")
+    vector_storage: str = Field(
+        ...,
+        description="What the running process's KB and evidence ChromaDB clients talk to: 'chromadb (server)', 'chromadb (persistent, split: kb + evidence)', 'disabled' when neither was built, or a per-client breakdown when they differ",
+        title="Vector Storage",
+    )
 
 
 class EvidenceDetailsResponse(BaseModel):
@@ -1697,6 +1735,26 @@ class LLMConfigResponse(BaseModel):
 class ProblemVerificationData(BaseModel):
     impact: ImpactData | None = Field(
         None, description="Scope of impact (services, users, regions)"
+    )
+    invalidation_finding: str | None = Field(
+        None,
+        description="What showed the reported problem was not present (false alarm).",
+        title="Invalidation Finding",
+    )
+    original_problem_statement: str | None = Field(
+        None,
+        description="The statement the investigation opened on, when the evidence has since revised it; null when it was never revised.",
+        title="Original Problem Statement",
+    )
+    pending_revision: str | None = Field(
+        None,
+        description="The revised statement awaiting the user's confirmation.",
+        title="Pending Revision",
+    )
+    problem_status: str | None = Field(
+        None,
+        description="Where the confirmed problem statement stands against the evidence: unverified | verified | revision_pending (a revised statement awaits the user's confirmation) | invalidated (the reported problem was not present: a false alarm)",
+        title="Problem Status",
     )
     severity: constr(max_length=50) | None = Field(
         None, description="Severity: critical | high | medium | low", title="Severity"
