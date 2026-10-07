@@ -677,34 +677,6 @@ class Role(Enum):
     system = "system"
 
 
-class Message(BaseModel):
-    author_id: str | None = Field(
-        None, description="User who created the message", title="Author Id"
-    )
-    content: str = Field(..., title="Content")
-    created_at: str = Field(
-        ..., description="ISO 8601 datetime string (matches SQL schema)", title="Created At"
-    )
-    investigation_turn: int | None = Field(
-        None,
-        description='Which turn OF THE INVESTIGATION this row belongs to (#1387): the message clock at this row minus the out-of-band turns at or before it. `turn_number` is the message clock and advances on every exchange, asides included (small talk, trivia, questions about FaultMaven itself); this does not, so an aside carries the same value as the investigation turn before it. A client displaying "Turn N" against a conversation row should prefer this, and keep `turn_number` for anything that ADDRESSES a turn (anchors, `uploaded_at_turn` lookups) — those are message-clock references and re-basing them breaks jump-to-turn. On the newest row this equals `TurnResponse.investigation_turn`, which is the same quantity read at the case level. Null on a row that owns no turn — a `system` notice reporting a background job, stamped with whichever turn was open when the job finished — and on a server that predates the field.',
-        title="Investigation Turn",
-    )
-    message_id: str = Field(..., title="Message Id")
-    metadata: dict[str, Any] | None = Field(
-        None, description="Sources, tools used, etc.", title="Metadata"
-    )
-    role: Role = Field(..., title="Role")
-    token_count: int | None = Field(
-        None, description="Number of tokens in content", title="Token Count"
-    )
-    turn_number: int = Field(
-        ...,
-        description="Turn number in conversation (user messages increment turn)",
-        title="Turn Number",
-    )
-
-
 class MessageRetrievalDebugInfo(BaseModel):
     message_parsing_errors: int | None = Field(
         0, description="Number of messages that failed to parse", title="Message Parsing Errors"
@@ -792,6 +764,13 @@ class PersonalTenantLimitsStatus(BaseModel):
         description="TENANT_DAILY_TURN_CAP — investigation turns an account in NO organization may take per UTC day before further turns are refused with 429. The deployment DEFAULT only: an organization is uncapped, a single-tenant deployment is never capped, and a per-organization override set with fm-set-turn-cap beats this value.",
         title="Tenant Daily Turn Cap",
     )
+
+
+class ProblemStatus(Enum):
+    unverified = "unverified"
+    verified = "verified"
+    revision_pending = "revision_pending"
+    invalidated = "invalidated"
 
 
 class ProgressTransparencyInfo(BaseModel):
@@ -1427,27 +1406,6 @@ class CaseDetail(BaseModel):
     )
 
 
-class CaseMessagesResponse(BaseModel):
-    debug_info: MessageRetrievalDebugInfo | None = Field(
-        None, description="Debug information (only when include_debug=true)"
-    )
-    has_more: bool = Field(
-        ..., description="Whether more messages are available for pagination", title="Has More"
-    )
-    messages: list[Message] = Field(
-        ..., description="Array of conversation messages", title="Messages"
-    )
-    next_offset: int | None = Field(
-        None, description="Offset for next page (null if no more pages)", title="Next Offset"
-    )
-    retrieved_count: int = Field(
-        ..., description="Number of messages successfully retrieved", title="Retrieved Count"
-    )
-    total_count: int = Field(
-        ..., description="Total number of messages in the case", title="Total Count"
-    )
-
-
 class CaseSearchRequest(BaseModel):
     limit: conint(ge=1, le=100) | None = Field(20, description="Maximum results", title="Limit")
     query: constr(min_length=1, max_length=500) = Field(
@@ -1751,10 +1709,9 @@ class ProblemVerificationData(BaseModel):
         description="The revised statement awaiting the user's confirmation.",
         title="Pending Revision",
     )
-    problem_status: str | None = Field(
+    problem_status: ProblemStatus | None = Field(
         None,
         description="Where the confirmed problem statement stands against the evidence: unverified | verified | revision_pending (a revised statement awaits the user's confirmation) | invalidated (the reported problem was not present: a false alarm)",
-        title="Problem Status",
     )
     severity: constr(max_length=50) | None = Field(
         None, description="Severity: critical | high | medium | low", title="Severity"
@@ -1818,6 +1775,11 @@ class Source(BaseModel):
     confidence: float | None = Field(None, title="Confidence")
     content: str = Field(..., title="Content")
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
+    new_this_turn: bool | None = Field(
+        None,
+        description="For a knowledge-base source in a turn's `sources`: true when this runbook excerpt was not in the prompt of the case's previous turn that carried knowledge-base context. That context stands in every prompt from the turn it is fetched until the next fetch replaces it, so a client shows the list where something is new rather than under every answer. Null on any other source.",
+        title="New This Turn",
+    )
     type: SourceType
     verification_reason: str | None = Field(None, title="Verification Reason")
     verification_status: VerificationStatus | None = Field(None, title="Verification Status")
@@ -1852,7 +1814,7 @@ class TurnResponse(BaseModel):
     )
     sources: list[Source] | None = Field(
         None,
-        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED). Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary.",
+        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED) that the prompt the model answered from actually carried, after the section budget. A pre-fetch that fires while the turn's response is applied first reaches the NEXT turn's prompt, and is listed there. The context stands in every prompt until a pre-fetch replaces it, so it repeats turn to turn; `new_this_turn` marks the excerpts the previous turn's prompt did not carry. Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary.",
         title="Sources",
     )
     suggested_actions: list[SuggestedActionResponse] | None = Field(None, title="Suggested Actions")
@@ -1872,12 +1834,6 @@ class AdminCaseListResponse(BaseModel):
     offset: int = Field(..., title="Offset")
     total_count: int = Field(..., title="Total Count")
     view: Literal["full"] = Field("full", title="View")
-
-
-class AdminCaseMessagesResponse(BaseModel):
-    access: Access = Field(..., title="Access")
-    grant: BreakGlassGrant | None = None
-    messages: CaseMessagesResponse
 
 
 class CaseEvidenceListResponse(BaseModel):
@@ -1999,6 +1955,39 @@ class CaseUIResponseInvestigating(BaseModel):
     )
 
 
+class Message(BaseModel):
+    author_id: str | None = Field(
+        None, description="User who created the message", title="Author Id"
+    )
+    content: str = Field(..., title="Content")
+    created_at: str = Field(
+        ..., description="ISO 8601 datetime string (matches SQL schema)", title="Created At"
+    )
+    investigation_turn: int | None = Field(
+        None,
+        description='Which turn OF THE INVESTIGATION this row belongs to (#1387): the message clock at this row minus the out-of-band turns at or before it. `turn_number` is the message clock and advances on every exchange, asides included (small talk, trivia, questions about FaultMaven itself); this does not, so an aside carries the same value as the investigation turn before it. A client displaying "Turn N" against a conversation row should prefer this, and keep `turn_number` for anything that ADDRESSES a turn (anchors, `uploaded_at_turn` lookups) — those are message-clock references and re-basing them breaks jump-to-turn. On the newest row this equals `TurnResponse.investigation_turn`, which is the same quantity read at the case level. Null on a row that owns no turn — a `system` notice reporting a background job, stamped with whichever turn was open when the job finished — and on a server that predates the field.',
+        title="Investigation Turn",
+    )
+    message_id: str = Field(..., title="Message Id")
+    metadata: dict[str, Any] | None = Field(
+        None, description="Tools used and other per-turn detail.", title="Metadata"
+    )
+    role: Role = Field(..., title="Role")
+    sources: list[Source] | None = Field(
+        None,
+        description="On an assistant row: the knowledge-base runbooks that turn's prompt carried, exactly as the live `TurnResponse.sources` returned them, `new_this_turn` included. Null on a row whose prompt carried none (and on every user or system row).",
+        title="Sources",
+    )
+    token_count: int | None = Field(
+        None, description="Number of tokens in content", title="Token Count"
+    )
+    turn_number: int = Field(
+        ...,
+        description="Turn number in conversation (user messages increment turn)",
+        title="Turn Number",
+    )
+
+
 class ReportGenerationResponse(BaseModel):
     case_id: str = Field(..., description="Case identifier", title="Case Id")
     remaining_regenerations: conint(ge=0, le=5) = Field(
@@ -2007,3 +1996,30 @@ class ReportGenerationResponse(BaseModel):
         title="Remaining Regenerations",
     )
     reports: list[CaseReport] = Field(..., description="Generated reports", title="Reports")
+
+
+class CaseMessagesResponse(BaseModel):
+    debug_info: MessageRetrievalDebugInfo | None = Field(
+        None, description="Debug information (only when include_debug=true)"
+    )
+    has_more: bool = Field(
+        ..., description="Whether more messages are available for pagination", title="Has More"
+    )
+    messages: list[Message] = Field(
+        ..., description="Array of conversation messages", title="Messages"
+    )
+    next_offset: int | None = Field(
+        None, description="Offset for next page (null if no more pages)", title="Next Offset"
+    )
+    retrieved_count: int = Field(
+        ..., description="Number of messages successfully retrieved", title="Retrieved Count"
+    )
+    total_count: int = Field(
+        ..., description="Total number of messages in the case", title="Total Count"
+    )
+
+
+class AdminCaseMessagesResponse(BaseModel):
+    access: Access = Field(..., title="Access")
+    grant: BreakGlassGrant | None = None
+    messages: CaseMessagesResponse
