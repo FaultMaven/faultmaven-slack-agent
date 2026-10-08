@@ -189,26 +189,6 @@ class BodySubmitTurnApiV1CasesCaseIdTurnsPost(BaseModel):
     source_url: str | None = Field(None, title="Source Url")
 
 
-class Scope(Enum):
-    personal = "personal"
-    team = "team"
-    global_ = "global"
-
-
-class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
-    category: str | None = Field(None, title="Category")
-    description: str | None = Field(None, title="Description")
-    document_type: str = Field(..., title="Document Type")
-    file: str = Field(
-        ..., json_schema_extra={"contentMediaType": "application/octet-stream"}, title="File"
-    )
-    scope: Scope | None = Field("personal", title="Scope")
-    source_url: str | None = Field(None, title="Source Url")
-    tags: str | None = Field(None, title="Tags")
-    team_id: str | None = Field(None, title="Team Id")
-    title: str = Field(..., title="Title")
-
-
 class BreakGlassGrant(BaseModel):
     approval_state: str = Field(..., title="Approval State")
     created_at: AwareDatetime = Field(..., title="Created At")
@@ -440,20 +420,6 @@ class HypothesisSummary(BaseModel):
     text: constr(max_length=500) = Field(..., description="Hypothesis statement", title="Text")
 
 
-class ImpactData(BaseModel):
-    affected_regions: list[str] | None = Field(
-        None, description="List of affected geographical regions", title="Affected Regions"
-    )
-    affected_services: list[str] | None = Field(
-        None, description="List of affected services", title="Affected Services"
-    )
-    affected_users: constr(max_length=500) | None = Field(
-        None,
-        description="User impact description (e.g., 'All users in US region')",
-        title="Affected Users",
-    )
-
-
 class InquiryResponseData(BaseModel):
     inquiry_turns: conint(ge=0) | None = Field(
         0, description="Number of conversation turns during inquiry phase", title="Inquiry Turns"
@@ -519,6 +485,12 @@ class KnowledgeBaseDocument(BaseModel):
     verification_status: VerificationStatus | None = Field(
         "experimental", title="Verification Status"
     )
+
+
+class KnowledgeScope(Enum):
+    global_ = "global"
+    team = "team"
+    personal = "personal"
 
 
 class LLMConfigUpdateRequest(BaseModel):
@@ -773,6 +745,48 @@ class ProblemStatus(Enum):
     invalidated = "invalidated"
 
 
+class TemporalState(Enum):
+    ongoing = "ongoing"
+    historical = "historical"
+
+
+class ProblemVerificationData(BaseModel):
+    invalidation_finding: str | None = Field(
+        None,
+        description="What showed the reported problem was not present (false alarm).",
+        title="Invalidation Finding",
+    )
+    original_problem_statement: str | None = Field(
+        None,
+        description="The statement the investigation opened on, when the evidence has since revised it; null when it was never revised.",
+        title="Original Problem Statement",
+    )
+    pending_revision: str | None = Field(
+        None,
+        description="The revised statement awaiting the user's confirmation.",
+        title="Pending Revision",
+    )
+    problem_status: ProblemStatus | None = Field(
+        None,
+        description="Where the confirmed problem statement stands against the evidence: unverified | verified | revision_pending (a revised statement awaits the user's confirmation) | invalidated (the reported problem was not present: a false alarm)",
+    )
+    severity: constr(max_length=50) | None = Field(
+        None,
+        description="Severity the user's problem confirmation gave, as the case record holds it: critical | high | medium | low; null when not assessed. Urgency never substitutes for it.",
+        title="Severity",
+    )
+    temporal_state: TemporalState | None = Field(
+        None,
+        description="Whether the problem was ongoing or historical, as reported when the investigation opened (Gate 1); null when not reported.",
+        title="Temporal State",
+    )
+    urgency_level: constr(max_length=50) | None = Field(
+        None,
+        description="Business-impact urgency the investigation opened with, as the case record holds it: critical | high | medium | low; null when not assessed.",
+        title="Urgency Level",
+    )
+
+
 class ProgressTransparencyInfo(BaseModel):
     active: bool = Field(
         ..., description="Whether transparent mode is active this turn", title="Active"
@@ -932,30 +946,31 @@ class RootCauseSummary(BaseModel):
         ..., description="What caused the problem", title="Description"
     )
     root_cause_id: str = Field(..., description="Root cause identifier", title="Root Cause Id")
-    severity: constr(max_length=50) = Field(
-        ..., description="Severity: critical | high | medium | low", title="Severity"
-    )
 
 
-class RunbookCreateRequest(BaseModel):
-    applicability: constr(min_length=10) = Field(..., title="Applicability")
-    causes: constr(min_length=10) = Field(
-        ...,
-        description="Pre-formatted markdown with ### Cause N subsections (one ROOT each). Each cause needs Statement, an optional Chain (root->D rungs), Indicators (per-rung, [Step N]-anchored), and quadrant-tagged Interventions (remediation/defensive_fix/mitigation/loop_break). Include ### Cause Z: Unidentified with a [Default] indicator as fallback.",
-        title="Causes",
-    )
-    diagnostic_steps: constr(min_length=10) = Field(..., title="Diagnostic Steps")
-    difficulty: str | None = Field("intermediate", title="Difficulty")
-    domain: str = Field(..., title="Domain")
-    prevention: constr(min_length=10) = Field(..., title="Prevention")
-    scope: str = Field(..., title="Scope")
-    service: str = Field(..., title="Service")
-    severity: str = Field(..., title="Severity")
-    symptom_class: list[str] = Field(..., min_length=1, title="Symptom Class")
-    symptom_recognition: constr(min_length=10) = Field(..., title="Symptom Recognition")
-    tags: list[str] | None = Field(None, title="Tags")
-    team_id: str | None = Field(None, title="Team Id")
-    title: constr(min_length=10, max_length=100) = Field(..., title="Title")
+class RunbookDifficulty(Enum):
+    beginner = "beginner"
+    intermediate = "intermediate"
+    advanced = "advanced"
+    expert = "expert"
+
+
+class RunbookDomain(Enum):
+    database = "database"
+    networking = "networking"
+    compute = "compute"
+    application = "application"
+    security = "security"
+    storage = "storage"
+    messaging = "messaging"
+
+
+class RunbookSeverity(Enum):
+    critical = "critical"
+    high = "high"
+    medium = "medium"
+    low = "low"
+    info = "info"
 
 
 class RunbookSource(Enum):
@@ -1075,6 +1090,25 @@ class SuggestedActionResponse(BaseModel):
     type: str = Field(..., title="Type")
 
 
+class SymptomClass(Enum):
+    auth_failure = "auth_failure"
+    connection_refused = "connection_refused"
+    cpu_saturation = "cpu_saturation"
+    crash_loop = "crash_loop"
+    data_loss = "data_loss"
+    deployment_failure = "deployment_failure"
+    disk_full = "disk_full"
+    image_pull_failure = "image_pull_failure"
+    latency = "latency"
+    node_failure = "node_failure"
+    oom = "oom"
+    replication_lag = "replication_lag"
+    scheduling_failure = "scheduling_failure"
+    service_unavailable = "service_unavailable"
+    throughput_degradation = "throughput_degradation"
+    timeout = "timeout"
+
+
 class TeamCreateRequest(BaseModel):
     description: constr(max_length=2000) | None = Field(None, title="Description")
     name: constr(min_length=1, max_length=200) = Field(..., title="Name")
@@ -1092,18 +1126,6 @@ class TeamResponse(BaseModel):
     enterprise_id: str = Field(..., title="Enterprise Id")
     name: str = Field(..., title="Name")
     team_id: str = Field(..., title="Team Id")
-
-
-class TemporalStateData(BaseModel):
-    last_occurrence_at: AwareDatetime | None = Field(
-        None, description="Most recent occurrence of the problem", title="Last Occurrence At"
-    )
-    started_at: AwareDatetime | None = Field(
-        None, description="When the problem started", title="Started At"
-    )
-    state: constr(max_length=50) | None = Field(
-        None, description="Temporal state: ongoing | historical | intermittent", title="State"
-    )
 
 
 class TitleResponse(BaseModel):
@@ -1364,6 +1386,20 @@ class AuthTokenResponse(BaseModel):
     user: UserProfile = Field(..., description="Authenticated user profile")
 
 
+class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
+    category: str | None = Field(None, title="Category")
+    description: str | None = Field(None, title="Description")
+    document_type: str = Field(..., title="Document Type")
+    file: str = Field(
+        ..., json_schema_extra={"contentMediaType": "application/octet-stream"}, title="File"
+    )
+    scope: KnowledgeScope | None = "personal"
+    source_url: str | None = Field(None, title="Source Url")
+    tags: str | None = Field(None, title="Tags")
+    team_id: str | None = Field(None, title="Team Id")
+    title: str = Field(..., title="Title")
+
+
 class CaseDetail(BaseModel):
     case_id: str = Field(..., title="Case Id")
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
@@ -1489,6 +1525,66 @@ class CaseUIResponseInquiry(BaseModel):
         None,
         description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
+    )
+
+
+class CaseUIResponseResolved(BaseModel):
+    case_id: str = Field(..., description="Case identifier", title="Case Id")
+    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
+    current_turn: conint(ge=0) = Field(
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
+    )
+    disposition_eligibility: dict[str, str] | None = Field(
+        None,
+        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when a qualifying causal-absence row is on the case, which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
+        title="Disposition Eligibility",
+    )
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
+    problem_statement: constr(max_length=1000) | None = Field(
+        None,
+        description="Confirmed problem statement carried over from INQUIRY (sourced from case.description).",
+        title="Problem Statement",
+    )
+    problem_verification: ProblemVerificationData | None = Field(
+        None,
+        description="Where the problem statement stood when the case ended, as on the INVESTIGATING response: a case closed as `closed_false_alarm` carries `invalidated` with its `invalidation_finding`, and a statement a revision or an edit changed carries `original_problem_statement`. Null for a case closed from INQUIRY, which confirmed no statement.",
+    )
+    reports_available: list[ReportAvailability] | None = Field(
+        None,
+        description="Available reports (incident report, post-mortem, runbook)",
+        title="Reports Available",
+    )
+    resolution_summary: ResolutionSummary = Field(
+        ..., description="Overall resolution metrics and insights"
+    )
+    resolved_at: AwareDatetime = Field(
+        ..., description="When case was resolved", title="Resolved At"
+    )
+    root_cause: RootCauseSummary = Field(..., description="What caused the problem")
+    solution_applied: SolutionSummary = Field(..., description="Solution that fixed the problem")
+    state: State = Field(
+        ...,
+        description="Case terminal state: 'resolved' (with solution) or 'closed' (without investigation)",
+        title="State",
+    )
+    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
+    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
+    uploaded_files_count: int | None = Field(
+        0, description="Number of uploaded files", title="Uploaded Files Count"
+    )
+    valid_next_states: list[str] | None = Field(
+        None,
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
+        title="Valid Next States",
+    )
+    verification_status: SolutionVerificationData = Field(
+        ..., description="How solution effectiveness was verified"
     )
 
 
@@ -1634,43 +1730,6 @@ class LLMConfigResponse(BaseModel):
     timestamp: AwareDatetime = Field(..., title="Timestamp")
 
 
-class ProblemVerificationData(BaseModel):
-    impact: ImpactData | None = Field(
-        None, description="Scope of impact (services, users, regions)"
-    )
-    invalidation_finding: str | None = Field(
-        None,
-        description="What showed the reported problem was not present (false alarm).",
-        title="Invalidation Finding",
-    )
-    original_problem_statement: str | None = Field(
-        None,
-        description="The statement the investigation opened on, when the evidence has since revised it; null when it was never revised.",
-        title="Original Problem Statement",
-    )
-    pending_revision: str | None = Field(
-        None,
-        description="The revised statement awaiting the user's confirmation.",
-        title="Pending Revision",
-    )
-    problem_status: ProblemStatus | None = Field(
-        None,
-        description="Where the confirmed problem statement stands against the evidence: unverified | verified | revision_pending (a revised statement awaits the user's confirmation) | invalidated (the reported problem was not present: a false alarm)",
-    )
-    severity: constr(max_length=50) | None = Field(
-        None, description="Severity: critical | high | medium | low", title="Severity"
-    )
-    temporal_state: TemporalStateData | None = Field(
-        None, description="When the problem occurred and its temporal pattern"
-    )
-    urgency_level: constr(max_length=50) | None = Field(
-        None, description="Urgency: critical | high | medium | low | unknown", title="Urgency Level"
-    )
-    user_impact: constr(max_length=1000) | None = Field(
-        None, description="Human-readable user impact summary", title="User Impact"
-    )
-
-
 class ReportGenerationRequest(BaseModel):
     report_types: list[ReportType] = Field(
         ...,
@@ -1690,6 +1749,27 @@ class ReportListResponse(BaseModel):
 class ReportVersionListResponse(BaseModel):
     total: int = Field(..., title="Total")
     versions: list[ReportVersionResponse] = Field(..., title="Versions")
+
+
+class RunbookCreateRequest(BaseModel):
+    applicability: constr(min_length=10) = Field(..., title="Applicability")
+    causes: constr(min_length=10) = Field(
+        ...,
+        description="Pre-formatted markdown with ### Cause N subsections (one ROOT each). Each cause needs Statement, an optional Chain (root->D rungs), Indicators (per-rung, [Step N]-anchored), and quadrant-tagged Interventions (remediation/defensive_fix/mitigation/loop_break). Include ### Cause Z: Unidentified with a [Default] indicator as fallback.",
+        title="Causes",
+    )
+    diagnostic_steps: constr(min_length=10) = Field(..., title="Diagnostic Steps")
+    difficulty: RunbookDifficulty | None = "intermediate"
+    domain: RunbookDomain
+    prevention: constr(min_length=10) = Field(..., title="Prevention")
+    scope: KnowledgeScope
+    service: str = Field(..., title="Service")
+    severity: RunbookSeverity
+    symptom_class: list[SymptomClass] = Field(..., min_length=1, title="Symptom Class")
+    symptom_recognition: constr(min_length=10) = Field(..., title="Symptom Recognition")
+    tags: list[str] | None = Field(None, title="Tags")
+    team_id: str | None = Field(None, title="Team Id")
+    title: constr(min_length=10, max_length=100) = Field(..., title="Title")
 
 
 class RunbookMetadata(BaseModel):
@@ -1896,66 +1976,6 @@ class CaseUIResponseInvestigating(BaseModel):
     )
     working_conclusion: WorkingConclusionSummary | None = Field(
         None, description="Agent's current understanding of the problem"
-    )
-
-
-class CaseUIResponseResolved(BaseModel):
-    case_id: str = Field(..., description="Case identifier", title="Case Id")
-    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
-    current_turn: conint(ge=0) = Field(
-        ...,
-        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
-        title="Current Turn",
-    )
-    disposition_eligibility: dict[str, str] | None = Field(
-        None,
-        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when a qualifying causal-absence row is on the case, which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
-        title="Disposition Eligibility",
-    )
-    investigation_turn: conint(ge=0) | None = Field(
-        None,
-        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
-        title="Investigation Turn",
-    )
-    problem_statement: constr(max_length=1000) | None = Field(
-        None,
-        description="Confirmed problem statement carried over from INQUIRY (sourced from case.description).",
-        title="Problem Statement",
-    )
-    problem_verification: ProblemVerificationData | None = Field(
-        None,
-        description="Where the problem statement stood when the case ended, as on the INVESTIGATING response: a case closed as `closed_false_alarm` carries `invalidated` with its `invalidation_finding`, and a statement a revision or an edit changed carries `original_problem_statement`. Null for a case closed from INQUIRY, which confirmed no statement.",
-    )
-    reports_available: list[ReportAvailability] | None = Field(
-        None,
-        description="Available reports (incident report, post-mortem, runbook)",
-        title="Reports Available",
-    )
-    resolution_summary: ResolutionSummary = Field(
-        ..., description="Overall resolution metrics and insights"
-    )
-    resolved_at: AwareDatetime = Field(
-        ..., description="When case was resolved", title="Resolved At"
-    )
-    root_cause: RootCauseSummary = Field(..., description="What caused the problem")
-    solution_applied: SolutionSummary = Field(..., description="Solution that fixed the problem")
-    state: State = Field(
-        ...,
-        description="Case terminal state: 'resolved' (with solution) or 'closed' (without investigation)",
-        title="State",
-    )
-    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
-    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
-    uploaded_files_count: int | None = Field(
-        0, description="Number of uploaded files", title="Uploaded Files Count"
-    )
-    valid_next_states: list[str] | None = Field(
-        None,
-        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
-        title="Valid Next States",
-    )
-    verification_status: SolutionVerificationData = Field(
-        ..., description="How solution effectiveness was verified"
     )
 
 
