@@ -16,7 +16,9 @@ thread with :func:`try_begin_turn` and release it with :func:`end_turn`.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -35,6 +37,8 @@ from faultmaven import (
     FaultMavenRateLimitError,
     FaultMavenTimeoutError,
     FaultMavenWorkspaceUnlinkedError,
+    IdempotencyKeyReuseError,
+    IdempotencyReplayUnavailableError,
     TurnResult,
 )
 from rendering import build_turn_blocks
@@ -69,14 +73,39 @@ TURN_ERROR_TEXT = (
     ":warning: FaultMaven hit an error on that turn. Please try again or "
     "@mention me."
 )
-# The turn may have completed backend-side — do NOT advise a retry (a resent
-# message would run a duplicate turn against state the user never saw). Worded
+# Shown only once the recovery loop has run out (FAULTMAVEN_TURN_RECOVERY_SECONDS):
+# until then the turn is re-sent under its own key and its answer, when it
+# comes, is posted instead. The turn may have committed, so this points at the
+# case rather than at a re-send: a re-send is a NEW message with a new key, so
+# it would run the turn a second time against state the user never saw. Worded
 # to hold whether or not a case/turn had yet been recorded (a create-case
 # timeout reaches here too), so it never asserts a commit that didn't happen.
 TURN_TIMEOUT_TEXT = (
-    ":hourglass: I gave up waiting on the backend — that turn may still be "
-    "completing on the case. Give it a moment before re-sending the same "
-    "message or files."
+    ":hourglass: I stopped waiting on the backend — that turn may still have "
+    "gone through. Check the case before sending it again: a re-send runs as a "
+    "new turn, and would repeat it if it did."
+)
+#: What the thread shows, once, when a turn's first attempt went unanswered and
+#: the agent is waiting on it under its key. "Working", not "investigating", for
+#: the reason :data:`WORKING_PLACEHOLDER` gives.
+STILL_WORKING_TEXT = (
+    ":hourglass_flowing_sand: Still working — this turn is taking longer than "
+    "usual…"
+)
+# The turn COMMITTED; only its reply was lost (the backend can no longer replay
+# it). So nothing here invites a re-send, which would run it twice: the case has
+# the turn, and a follow-up continues from it.
+REPLAY_UNAVAILABLE_TEXT = (
+    ":white_check_mark: That turn was saved to the case, but I couldn't fetch "
+    "its reply. Ask a follow-up and I'll pick up from there."
+)
+# The backend refused the turn's key as already used for a different turn. Every
+# key comes from one Slack message, click or shortcut, so this is a fault on our
+# side, never the user's. Nothing of this turn ran, so sending it again (a new
+# message, so a new key) is safe.
+KEY_REUSE_TEXT = (
+    ":warning: FaultMaven refused that turn as a repeat of a different one — a "
+    "fault on my side, not yours. Nothing was applied; please send it again."
 )
 #: How a thread starts over once its case is gone, by surface. Slack marks a
 #: 1:1 conversation with a ``D`` channel-id prefix; this is the one thing that
@@ -249,6 +278,10 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # the original ordering.
     if isinstance(exc, FaultMavenTimeoutError):
         return TURN_TIMEOUT_TEXT
+    # Above the shutdown override: the turn committed, which a restart does not
+    # undo, so "resend it in a minute" would run it twice.
+    if isinstance(exc, IdempotencyReplayUnavailableError):
+        return REPLAY_UNAVAILABLE_TEXT
     # Also checked before the shutdown override: a dead credential outlives the
     # restart the shutdown message promises, so "resend in a minute" would be a
     # false promise.
@@ -283,6 +316,10 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # neither is a malfunction.
     if isinstance(exc, CaseVersionConflictError):
         return CASE_BUSY_TEXT
+    # A labelled 409 and nothing ran, so the generic 4xx "won't help" below
+    # would be false: a re-send is a new key.
+    if isinstance(exc, IdempotencyKeyReuseError):
+        return KEY_REUSE_TEXT
     # Backend backpressure. Transient, so it must NOT get the generic 4xx
     # "re-sending won't help" — but TURN_ERROR_TEXT's bare "please try again"
     # was no better: it dropped both the reason and the wait, so the user
@@ -318,9 +355,9 @@ def retry_may_help(exc: Exception) -> bool:
     opposite things.
 
     False for the whole "don't re-send" family, each for its own reason:
-    a timeout's turn may have COMMITTED (a re-click double-submits it against
-    state the user never saw), a dead credential and a concluded case reproduce
-    identically forever, a 4xx rejects the same input every time, and a missing
+    a timeout's turn may have COMMITTED and an unreplayable one DID (a re-click
+    double-submits it against state the user never saw), a dead credential and
+    a concluded case reproduce identically forever, a 4xx rejects the same input every time, and a missing
     case has already been unlinked — its retry wouldn't repeat the failure, it
     would land the stale decision on whatever fresh case the thread opens next,
     which is worse than refusing it.
@@ -330,6 +367,7 @@ def retry_may_help(exc: Exception) -> bool:
         exc,
         (
             FaultMavenTimeoutError,
+            IdempotencyReplayUnavailableError,
             FaultMavenCredentialError,
             FaultMavenWorkspaceUnlinkedError,
             CaseTerminalError,
@@ -339,7 +377,10 @@ def retry_may_help(exc: Exception) -> bool:
         return False
     if _shutting_down.is_set():
         return True  # RESTARTING_TEXT: "please resend it in a minute"
-    if isinstance(exc, (CaseVersionConflictError, FaultMavenRateLimitError)):
+    if isinstance(
+        exc,
+        (CaseVersionConflictError, IdempotencyKeyReuseError, FaultMavenRateLimitError),
+    ):
         return True
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         return exc.status_code == 429  # a 429 is backpressure, not a bad request
@@ -767,6 +808,34 @@ def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None
     return None
 
 
+def turn_key(*identity: str | None) -> str:
+    """The ``Idempotency-Key`` for one logical turn, from Slack's own identity.
+
+    A message turn is ``(team, channel, message ts)``, a button click
+    ``(team, channel, action_ts)`` and a shortcut ``(team, trigger_id)``. The
+    message ts and the trigger_id are what this agent already dedupes Slack's
+    redeliveries on, so a redelivered event (even to a restarted process, whose
+    in-memory dedup is empty) is the same turn to the backend too; an action_ts
+    names one click. Two different messages or clicks are never one key.
+
+    sha256 hex: deterministic, 64 characters, and inside the header's published
+    grammar (8–255 of ``[A-Za-z0-9_-]``) whatever the identity contains — a
+    Slack ts carries a dot, which the grammar refuses. Not truncated; it fits.
+
+    A missing part would make every turn that lacks it share one key, and the
+    second would be refused as a reuse. Slack always sends these, but if one is
+    ever absent the turn gets a fresh random key: it still recovers within this
+    process, it only loses the redelivery match.
+    """
+
+    if not all(identity):
+        logger.warning(
+            "turn identity incomplete (%r); using a one-off Idempotency-Key", identity
+        )
+        return secrets.token_hex(32)
+    return hashlib.sha256(":".join(identity).encode("utf-8")).hexdigest()
+
+
 def slack_ts_to_iso(ts: str | None) -> str | None:
     """Slack's ``"1754336177.123456"`` → an ISO-8601 UTC instant, or None.
 
@@ -800,11 +869,13 @@ def run_turn(
     channel_id: str,
     thread_ts: str,
     text: str,
+    idempotency_key: str,
     pasted_content: str | None = None,
     source_url: str | None = None,
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
+    on_waiting=None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
 
@@ -830,6 +901,10 @@ def run_turn(
       before this turn. It travels as structured metadata, never as text
       prepended to ``pasted_content``: the engine must not be able to tell a
       Slack-forwarded alert from the same alert pasted into the Copilot.
+    - ``idempotency_key`` names this logical turn (:func:`turn_key` of the
+      message that asked for it) and ``on_waiting`` is the surface's
+      "still working" notice; both go to :meth:`FaultMavenClient.submit_turn`,
+      whose recovery loop holds the thread's gate for as long as it waits.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -861,6 +936,7 @@ def run_turn(
         if pasted_content or source_url or files:
             result = fm.submit_turn(
                 case_id,
+                idempotency_key=idempotency_key,
                 query=text,
                 pasted_content=pasted_content or None,
                 source_url=source_url,
@@ -868,9 +944,16 @@ def run_turn(
                 files=files or None,
                 input_type="paste" if pasted_content else None,
                 team_id=team_id,
+                on_waiting=on_waiting,
             )
         else:
-            result = fm.submit_turn(case_id, query=text, team_id=team_id)
+            result = fm.submit_turn(
+                case_id,
+                idempotency_key=idempotency_key,
+                query=text,
+                team_id=team_id,
+                on_waiting=on_waiting,
+            )
     except CaseNotFoundError:
         # The case is gone server-side (deleted from the dashboard, a DB reset,
         # a restore that predates it) — tombstone the mapping so this thread
@@ -878,11 +961,26 @@ def run_turn(
         # was ours, which is what lets the next reply get an explanation.
         unlink_stale_case(store, team_id, channel_id, thread_ts, case_id)
         raise
+    except IdempotencyReplayUnavailableError:
+        # The turn committed; only its reply is gone. The case has it, so the
+        # thread is seeded exactly as if the reply had arrived: re-sending the
+        # catch-up context next turn would hand the case its own history again.
+        _mark_seeded(store, team_id, channel_id, thread_ts)
+        raise
 
-    # The turn is committed. A store-write failure here (a closed DB during a
-    # shutdown/drain race, a lock, a full disk) must NOT sink the reply and
-    # mislabel it a turn error — the only cost of a missed seed is that the
-    # one-time catch-up context is re-sent next turn.
+    _mark_seeded(store, team_id, channel_id, thread_ts)
+    return result
+
+
+def _mark_seeded(store: CaseStore, team_id: str, channel_id: str, thread_ts: str) -> None:
+    """Record that the thread's case has a turn. Never raises.
+
+    The turn is committed. A store-write failure here (a closed DB during a
+    shutdown/drain race, a lock, a full disk) must NOT sink the reply and
+    mislabel it a turn error — the only cost of a missed seed is that the
+    one-time catch-up context is re-sent next turn.
+    """
+
     try:
         store.mark_seeded(team_id, channel_id, thread_ts)
     except Exception as exc:  # noqa: BLE001 — never lose a committed turn to a store write
@@ -890,7 +988,6 @@ def run_turn(
             "mark_seeded failed for thread %s (committed turn kept): %s",
             thread_ts, exc,
         )
-    return result
 
 
 def post_placeholder(
@@ -950,6 +1047,7 @@ def run_turn_and_post(
     thread_ts: str,
     team_id: str,
     text: str,
+    idempotency_key: str,
     pasted_content: str | None = None,
     source_url: str | None = None,
     observed_at: str | None = None,
@@ -974,7 +1072,9 @@ def run_turn_and_post(
     etiquette note about the one-at-a-time behavior (``intro_note`` overrides that
     note for surfaces with different etiquette, e.g. the plain DM).
     ``placeholder_ts`` reuses a placeholder a caller already posted (e.g. before a
-    slow file download).
+    slow file download). ``idempotency_key`` is the turn's :func:`turn_key`;
+    while the client waits on a slow turn under it, the placeholder is updated
+    once to :data:`STILL_WORKING_TEXT`.
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise
@@ -1020,6 +1120,10 @@ def run_turn_and_post(
                 observed_at=observed_at,
                 prior_context=prior_context,
                 files=files,
+                # The same key on the fallback re-send too: the backend refused
+                # the first with a 400, so nothing committed under it.
+                idempotency_key=idempotency_key,
+                on_waiting=lambda: update(STILL_WORKING_TEXT),
             )
 
         try:

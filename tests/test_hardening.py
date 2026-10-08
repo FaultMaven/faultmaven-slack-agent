@@ -26,6 +26,7 @@ from listeners.events import is_thread_followup_candidate
 from rendering import _chunk, build_turn_blocks
 from slack_mrkdwn import to_mrkdwn
 from store import CaseStore
+from tests._clock import FakeClock
 
 
 # -- untrusted-content escaping (mrkdwn injection) -----------------------------
@@ -124,6 +125,9 @@ def _client(handler, *, token: str = "", dev: str = "") -> FaultMavenClient:
     client._http = httpx.Client(
         base_url="http://test", transport=httpx.MockTransport(handler)
     )
+    # A turn whose outcome is unknown is re-sent until the recovery bound runs
+    # out; on the fake clock that takes no wall time.
+    FakeClock().install(client)
     return client
 
 
@@ -133,7 +137,7 @@ def test_submit_turn_404_raises_case_not_found_with_detail():
 
     client = _client(handler, token="tok")
     with pytest.raises(CaseNotFoundError) as err:
-        client.submit_turn("dead", query="hi")
+        client.submit_turn("dead", query="hi", idempotency_key="test-turn-key")
     assert err.value.status_code == 404
     assert "Case not found" in err.value.detail
 
@@ -144,7 +148,7 @@ def test_submit_turn_4xx_carries_backend_detail():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.status_code == 400
     assert "file type not allowed" in err.value.detail
 
@@ -172,7 +176,7 @@ def test_submit_turn_4xx_carries_protection_error_message():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
 
     assert err.value.status_code == 429
     assert err.value.detail == message
@@ -193,7 +197,7 @@ def test_submit_turn_4xx_message_fallback_does_not_shadow_detail():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.detail == "file type not allowed"
 
 
@@ -213,7 +217,7 @@ def test_submit_turn_422_list_detail_still_falls_back_to_raw_text():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert "field required" in err.value.detail
 
 
@@ -223,7 +227,7 @@ def test_submit_turn_timeout_is_typed():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenTimeoutError):
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
 
 
 def test_preset_token_is_never_wiped_on_401():
@@ -407,7 +411,7 @@ def test_failed_first_turn_keeps_thread_linked_but_unseeded():
     fm = _FM(fail=FaultMavenAPIError("boom", status_code=502, detail=""))
     with pytest.raises(FaultMavenAPIError):
         _turn.run_turn(
-            fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi"
+            fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi", idempotency_key="test-turn-key"
         )
     assert store.get("T", "C", "TS") == "case_1"  # linked: retries route here
     assert not store.is_seeded("T", "C", "TS")  # callers re-send the seed
@@ -415,7 +419,7 @@ def test_failed_first_turn_keeps_thread_linked_but_unseeded():
     fm_ok = _FM()
     _turn.run_turn(
         fm_ok, store, team_id="T", channel_id="C", thread_ts="TS",
-        text="hi again", prior_context="the catch-up, re-delivered",
+        text="hi again", prior_context="the catch-up, re-delivered", idempotency_key="test-turn-key",
     )
     assert fm_ok.turns[0][1]["pasted_content"] == "the catch-up, re-delivered"
     assert store.is_seeded("T", "C", "TS")
@@ -427,7 +431,7 @@ def test_stale_mapping_evicted_on_server_side_404():
     fm = _FM(fail=CaseNotFoundError("gone", status_code=404, detail=""))
     with pytest.raises(CaseNotFoundError):
         _turn.run_turn(
-            fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi"
+            fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi", idempotency_key="test-turn-key"
         )
     assert store.unlinked == [("T", "C", "TS")]
     assert store.get("T", "C", "TS") is None  # nothing left to submit against
@@ -458,7 +462,7 @@ _COMMON = dict(channel="C", thread_ts="TS", team_id="T")
 def test_turn_failure_renders_typed_error_text():
     client = _SlackClient()
     fm = _FM(fail=FaultMavenAPIError("no", status_code=400, detail="too big"))
-    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON)
+    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON, idempotency_key="test-turn-key")
     assert "won't help" in client.updates[0]["text"]
 
 
@@ -469,7 +473,7 @@ def test_post_failure_after_committed_turn_degrades_to_plain_text():
 
     client = _SlackClient(fail_updates=1)
     fm = _FM()
-    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON)
+    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON, idempotency_key="test-turn-key")
     assert len(fm.turns) == 1
     fallback = client.updates[0]
     assert "blocks" not in fallback
@@ -480,7 +484,7 @@ def test_post_failure_after_committed_turn_degrades_to_plain_text():
 def test_every_update_failing_never_raises():
     client = _SlackClient(fail_updates=10)
     fm = _FM()
-    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON)
+    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON, idempotency_key="test-turn-key")
     assert len(fm.turns) == 1  # turn ran; nothing propagated to the runner
 
 
@@ -488,7 +492,7 @@ def test_dm_intro_note_is_attached_on_first_turn():
     client = _SlackClient()
     fm = _FM()
     _turn.run_turn_and_post(
-        client, fm, _Store(), text="hi", intro_note="reply in thread", **_COMMON
+        client, fm, _Store(), text="hi", intro_note="reply in thread", **_COMMON, idempotency_key="test-turn-key"
     )
     contexts = [
         e["text"]
@@ -782,7 +786,7 @@ def test_post_failure_fallback_is_escaped_end_to_end():
     fm.submit_turn = lambda cid, **kw: TurnResult(
         agent_response="quoting evidence: <!here> ping"
     )
-    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON)
+    _turn.run_turn_and_post(client, fm, _Store(), text="hi", **_COMMON, idempotency_key="test-turn-key")
     fallback = client.updates[0]
     assert "<!here>" not in fallback["text"]
     assert "&lt;!here>" in fallback["text"]
@@ -833,7 +837,7 @@ def test_poll_location_404_is_not_case_not_found():
     client = _client(handler, token="tok")
     client._timeout = 3.0  # keep the poll's first sleep short
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert not isinstance(err.value, CaseNotFoundError)
     assert err.value.status_code == 404
 
@@ -887,7 +891,7 @@ def test_a_backend_429_reaches_slack_as_rate_limit_text_with_the_wait():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenRateLimitError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
 
     text = _turn.turn_error_text(err.value)
     assert "rate-limiting" in text
@@ -911,7 +915,7 @@ def test_the_retry_after_header_wins_over_the_body():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenRateLimitError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.retry_after == 30
 
 
@@ -921,7 +925,7 @@ def test_a_429_with_a_non_json_body_still_carries_the_header_wait():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenRateLimitError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.retry_after == 60
     assert "60 seconds" in _turn.turn_error_text(err.value)
 
@@ -935,7 +939,7 @@ def test_an_unparseable_retry_after_degrades_to_no_interval(bad):
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenRateLimitError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.retry_after is None
     assert "in a little while" in _turn.turn_error_text(err.value)
 
@@ -946,7 +950,7 @@ def test_a_429_without_any_retry_signal_still_says_rate_limited():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenRateLimitError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert err.value.retry_after is None
     assert "rate-limiting" in _turn.turn_error_text(err.value)
 
@@ -959,6 +963,6 @@ def test_a_rate_limit_error_is_still_a_faultmaven_api_error():
 
     client = _client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", query="hi")
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
     assert isinstance(err.value, FaultMavenRateLimitError)
     assert err.value.status_code == 429

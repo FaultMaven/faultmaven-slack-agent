@@ -32,6 +32,7 @@ from ._turn import (
     skipped_files_note,
     try_begin_turn,
     turn_error_text,
+    turn_key,
 )
 
 # Short conversational opener posted once on thread start. Kept deliberately
@@ -101,6 +102,16 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 logger.warning("assistant post failed in %s: %s", channel, exc)
                 return False
 
+        def still_working() -> None:
+            """The panel's notice for a turn the client is waiting on under its
+            key: Slack's own status line, so nothing is posted into the thread
+            that would then need taking down. Cosmetic, and guarded like the
+            first ``set_status`` below."""
+            try:
+                set_status("is still working — this is taking longer than usual…")
+            except Exception as status_exc:  # noqa: BLE001
+                logger.warning("set_status failed while waiting: %s", status_exc)
+
         def turn_work() -> None:
             # This thread was an investigation whose case has since gone
             # missing. Opening a fresh one behind the user's back would answer
@@ -154,8 +165,12 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     channel_id=channel,
                     thread_ts=thread_ts,
                     text=query,
+                    # The message is the turn: the identity its redelivery is
+                    # deduped on above.
+                    idempotency_key=turn_key(team_id, channel, payload.get("ts")),
                     pasted_content=pasted_text,
                     files=files or None,
+                    on_waiting=still_working,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("assistant user_message failed: %s", exc)
@@ -194,8 +209,8 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
         except Exception as status_exc:  # noqa: BLE001
             logger.warning("set_status failed; continuing turn: %s", status_exc)
 
-        # Offload the slow part (downloads up to 20s/file + a turn up to the
-        # 120s API timeout) to a tracked daemon, exactly like the channel
+        # Offload the slow part (downloads up to 20s/file + a turn up to
+        # FAULTMAVEN_TURN_RECOVERY_SECONDS) to a tracked daemon, exactly like the channel
         # surfaces: Bolt's listener executor defaults to FIVE workers, and five
         # concurrent Assistant turns would otherwise starve every ack() in the
         # app (buttons, shortcuts) past Slack's 3-second window. offload_turn

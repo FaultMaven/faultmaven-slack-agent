@@ -219,7 +219,7 @@ def test_shortcut_core_seeds_case_with_extracted_message():
     # The shortcut sends the alert as pasted_content (this-turn evidence).
     _turn.run_turn(
         fm, store, team_id="T", channel_id="C", thread_ts="msg_ts",
-        text="Please investigate this.", pasted_content=alert, source_url="https://slack/p1",
+        text="Please investigate this.", pasted_content=alert, source_url="https://slack/p1", idempotency_key="test-turn-key",
     )
     assert calls["create"] == (None, None)  # no initial_message seed
     case_id, kw = calls["turns"][0]
@@ -270,8 +270,8 @@ def test_pasted_content_is_sent_on_an_existing_case_too():
 
     fm, store = FakeFM(), FakeStore()
     kw = dict(team_id="T", channel_id="C", thread_ts="t1")
-    _turn.run_turn(fm, store, text="q1", pasted_content="alert A", **kw)  # creates
-    _turn.run_turn(fm, store, text="q2", pasted_content="alert B", **kw)  # existing
+    _turn.run_turn(fm, store, text="q1", pasted_content="alert A", **kw, idempotency_key="test-turn-key")  # creates
+    _turn.run_turn(fm, store, text="q2", pasted_content="alert B", **kw, idempotency_key="test-turn-key")  # existing
     assert fm.creates == 1
     assert turns[0]["pasted_content"] == "alert A"
     assert turns[1]["pasted_content"] == "alert B"  # NOT dropped on existing case
@@ -314,7 +314,7 @@ def test_run_turn_forwards_files_even_without_text_evidence():
     files = [("app.log", b"boom", "text/plain")]
     _turn.run_turn(
         FakeFM(), FakeStore(), team_id="T", channel_id="C", thread_ts="t1",
-        text="Please investigate this.", pasted_content=None, files=files,
+        text="Please investigate this.", pasted_content=None, files=files, idempotency_key="test-turn-key",
     )
     assert turns[0]["files"] == files
     assert turns[0]["pasted_content"] is None  # no text, files carry the evidence
@@ -380,7 +380,7 @@ def test_run_turn_forwards_observation_time():
         fm, _MemStore(), team_id="T", channel_id="C", thread_ts="t1",
         text="Please investigate this.",
         pasted_content="[FIRING:1] etcdInsufficientMembers",
-        observed_at="2026-08-04T19:36:17+00:00",
+        observed_at="2026-08-04T19:36:17+00:00", idempotency_key="test-turn-key",
     )
     assert fm.turns[0]["observed_at"] == "2026-08-04T19:36:17+00:00"
 
@@ -397,7 +397,7 @@ def test_observation_time_is_withheld_when_a_thread_replay_is_merged_in():
         text="Please investigate this.",
         pasted_content="[FIRING:1] etcdInsufficientMembers",
         observed_at="2026-08-04T19:36:17+00:00",
-        prior_context="earlier: we restarted kmaster-2",
+        prior_context="earlier: we restarted kmaster-2", idempotency_key="test-turn-key",
     )
     assert fm.turns[0]["observed_at"] is None
     assert "restarted kmaster-2" in fm.turns[0]["pasted_content"]
@@ -414,7 +414,7 @@ def test_observation_time_is_not_prepended_to_the_message_text():
     _turn.run_turn(
         fm, _MemStore(), team_id="T", channel_id="C", thread_ts="t1",
         text="Please investigate this.", pasted_content=alert,
-        observed_at="2026-08-04T19:36:17+00:00",
+        observed_at="2026-08-04T19:36:17+00:00", idempotency_key="test-turn-key",
     )
     assert fm.turns[0]["pasted_content"] == alert
 

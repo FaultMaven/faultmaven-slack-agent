@@ -46,7 +46,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -145,6 +145,70 @@ def _as_list(value: Any) -> list:
 # version conflict, as opposed to the (unlabelled) terminal-case rejection that
 # shares the status. Sent alongside x-expected-version / x-actual-version.
 _VERSION_CONFLICT_CODE = "CASE_VERSION_CONFLICT"
+# The label the core will put on its terminal-case 409s. Honored here BEFORE the
+# core sends it (faultmaven#1888 A11): the unlabelled mapping below stays, so the
+# core can start labelling without a window where Slack calls a closed case a
+# generic rejection.
+_CASE_TERMINAL_CODE = "CASE_TERMINAL"
+
+# The turn receipt's answers (contract 12.2.0, faultmaven#1888). A turn sent with
+# an ``Idempotency-Key`` commits a receipt with it, so a retry under the same key
+# is answered with the committed turn instead of running it again.
+#: 409: a request under this key is still running; retry after ``Retry-After``.
+_TURN_IN_PROGRESS_CODE = "TURN_IN_PROGRESS"
+#: 409: this key was already used for a DIFFERENT turn on this case.
+_KEY_REUSE_CODE = "IDEMPOTENCY_KEY_REUSE"
+#: 409: the turn committed, but its stored response no longer replays.
+_REPLAY_UNAVAILABLE_CODE = "IDEMPOTENCY_REPLAY_UNAVAILABLE"
+#: 504 from the app itself: the turn ran out of time and NOTHING committed. A
+#: gateway's 502/504 carries no label and may front a turn that did commit.
+_REQUEST_TIMEOUT_CODE = "REQUEST_TIMEOUT"
+#: Set ``true`` on a 200 that replays a committed turn.
+_REPLAYED_HEADER = "x-idempotency-replayed"
+
+# How long to wait before re-polling a TURN_IN_PROGRESS key. ``Retry-After`` is
+# the remaining TTL of the first request's claim, which is an UPPER bound: the
+# claim outlives its turn by up to ~48.5 s of margin. So the clamp is a poll
+# interval, not a schedule. Polling sooner is cheap (each poll is answered from
+# the claim or the receipt, never by running the turn) and correct.
+_IN_PROGRESS_POLL_MIN_SECONDS = 1.0
+_IN_PROGRESS_POLL_MAX_SECONDS = 60.0
+# Backoff before re-sending after an attempt whose outcome is unknown (a client
+# timeout, a gateway 502/504, a dropped connection). Without it, a gateway that
+# fails fast would be re-POSTed in a tight loop for the whole recovery bound.
+_RECOVERY_BACKOFF_FIRST_SECONDS = 1.0
+_RECOVERY_BACKOFF_MAX_SECONDS = 30.0
+
+
+def _next_backoff(seconds: float) -> float:
+    """The wait after ``seconds``: doubled, up to the cap."""
+
+    return min(seconds * 2, _RECOVERY_BACKOFF_MAX_SECONDS)
+
+
+def _in_progress_poll_seconds(retry_after: int | None) -> float:
+    """How long to wait on a TURN_IN_PROGRESS before asking again.
+
+    ``Retry-After`` clamped to the poll interval. Absent or unreadable, the
+    shortest poll: asking early costs one cheap 409, waiting too long costs the
+    user the wait.
+    """
+
+    if retry_after is None:
+        return _IN_PROGRESS_POLL_MIN_SECONDS
+    return float(
+        min(max(retry_after, _IN_PROGRESS_POLL_MIN_SECONDS), _IN_PROGRESS_POLL_MAX_SECONDS)
+    )
+
+
+def _notify_waiting(on_waiting: Callable[[], None]) -> None:
+    """Run a surface's "still working" callback. Never raises: it is cosmetic,
+    and the turn it reports on is still in flight."""
+
+    try:
+        on_waiting()
+    except Exception as exc:  # noqa: BLE001 — a notice must never cost the turn
+        logger.warning("could not show the still-working notice: %s", exc)
 
 
 class FaultMavenError(Exception):
@@ -234,6 +298,25 @@ class CaseVersionConflictError(FaultMavenAPIError):
     """
 
 
+class IdempotencyKeyReuseError(FaultMavenAPIError):
+    """The turn's ``Idempotency-Key`` was already used for a different turn (409).
+
+    Only reachable through a bug of ours: every key is derived from one Slack
+    message, button click or shortcut invocation, and re-sent only with the
+    bytes it was first sent with. Typed so it is not mistaken for a terminal
+    case (a labelled 409) and so nobody is told to re-send it.
+    """
+
+
+class IdempotencyReplayUnavailableError(FaultMavenAPIError):
+    """The turn COMMITTED, but its stored reply can no longer be replayed (409).
+
+    A deploy changed the response schema between the commit and the retry. The
+    case has the turn; only the reply text is lost. Running it again is the one
+    wrong answer, so callers record the turn as landed and say so.
+    """
+
+
 class FaultMavenCredentialError(FaultMavenError):
     """The refresh credential is dead; only an operator can restore service.
 
@@ -311,7 +394,20 @@ class FaultMavenTimeoutError(FaultMavenError):
 
     Distinguished so the user-facing message can warn against blind re-sends
     (a resent message runs a duplicate turn against state the user never saw).
+
+    From :meth:`FaultMavenClient.submit_turn` it means the recovery loop has
+    already re-sent the turn under its own key for as long as it was allowed
+    to, so "the agent gave up" is final for this message: a re-send is a NEW
+    message, a new key, and a second turn if the first one committed.
     """
+
+
+def _unknown_outcome(message: str, cause: BaseException) -> FaultMavenTimeoutError:
+    """The "may have committed" error for an attempt, chained to its cause."""
+
+    error = FaultMavenTimeoutError(message)
+    error.__cause__ = cause
+    return error
 
 
 @dataclass(slots=True)
@@ -337,6 +433,10 @@ class TurnResult:
     # renderer places beside it so Slack never forwards the claim bare.
     cause_assurance: str | None = None
     cause_overclaim: bool | None = None
+    #: True when the backend answered from the turn receipt
+    #: (``X-Idempotency-Replayed: true``): the turn committed on an earlier
+    #: attempt whose reply never arrived, and this is that turn.
+    replayed: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -415,7 +515,8 @@ class FaultMavenClient:
         *,
         token: str = "",
         dev_login_username: str = "",
-        timeout: float = 120.0,
+        timeout: float = 150.0,
+        turn_recovery_seconds: float = 660.0,
         refresh_token: str = "",
         credential_store: Any = None,
         oauth_client_id: str = "faultmaven-slack-agent",
@@ -474,7 +575,17 @@ class FaultMavenClient:
         self._warned_unbound: set[str] = set()
 
         self._timeout = timeout
+        # The whole wait for ONE turn, every attempt included (see
+        # :meth:`submit_turn`). ``_timeout`` bounds a single attempt.
+        self._turn_recovery_seconds = turn_recovery_seconds
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
+        # Set at shutdown: a turn in its recovery loop stops re-sending at the
+        # next attempt boundary, and a wait between attempts ends at once.
+        self._stopping = threading.Event()
+        # The recovery loop's clock and its interruptible sleep. Attributes so a
+        # test can drive the loop on a fake clock instead of wall time.
+        self._clock = time.monotonic
+        self._wait = self._stopping.wait
 
     # -- lifecycle ----------------------------------------------------------
     def startup(self) -> None:
@@ -516,7 +627,20 @@ class FaultMavenClient:
         except Exception as exc:  # noqa: BLE001 — best-effort bootstrap, never fatal
             logger.warning("FaultMaven auth deferred: %s", exc)
 
+    def begin_shutdown(self) -> None:
+        """Stop turns from starting new recovery attempts.
+
+        Called at the start of the shutdown drain, BEFORE :meth:`close`: a turn
+        mid-attempt still finishes that attempt (and posts its reply if it gets
+        one), but none re-sends after it and a wait between attempts ends at
+        once. The turn then reports the timeout, so its thread is told it may
+        have gone through rather than left at "Working…".
+        """
+
+        self._stopping.set()
+
     def close(self) -> None:
+        self._stopping.set()
         self._keepalive_stop.set()
         keepalive = self._keepalive
         if keepalive is not None:
@@ -1318,18 +1442,29 @@ class FaultMavenClient:
         json: dict[str, Any] | None = None,
         data: dict[str, str] | None = None,
         files: list | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         """POST with the bearer token, re-authenticating once on a 401.
 
         Handles the long-lived-process case where the token expires (dev-login
         tokens default to a 1-hour TTL): a 401 triggers exactly one re-login +
         retry, so turns keep working without a restart.
+
+        ``headers`` ride on BOTH posts. The re-auth re-POST is the attempt that
+        actually runs the turn, so a turn's ``Idempotency-Key`` must travel on
+        it: sent bare, a turn that committed with its reply lost would be run a
+        second time by the keyed recovery attempt after it, because the backend
+        has no receipt to answer that attempt with. ``timeout`` overrides the
+        client's per-request one.
         """
 
+        extra = {"timeout": timeout} if timeout is not None else {}
         token = self._current_token(cred)
         resp = self._http.post(
             url, json=json, data=data, files=files,
-            headers=self._auth_header(token),
+            headers={**self._auth_header(token), **(headers or {})},
+            **extra,
         )
         if resp.status_code == 401:
             if not cred.refresh_token and (
@@ -1347,7 +1482,8 @@ class FaultMavenClient:
             token = self._reauth(cred, token)
             resp = self._http.post(
                 url, json=json, data=data, files=files,
-                headers=self._auth_header(token),
+                headers={**self._auth_header(token), **(headers or {})},
+                **extra,
             )
         return resp
 
@@ -1698,6 +1834,7 @@ class FaultMavenClient:
         self,
         case_id: str,
         *,
+        idempotency_key: str,
         query: str | None = None,
         pasted_content: str | None = None,
         files: list[tuple[str, bytes, str]] | None = None,
@@ -1707,6 +1844,7 @@ class FaultMavenClient:
         source_url: str | None = None,
         observed_at: str | None = None,
         team_id: str | None = None,
+        on_waiting: Callable[[], None] | None = None,
     ) -> TurnResult:
         """Submit one turn (multipart) and return the normalized result.
 
@@ -1716,6 +1854,37 @@ class FaultMavenClient:
         was observed — distinct from when it was submitted. The backend
         defaults to submission time when it is absent, which reads a
         two-hour-old alert as current.
+
+        ``idempotency_key`` names this ONE logical turn (one Slack message,
+        click or shortcut invocation) and rides on every attempt at it. It is
+        required, with no default, because an unkeyed turn cannot be recovered:
+        the backend answers a retry with the committed turn only when the retry
+        carries the key the turn committed under.
+
+        **Recovery.** An attempt whose outcome is unknown — the client timed
+        out, a gateway answered 502/504, or the connection dropped after the
+        body was sent — usually means the turn is still running or has already
+        committed. Instead of giving up, the same request is re-sent under the
+        same key until the backend answers with the turn, for at most
+        ``turn_recovery_seconds`` in all:
+
+        - ``200`` is the answer; with ``X-Idempotency-Replayed`` it is the turn
+          an earlier attempt committed.
+        - ``409 TURN_IN_PROGRESS``: an earlier attempt is still running. Wait
+          ``Retry-After`` (clamped to a poll interval), then ask again.
+        - ``409 CASE_VERSION_CONFLICT`` while recovering: without a claim store
+          a re-send can run beside the first attempt and lose to it; the next
+          attempt replays. Re-sent once; a second one is the ordinary conflict.
+        - ``504 REQUEST_TIMEOUT``: the backend ran the turn out of time and
+          committed nothing. Re-sent once; a second one is final, because the
+          turn exhausts the ceiling on this input.
+        - anything else is mapped as it always was.
+
+        ``on_waiting`` is called at most once, when the first re-send is
+        decided, so a surface can tell the user the turn is taking longer than
+        usual. It must not raise; if it does, the failure is logged and the turn
+        goes on. When the bound runs out (or the process starts shutting down)
+        the last unknown outcome is raised as :class:`FaultMavenTimeoutError`.
         """
 
         form: dict[str, str] = {}
@@ -1738,6 +1907,9 @@ class FaultMavenClient:
         if observed_at:
             form["observed_at"] = observed_at
 
+        # Built once and re-sent as is: every attempt must carry the same bytes,
+        # files included, or the backend fingerprints it as a different turn
+        # and refuses the key (IDEMPOTENCY_KEY_REUSE).
         file_parts = (
             [("files", (name, content, ctype)) for name, content, ctype in files]
             if files
@@ -1750,74 +1922,180 @@ class FaultMavenClient:
             )
 
         cred = self._credential_for(team_id)
-        start = time.monotonic()
-        polled = False
-        try:
-            resp = self._post(
-                f"/api/v1/cases/{case_id}/turns",
-                cred=cred,
-                data=form,
-                files=file_parts,
+        headers = {"Idempotency-Key": idempotency_key}
+        deadline = self._clock() + self._turn_recovery_seconds
+        # The last attempt whose outcome is unknown, raised if the loop ends
+        # without an answer. None until the first such attempt: before it, a
+        # failure that never reached the backend is safe to report as retryable.
+        pending: FaultMavenTimeoutError | None = None
+        backoff = _RECOVERY_BACKOFF_FIRST_SECONDS
+        version_conflicts = 0
+        request_timeouts = 0
+        notified = False
+
+        while True:
+            timeout = max(0.0, min(self._timeout, deadline - self._clock()))
+            # Seconds to wait before the next attempt, when this one is retried.
+            wait = 0.0
+            try:
+                resp, polled = self._send_turn(
+                    case_id, cred, form, file_parts, headers, timeout
+                )
+            except httpx.TimeoutException as exc:
+                # The backend may still complete (and commit) this turn.
+                pending = _unknown_outcome(
+                    f"submit_turn timed out after {timeout:.0f}s; the turn may "
+                    "still complete on the backend",
+                    exc,
+                )
+                wait, backoff = backoff, _next_backoff(backoff)
+            except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                # The full request body was already sent and we failed while
+                # reading the RESPONSE, so the backend may have committed this
+                # turn — the same unknown outcome as a read timeout. NOTE: a
+                # write-phase failure (WriteError) means the body never fully
+                # landed, so THIS attempt did not commit; it is handled below.
+                pending = _unknown_outcome(
+                    f"submit_turn lost the connection after sending ({exc}); "
+                    "the turn may still complete on the backend",
+                    exc,
+                )
+                wait, backoff = backoff, _next_backoff(backoff)
+            except FaultMavenTimeoutError as exc:
+                # The 202 poll ran out of this attempt's time.
+                pending = exc
+                wait, backoff = backoff, _next_backoff(backoff)
+            except httpx.HTTPError as exc:
+                # The request never reached the backend (refused, reset
+                # mid-upload). On a first attempt nothing ran, so a retry is
+                # safe and that is what the user is told. While recovering, an
+                # EARLIER attempt may have committed, so the outcome stays
+                # unknown and the loop keeps asking (a backend mid-restart
+                # refuses connections for a while).
+                if pending is None:
+                    raise FaultMavenError(f"submit_turn failed: {exc}") from exc
+                wait, backoff = backoff, _next_backoff(backoff)
+            else:
+                if resp.is_success:
+                    return self._turn_result(resp, case_id)
+                code = resp.headers.get("x-error-code")
+                if resp.status_code == 504 and code == _REQUEST_TIMEOUT_CODE:
+                    request_timeouts += 1
+                    timed_out = FaultMavenTimeoutError(
+                        "submit_turn ran out of time on the backend (HTTP 504 "
+                        "REQUEST_TIMEOUT); nothing of it committed"
+                    )
+                    if request_timeouts > 1:
+                        raise timed_out
+                    pending = timed_out
+                elif resp.status_code in (502, 504) and not code:
+                    # A gateway timed out on an upstream it had forwarded to:
+                    # the turn may be running, or committed, behind it.
+                    pending = FaultMavenTimeoutError(
+                        f"submit_turn hit a gateway timeout (HTTP "
+                        f"{resp.status_code}); the turn may still complete on "
+                        "the backend"
+                    )
+                    wait, backoff = backoff, _next_backoff(backoff)
+                elif resp.status_code == 409 and code == _TURN_IN_PROGRESS_CODE:
+                    pending = FaultMavenTimeoutError(
+                        "submit_turn: the turn is still in progress on the "
+                        "backend (409 TURN_IN_PROGRESS)"
+                    )
+                    wait = _in_progress_poll_seconds(self._retry_after(resp))
+                elif (
+                    resp.status_code == 409
+                    and code == _VERSION_CONFLICT_CODE
+                    and pending is not None
+                    and version_conflicts == 0
+                ):
+                    # A re-send that ran beside the attempt it recovers, with no
+                    # claim to stop it, and lost the case version to it: the
+                    # next attempt is answered from that attempt's receipt.
+                    version_conflicts += 1
+                else:
+                    self._raise_turn_error(resp, polled=polled)
+
+            # Retry: the same request, under the same key.
+            remaining = deadline - self._clock()
+            if remaining <= 0 or self._stopping.is_set():
+                raise pending
+            if not notified and on_waiting is not None:
+                notified = True
+                _notify_waiting(on_waiting)
+            logger.info(
+                "Re-sending turn on case %s under its key in %.0fs (%s)",
+                case_id, min(wait, remaining), pending,
             )
-            # The current backend answers turns synchronously (200). The 202 +
-            # Location poll is kept as a forward-compatible safety net only.
-            # The poll shares the POST's time budget: self._timeout is the
-            # upper bound for the WHOLE turn (see config.py), not per leg.
-            if resp.status_code == 202:
-                polled = True
-                resp = self._poll(
+            if wait > 0 and self._wait(min(wait, remaining)):
+                raise pending  # shutting down: stop between attempts
+            if deadline - self._clock() <= 0:
+                raise pending
+
+    def _send_turn(
+        self,
+        case_id: str,
+        cred: _Credential,
+        form: dict[str, str],
+        file_parts: list | None,
+        headers: dict[str, str],
+        timeout: float,
+    ) -> tuple[httpx.Response, bool]:
+        """One attempt at a turn: the POST, and the 202 poll if one is asked
+        for. Returns the final response and whether it came from the poll."""
+
+        start = time.monotonic()
+        resp = self._post(
+            f"/api/v1/cases/{case_id}/turns",
+            cred=cred,
+            data=form,
+            files=file_parts,
+            headers=headers,
+            timeout=timeout,
+        )
+        # The current backend answers turns synchronously (200). The 202 +
+        # Location poll is kept as a forward-compatible safety net only. The
+        # poll shares the POST's time budget: ``timeout`` bounds the whole
+        # attempt, not each leg.
+        if resp.status_code == 202:
+            return (
+                self._poll(
                     resp.headers.get("Location", ""),
                     cred=cred,
-                    deadline=start + self._timeout,
-                )
-        except httpx.TimeoutException as exc:
-            # The backend may still complete (and commit) this turn — typed so
-            # the user-facing message can warn against a blind re-send.
-            raise FaultMavenTimeoutError(
-                f"submit_turn timed out after {self._timeout}s; the turn may "
-                "still complete on the backend"
-            ) from exc
-        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-            # The full request body was already sent and we failed while reading
-            # the RESPONSE, so the backend may have committed this turn — same
-            # "indeterminate, don't blind-resend" class as a read timeout. NOTE:
-            # a write-phase failure (WriteError) means the body never fully
-            # landed → the turn did NOT commit → it belongs in the retryable
-            # branch below (with ConnectError), NOT here, or a mid-upload reset
-            # would tell the user not to retry a turn that never ran.
-            raise FaultMavenTimeoutError(
-                f"submit_turn lost the connection after sending ({exc}); the "
-                "turn may still complete on the backend"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise FaultMavenError(f"submit_turn failed: {exc}") from exc
+                    deadline=start + timeout,
+                ),
+                True,
+            )
+        return resp, False
+
+    def _raise_turn_error(self, resp: httpx.Response, *, polled: bool) -> None:
+        """Map a final non-2xx turn response onto the typed exceptions. Always
+        raises."""
+
         # A 404 means "case deleted" only on the turn POST itself. A 404 from
         # the polled Location URL is the STATUS resource expiring/moving — the
         # case may be alive, so it must not trigger the caller's mapping
-        # eviction. A gateway 502/504 means an upstream was forwarded then timed
-        # out — the same indeterminate/maybe-committed class as a read timeout,
-        # so it is raised as FaultMavenTimeoutError HERE (in the client, for both
-        # the POST and poll paths) rather than re-derived from a status code in
-        # the UI layer.
+        # eviction.
         try:
             self._raise_for_status(
                 resp, "submit_turn", not_found_is_case=not polled
             )
         except FaultMavenAPIError as exc:
             if exc.status_code in (502, 504):
+                # A labelled 502/504 we do not model. Still the "may have
+                # committed" class, raised here in the client so the UI layer
+                # never re-derives it from a status code.
                 raise FaultMavenTimeoutError(
                     f"submit_turn hit a gateway timeout (HTTP {exc.status_code}); "
                     "the turn may still complete on the backend"
                 ) from exc
             if exc.status_code == 409:
                 # Several unrelated conflicts share this status, and they need
-                # different advice. The two we recognize are the OCC version
-                # conflict (labelled) and the terminal-case rejection (the route
-                # raises it with no ``x-error-code``).
-                #
-                # The terminal case is therefore identified by the header being
-                # ABSENT — not by "isn't the OCC code". Other middleware emits
-                # labelled 409s on this path (the deduplication middleware sends
+                # different advice. The labelled ones are matched by label, and
+                # the terminal-case rejection the route raises with no
+                # ``x-error-code`` is matched by the header being ABSENT — not
+                # by "isn't a code we know". Other middleware emits labelled
+                # 409s on this path (the deduplication middleware sends
                 # ``DUPLICATE_REQUEST`` + ``Retry-After``, and it skips only
                 # multipart, so a text-only turn is in scope); treating those as
                 # terminal would tell a user with a live case that their
@@ -1828,11 +2106,17 @@ class FaultMavenClient:
                 # Matching the prose of ``detail`` for "closed" instead would
                 # break on any rewording of a message we don't own.
                 error_code = resp.headers.get("x-error-code")
-                if error_code == _VERSION_CONFLICT_CODE:
-                    # The label is authoritative wherever it appears, so it is
-                    # honored on the polled path too — an async turn that hits an
-                    # OCC conflict mid-execution must still be re-sendable.
-                    raise CaseVersionConflictError(
+                # The labels are authoritative wherever they appear, so they are
+                # honored on the polled path too — an async turn that hits an
+                # OCC conflict mid-execution must still be re-sendable.
+                labelled = {
+                    _VERSION_CONFLICT_CODE: CaseVersionConflictError,
+                    _KEY_REUSE_CODE: IdempotencyKeyReuseError,
+                    _REPLAY_UNAVAILABLE_CODE: IdempotencyReplayUnavailableError,
+                    _CASE_TERMINAL_CODE: CaseTerminalError,
+                }.get(error_code or "")
+                if labelled is not None:
+                    raise labelled(
                         str(exc), status_code=409, detail=exc.detail
                     ) from exc
                 # Unlabelled, and only off the POST itself: like the 404 above,
@@ -1844,12 +2128,28 @@ class FaultMavenClient:
                         str(exc), status_code=409, detail=exc.detail
                     ) from exc
             raise
+        # Reached only for a status that is neither 2xx nor an error (a 1xx or
+        # 3xx httpx did not follow): no turn to render.
+        raise FaultMavenAPIError(
+            f"submit_turn failed: HTTP {resp.status_code}",
+            status_code=resp.status_code,
+        )
+
+    def _turn_result(self, resp: httpx.Response, case_id: str) -> TurnResult:
+        """The committed turn behind a 2xx, replayed or not."""
 
         # Status was 2xx here — the turn committed. Parsing must NEVER raise
         # past this point (a JSONDecodeError from a 200 non-JSON body, or a
         # scalar where a list is expected, would surface as a "try again" on a
         # committed turn); degrade to an empty body the tolerant parser renders.
-        return self._parse_turn(self._json_or_empty(resp))
+        result = self._parse_turn(self._json_or_empty(resp))
+        if resp.headers.get(_REPLAYED_HEADER, "").lower() == "true":
+            result.replayed = True
+            logger.info(
+                "Turn on case %s answered from its receipt (committed earlier)",
+                case_id,
+            )
+        return result
 
     # -- helpers ------------------------------------------------------------
     @staticmethod

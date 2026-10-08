@@ -62,12 +62,24 @@ the infra repo.
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
 | `FAULTMAVEN_REFRESH_TOKEN` | secret | **required against an `oauth`-mode backend** — provisioned refresh credential (ADR-012 D10). A one-time seed: the grant rotates and the live token then lives in `CREDENTIAL_STORE_PATH`. See [Service account credentials](#service-account-credentials-oauth-mode-backends) |
 | `FAULTMAVEN_OAUTH_CLIENT_ID` | config | client id presented on the refresh grant (default `faultmaven-slack-agent`) |
+| `FAULTMAVEN_REQUEST_TIMEOUT` | config | seconds ONE attempt at a turn waits (default `150`: above the API's default 120 s turn ceiling plus its commit and auto-title time) |
+| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all (default `660`). A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Sets the shutdown drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
 
 Missing http-mode credentials fail fast at boot with a named error
 (`config.Settings._validate_transport_requirements`), never as an opaque runtime
 error on the first Slack event.
+
+## Shutdown drain (a deploy requirement for the infra repo)
+
+On SIGTERM the agent stops starting new recovery attempts, then waits for
+in-flight turns before closing its stores: up to
+`max(FAULTMAVEN_REQUEST_TIMEOUT, FAULTMAVEN_TURN_RECOVERY_SECONDS) + 10` seconds
+(670 at the defaults). A turn mid-attempt finishes that attempt and then stops,
+so the drain normally ends well inside one attempt, but the pod's
+`terminationGracePeriodSeconds` must exceed that bound, or a SIGKILL can land
+mid-drain and strand a thread at "Working…".
 
 ## State that must persist (a deploy requirement for the infra repo)
 

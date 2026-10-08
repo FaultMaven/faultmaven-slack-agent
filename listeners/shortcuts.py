@@ -28,6 +28,7 @@ from ._turn import (
     run_turn_and_post,
     skipped_files_note,
     slack_ts_to_iso,
+    turn_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,10 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=_SEED_QUERY,
+                # One invocation, one turn: the trigger_id the redelivery is
+                # deduped on above. A deliberate second invocation gets a fresh
+                # trigger_id, so it is a new turn, as it should be.
+                idempotency_key=turn_key(team_id, shortcut.get("trigger_id")),
                 pasted_content=pasted or None,
                 source_url=source_url,
                 observed_at=slack_ts_to_iso(message_ts),

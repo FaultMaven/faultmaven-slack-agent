@@ -127,10 +127,32 @@ class Settings(BaseSettings):
         default="faultmaven-slack-agent",
         validation_alias="FAULTMAVEN_OAUTH_CLIENT_ID",
     )
-    # Upper bound for one turn (incl. 202+poll). Runs behind the Slack ack, so
-    # it can comfortably exceed Slack's 3s budget.
+    # How long ONE attempt at a turn waits for its answer (incl. 202+poll). Runs
+    # behind the Slack ack, so it can comfortably exceed Slack's 3s budget.
+    #
+    # 150 s is a latency choice, not a derived bound: it sits above the API's
+    # DEFAULT turn ceiling (120 s) plus the up-to-18.5 s a turn spends after it
+    # (a 3.5 s commit reserve and a 15 s auto-title), so an ordinary turn answers
+    # on its first attempt. Per-provider ceilings can be longer; a turn that
+    # outlasts this is not lost, it is recovered under its key within
+    # FAULTMAVEN_TURN_RECOVERY_SECONDS.
     faultmaven_request_timeout: float = Field(
-        default=120.0, validation_alias="FAULTMAVEN_REQUEST_TIMEOUT"
+        default=150.0, validation_alias="FAULTMAVEN_REQUEST_TIMEOUT"
+    )
+    # How long a Slack thread is willing to wait for one turn, every attempt
+    # included. When an attempt times out, hits a gateway 502/504 or loses its
+    # connection, the agent re-sends the same turn under the same
+    # Idempotency-Key until the backend answers with it — the committed turn,
+    # replayed — or this runs out; only then is the thread told it gave up. The
+    # thread's one-turn gate is held for the whole wait, so replies meanwhile
+    # get ⏭️ as usual.
+    #
+    # A policy bound, not a derivation: the API's per-provider ceilings are
+    # unbounded, so no value here is "long enough" by construction, and
+    # correctness never depends on it — a turn that outlives it still commits
+    # exactly once. Also sets the shutdown drain (see app.py).
+    faultmaven_turn_recovery_seconds: float = Field(
+        default=660.0, gt=0, validation_alias="FAULTMAVEN_TURN_RECOVERY_SECONDS"
     )
 
     # --- Local state -------------------------------------------------------

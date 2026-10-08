@@ -99,7 +99,7 @@ def create_fastapi_app() -> FastAPI:
         # Bootstrap the FM token on a background thread, NOT inline: uvicorn does
         # not begin serving (bind the listening socket's accept loop) until this
         # lifespan startup returns, so a slow/hanging backend here would block
-        # /health up to the 120s client timeout and trip the k8s liveness
+        # /health up to the client's request timeout and trip the k8s liveness
         # SIGKILL — the very failure /health is designed to avoid. The bootstrap
         # is best-effort (the first turn re-acquires lazily), so firing it and
         # returning immediately loses nothing.
@@ -112,8 +112,8 @@ def create_fastapi_app() -> FastAPI:
         finally:
             # Drain in-flight turns before releasing shared resources, mirroring
             # the Socket Mode finally. drain_turns joins turn threads for up to
-            # ~130s, so run it OFF the event loop or /health and in-flight
-            # responses freeze for the whole drain.
+            # the turn bound + headroom (app.py), so run it OFF the event loop
+            # or /health and in-flight responses freeze for the whole drain.
             await run_in_threadpool(shutdown_runtime, store, fm)
 
     api = FastAPI(lifespan=lifespan)
