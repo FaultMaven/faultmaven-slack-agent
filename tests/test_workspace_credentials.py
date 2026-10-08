@@ -552,8 +552,8 @@ def test_two_workspaces_open_cases_under_their_own_service_accounts(tmp_path):
     cases = CaseStore(str(tmp_path / "cases.db"))
     try:
         common = dict(channel_id="C1", thread_ts="1.0", text="disk is full")
-        run_turn(fm, cases, team_id="T1", **common)
-        run_turn(fm, cases, team_id="T2", **common)
+        run_turn(fm, cases, team_id="T1", **common, idempotency_key="test-turn-key")
+        run_turn(fm, cases, team_id="T2", **common, idempotency_key="test-turn-key")
     finally:
         cases.close()
 
@@ -589,7 +589,7 @@ def test_an_unlinked_workspace_never_reaches_the_backend(tmp_path):
         with pytest.raises(FaultMavenWorkspaceUnlinkedError):
             run_turn(
                 fm, cases, team_id="T-unbound", channel_id="C1",
-                thread_ts="1.0", text="disk is full",
+                thread_ts="1.0", text="disk is full", idempotency_key="test-turn-key",
             )
     finally:
         cases.close()

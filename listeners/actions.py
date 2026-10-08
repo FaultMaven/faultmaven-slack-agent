@@ -24,6 +24,7 @@ from store import CaseStore
 
 from ._turn import (
     case_gone_text,
+    click_turn_key,
     deliver_turn_result,
     record_posted_turn,
     retry_may_help,
@@ -35,7 +36,13 @@ from ._turn import (
 
 
 def apply_action(
-    fm: FaultMavenClient, case_id: str, value_json: str, *, team_id: str
+    fm: FaultMavenClient,
+    case_id: str,
+    value_json: str,
+    *,
+    team_id: str,
+    idempotency_key: str,
+    on_waiting=None,
 ) -> TurnResult:
     """Submit the turn encoded in a button's ``value`` and return the result.
 
@@ -45,15 +52,21 @@ def apply_action(
     credential, which against a multi-tenant backend cannot see the workspace's
     case at all — and the 404 that follows is mapped to ``CaseNotFoundError``,
     whose handler unlinks a thread→case mapping that was never stale.
+
+    ``idempotency_key`` is required for the reason every turn's is (see
+    :meth:`FaultMavenClient.submit_turn`): the click's
+    :func:`~listeners._turn.click_turn_key`.
     """
 
     value = json.loads(value_json)
     return fm.submit_turn(
         case_id,
+        idempotency_key=idempotency_key,
         query=value.get("q"),
         intent_type=value.get("it"),
         intent_data=value.get("id"),
         team_id=team_id,
+        on_waiting=on_waiting,
     )
 
 
@@ -85,20 +98,27 @@ def _disable_actions(client: WebClient, body: dict) -> None:
     _rewrite(client, body, kept, text)
 
 
-def _show_working(client: WebClient, body: dict, label: str) -> None:
+def _show_working(
+    client: WebClient, body: dict, label: str, *, slow: bool = False
+) -> None:
     """Swap the buttons for a "working…" note the moment a click lands.
 
     Slack message buttons cannot be disabled, so removing them is the only way
     to make a click unrepeatable while the turn runs. The note doubles as
     instant feedback that the click registered. If the turn then fails a way a
     retry could survive, :func:`_restore_actions` puts the buttons back.
+
+    ``slow`` rewrites the same note, once, when the client is still waiting on
+    the turn under its key after its first attempt went unanswered.
     """
 
     kept, text = stripped_blocks(body["message"])
+    still = "Still working" if slow else "Working"
+    suffix = " — this is taking longer than usual" if slow else ""
     working = (
-        f":hourglass_flowing_sand: Working on *{_plain(label)}*…"
+        f":hourglass_flowing_sand: {still} on *{_plain(label)}*{suffix}…"
         if label
-        else ":hourglass_flowing_sand: Working on it…"
+        else f":hourglass_flowing_sand: {still} on it{suffix}…"
     )
     kept.append(
         {"type": "context", "elements": [{"type": "mrkdwn", "text": working}]}
@@ -240,6 +260,15 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
             # the thread opens next.
             restore = False
 
+            def still_working() -> None:
+                """The clicked message's note, rewritten once for a slow turn."""
+                try:
+                    _show_working(client, body, label, slow=True)
+                except Exception as exc:  # noqa: BLE001 — cosmetic
+                    logger.warning(
+                        "could not update the working note in %s: %s", channel, exc
+                    )
+
             def attempt() -> TurnResult | None:
                 """Run the click's turn, or post why it failed and return None.
 
@@ -262,7 +291,17 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         post(case_gone_text(channel))
                         return None
                     return apply_action(
-                        fm, case_id, action["value"], team_id=team_id
+                        fm,
+                        case_id,
+                        action["value"],
+                        team_id=team_id,
+                        # One click, one turn. A re-click after a failure is a
+                        # new action_ts, so a new turn — and the buttons come
+                        # back only when that is safe (retry_may_help).
+                        idempotency_key=click_turn_key(
+                            team_id, channel, action.get("action_ts")
+                        ),
+                        on_waiting=still_working,
                     )
                 except CaseNotFoundError:
                     # Only apply_action raises this, so case_id is set.

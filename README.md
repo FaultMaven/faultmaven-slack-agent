@@ -56,6 +56,11 @@ Directory form by hand — drift there cannot be caught programmatically.
   case) but the backend is linear, so the agent answers the first message and
   **skips** any that arrive before its reply (marked ⏭️, resend after), and
   `@mention`s the person it's answering. See [design.md](docs/design.md) §5.3.
+- **A slow turn is recovered, not lost** — every turn carries an
+  `Idempotency-Key` derived from the Slack message, click or shortcut that asked
+  for it. An attempt that times out is re-sent under that key until the API
+  answers with the committed turn, bounded by `FAULTMAVEN_TURN_RECOVERY_SECONDS`
+  (design.md §8.1). The thread stays busy for the whole wait.
 - **Files in-thread** — attached logs/configs/screenshots are downloaded and
   forwarded as multipart file data on any surface (§5.4).
 - **Thread = case.** Each Slack thread maps to one FaultMaven case; the mapping

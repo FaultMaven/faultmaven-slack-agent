@@ -62,12 +62,42 @@ the infra repo.
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
 | `FAULTMAVEN_REFRESH_TOKEN` | secret | **required against an `oauth`-mode backend** — provisioned refresh credential (ADR-012 D10). A one-time seed: the grant rotates and the live token then lives in `CREDENTIAL_STORE_PATH`. See [Service account credentials](#service-account-credentials-oauth-mode-backends) |
 | `FAULTMAVEN_OAUTH_CLIENT_ID` | config | client id presented on the refresh grant (default `faultmaven-slack-agent`) |
+| `FAULTMAVEN_REQUEST_TIMEOUT` | config | seconds ONE attempt at a turn waits (default `150`: above the API's default 120 s turn ceiling plus its commit and auto-title time) |
+| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all (default `660`). A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
 
 Missing http-mode credentials fail fast at boot with a named error
 (`config.Settings._validate_transport_requirements`), never as an opaque runtime
 error on the first Slack event.
+
+## Shutdown drain (a deploy requirement for the infra repo)
+
+On SIGTERM the agent stops starting new recovery attempts, then waits for
+in-flight turns before closing its stores: up to
+`FAULTMAVEN_REQUEST_TIMEOUT + 10` seconds (160 at the defaults). A turn being
+recovered finishes the attempt it is in and then stops (a wait between
+attempts ends at once) and tells its thread it stopped waiting, so one attempt
+is the most the drain needs.
+
+The bound is approximate: token acquisition or renewal before an attempt counts
+against it but is never cut short, and `httpx` applies its timeout per phase
+(connect, write, each read), not to the request as a whole. Give the pod's
+`terminationGracePeriodSeconds` some slack above it, or a SIGKILL can land
+mid-drain and strand a thread at "Working…".
+
+## Known residual: a ceiling above the attempt timeout
+
+Each attempt is capped at `FAULTMAVEN_REQUEST_TIMEOUT` (150 s). When the API's
+turn ceiling for the configured provider exceeds about 131 s (150 less the
+18.5 s it spends committing and auto-titling), an attempt can end before the
+API answers. A turn that then runs out the ceiling at the API (nothing commits)
+releases its claim, and the next re-send under the same key runs it again, so
+within the default recovery bound such a turn can run up to about three times
+where it used to run once. It only happens to turns that fail at the ceiling
+anyway, and correctness holds: at most one commit per key. Publishing the
+ceiling (FaultMaven/faultmaven#1905) would let the first attempt be sized from
+it.
 
 ## State that must persist (a deploy requirement for the infra repo)
 

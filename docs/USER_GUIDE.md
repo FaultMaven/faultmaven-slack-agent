@@ -103,6 +103,12 @@ next time this happens, the investigation starts from what this one learned.
 - **One turn at a time.** The engine works a case linearly. If several people
   reply at once, FaultMaven answers the first (and `@mention`s that person) and
   marks the others with a ⏭️ reaction — just resend after it replies.
+- **A slow turn is waited for, not dropped.** If the backend takes longer than
+  usual, the reply changes to "Still working…" and FaultMaven keeps asking for
+  that same turn (never running it twice) for up to about 11 minutes. The
+  thread stays busy for that whole wait, so other messages still get ⏭️. Only if
+  it runs out does it say it stopped waiting — then check the case before
+  re-sending, because a re-send is a new turn.
 - **It won't fabricate a root cause.** While a case is still open, FaultMaven
   tells you what data it needs rather than posting a confident, made-up
   answer to look decisive. When data is inadequate, it keeps engaging and names
@@ -159,6 +165,7 @@ tokens or message payloads; the agent is the only bridge.
 | A reply in a thread is ignored | FaultMaven only continues threads it was summoned into. `@mention` it (or use the shortcut) to open the case first. |
 | "Couldn't read that file" | The file is over 8 MiB or in a channel the bot can't access — paste the key text instead. |
 | Your message got a ⏭️ reaction | It arrived while FaultMaven was answering someone else. Resend it after its reply lands. |
+| "I stopped waiting on the backend" | The turn may still have gone through. Check the case (Dashboard) before re-sending: a re-send runs as a new turn. |
 
 ---
 

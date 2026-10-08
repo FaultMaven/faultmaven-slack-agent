@@ -284,7 +284,7 @@ def test_apply_action_submits_decide_intent():
                    "user_confirmed": True},
         }
     )
-    result = apply_action(fm, "c1", value, team_id="T1")
+    result = apply_action(fm, "c1", value, team_id="T1", idempotency_key="test-turn-key")
     assert result.agent_response == "next"
     case_id, kwargs = fm.turns[0]
     assert case_id == "c1"
@@ -302,7 +302,7 @@ def test_apply_action_submits_free_speech_without_intent_data():
         fm,
         "c1",
         json.dumps({"q": "tell me more", "it": "conversation"}),
-        team_id="T1",
+        team_id="T1", idempotency_key="test-turn-key",
     )
     _, kwargs = fm.turns[0]
     assert kwargs["intent_type"] == "conversation"

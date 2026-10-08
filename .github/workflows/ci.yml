@@ -107,6 +107,17 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
+      # The pinned contract, from the same URL the drift job generates from
+      # (scripts/generate_api_models.py's pinned_spec_url), so the test that
+      # checks the Idempotency-Key grammar quoted in tests/test_turn_recovery.py
+      # runs here instead of skipping. Fetched in this job rather than handed
+      # over from the drift job: that job installs only the generator and ruff,
+      # not the runtime the test imports.
+      - name: Fetch the pinned API contract
+        run: |
+          url="$(python -c 'import sys; sys.path.insert(0, "scripts"); from generate_api_models import pinned_spec_url; print(pinned_spec_url())')"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/openapi.json" "$url"
+          echo "FM_OPENAPI_SPEC=$RUNNER_TEMP/openapi.json" >> "$GITHUB_ENV"
       - run: python -m pytest -q
 
   build:

@@ -56,12 +56,21 @@ logger = logging.getLogger("faultmaven.slack")
 # without this the bot wedges "alive" while answering nothing).
 _WATCH_POLL_SECONDS = 30.0
 _MAX_DISCONNECTED_SECONDS = 600.0
-# Headroom added to the turn timeout for the shutdown drain: a normal turn can
+# Headroom added to the turn timeout for the shutdown drain: a turn attempt can
 # legitimately run the full FAULTMAVEN_REQUEST_TIMEOUT, so the drain must
 # outlast it or closing the store/API client yanks resources from live workers
-# mid-turn. Deployment note: the supervisor's kill grace (e.g. Kubernetes
+# mid-turn. One attempt is enough even for a turn being recovered under its
+# key: the client is told first (``fm.begin_shutdown``), so the recovery loop
+# re-sends nothing after the attempt it is in and its wait between attempts
+# ends at once — FAULTMAVEN_TURN_RECOVERY_SECONDS does not enter the drain.
+#
+# The bound is approximate. Token acquisition or renewal before an attempt
+# counts against it but is never cut short (a renewal holds the credential's
+# lock across its exchange, and a rotation must not be abandoned mid-flight),
+# and httpx applies its timeout per phase rather than to the whole request.
+# Deployment note: the supervisor's kill grace (e.g. Kubernetes
 # terminationGracePeriodSeconds, systemd TimeoutStopSec) should exceed
-# timeout + this headroom, or a SIGKILL lands mid-drain.
+# timeout + this headroom with some slack, or a SIGKILL lands mid-drain.
 _SHUTDOWN_DRAIN_HEADROOM_SECONDS = 10.0
 
 
@@ -111,6 +120,7 @@ def make_fault_client(
         token=settings.faultmaven_api_token,
         dev_login_username=settings.faultmaven_dev_login_username,
         timeout=settings.faultmaven_request_timeout,
+        turn_recovery_seconds=settings.faultmaven_turn_recovery_seconds,
         refresh_token=settings.faultmaven_refresh_token,
         credential_store=credential_store,
         oauth_client_id=settings.faultmaven_oauth_client_id,
@@ -379,11 +389,15 @@ def shutdown_runtime(store: CaseStore, fm: FaultMavenClient) -> None:
     Shared by both transports' shutdown paths. In-flight turns that fail from
     the teardown itself must say "restarting", not blame the turn or advise a
     retry — :func:`begin_shutdown` flips that message. The drain must outlast
-    the turn timeout, or a live worker gets its resources yanked mid-turn and
+    a turn attempt, or a live worker gets its resources yanked mid-turn and
     the thread's ":hourglass_flowing_sand: Working…" placeholder strands forever.
     """
 
     begin_shutdown()
+    # Before the drain, so a turn waiting on a slow answer stops re-sending at
+    # its next attempt boundary instead of running out its recovery bound —
+    # which is what lets the drain below cover one attempt, not the bound.
+    fm.begin_shutdown()
     drain_turns(
         get_settings().faultmaven_request_timeout
         + _SHUTDOWN_DRAIN_HEADROOM_SECONDS

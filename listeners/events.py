@@ -32,6 +32,7 @@ from ._turn import (
     RESTARTED_AFTER_MISSING_CASE,
     is_thread_busy,
     mark_skipped,
+    message_turn_key,
     post_placeholder,
     resolve_query,
     run_gated,
@@ -352,6 +353,9 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=mention_text(cleaned, seeded=seeded),
+                # The mention itself is the turn: the identity its redelivery
+                # is deduped on above, so a redelivery is the same turn.
+                idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 prior_context=prior_context,
                 files=files or None,
@@ -427,6 +431,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     thread_ts=thread_ts,
                     team_id=team_id,
                     text=query,
+                    idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                     pasted_content=snippet_text,
                     files=files or None,
                     placeholder_ts=placeholder_ts,
@@ -495,6 +500,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=text or "Please continue the investigation with this data.",
+                idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 files=files or None,
                 prior_context=prior_context,

@@ -83,6 +83,11 @@ done when its check conclusions are green, not when local tests pass.
   acts as its own service account; an unbound workspace falls back to the
   process-wide credential unless `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`
   refuses it. That setting fails boot under Socket Mode, which has no bindings.
+- Every turn carries an `Idempotency-Key` (`listeners._turn`'s
+  `message_turn_key` / `click_turn_key` / `shortcut_turn_key`; required by `submit_turn`, no default).
+  `submit_turn` re-sends a turn whose outcome is unknown under that key until
+  the API answers with it, bounded by `FAULTMAVEN_TURN_RECOVERY_SECONDS`; every
+  attempt must send the same bytes, or the API refuses the key as reused.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
   regenerated `faultmaven/api_generated.py` in the same PR.
