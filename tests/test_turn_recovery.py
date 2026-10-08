@@ -677,6 +677,23 @@ def test_a_shortcut_turn_is_keyed_on_its_trigger_id():
     assert fm.turns[0][1] == _turn.turn_key("T1", "12345.98765.abcd0123")
 
 
+def test_the_preflight_turn_is_keyed():
+    """``preflight --full`` drives the real client: unkeyed, it would now be a
+    TypeError rather than a round-trip check."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_preflight", "scripts/preflight.py")
+    preflight = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
+
+    backend = _Backend(httpx.Response(201, json={"case_id": "c9"}), _ok())
+    client, _ = _client(backend)
+    assert preflight.check_turn_contract(client) is True
+    (key,) = backend.keys[1:]
+    assert key and _admitted(key)
+
+
 # -- Slack and the store, recorded --------------------------------------------------
 class _Slack:
     token = "xoxb-test"

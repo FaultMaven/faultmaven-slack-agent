@@ -23,6 +23,7 @@ Exit code is non-zero if any check fails, so it doubles as a CI/start gate.
 from __future__ import annotations
 
 import argparse
+import secrets
 import sys
 from pathlib import Path
 
@@ -297,7 +298,13 @@ def check_turn_contract(fm: FaultMavenClient) -> bool:
     print("\nTurn contract (--full)")
     try:
         case_id = fm.create_case(title="preflight smoke test")
-        result = fm.submit_turn(case_id, query="Preflight ping — please ack.")
+        # A one-off key: the case is new, so its only turn is this one. Keyed
+        # all the same, so a slow backend is waited out the way a real turn is.
+        result = fm.submit_turn(
+            case_id,
+            idempotency_key=secrets.token_hex(32),
+            query="Preflight ping — please ack.",
+        )
     except FaultMavenError as exc:
         return _fail(
             f"case/turn round-trip failed: {exc}",
