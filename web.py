@@ -112,7 +112,7 @@ def create_fastapi_app() -> FastAPI:
         finally:
             # Drain in-flight turns before releasing shared resources, mirroring
             # the Socket Mode finally. drain_turns joins turn threads for up to
-            # the turn bound + headroom (app.py), so run it OFF the event loop
+            # one turn attempt + headroom (app.py), so run it OFF the event loop
             # or /health and in-flight responses freeze for the whole drain.
             await run_in_threadpool(shutdown_runtime, store, fm)
 

@@ -704,17 +704,21 @@ all — while `is_unlinked` preserves the memory:
 
 4. **Turn receipts (contract 12.2.0).** Every turn carries an `Idempotency-Key`
    header: the sha256 hex of the Slack identity of the thing that asked for it
-   (`team:channel:message ts`, `team:channel:action_ts` for a click,
-   `team:trigger_id` for the shortcut), so a redelivered event is the same turn
-   and two messages never are. When an attempt's outcome is unknown (the client
+   (`msg:team:channel:ts`, `click:team:channel:action_ts`,
+   `shortcut:team:trigger_id`), so a redelivered event is the same turn and two
+   messages or clicks never are. When an attempt's outcome is unknown (the client
    timed out after `FAULTMAVEN_REQUEST_TIMEOUT`, a gateway 502/504, a connection
    dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
    request under the same key: `200` (with `X-Idempotency-Replayed: true` when an
    earlier attempt committed) is the answer; `409 TURN_IN_PROGRESS` waits
    `Retry-After`, clamped to a 1–60 s poll interval; `409 CASE_VERSION_CONFLICT`
    is re-sent once (a claimless duplicate that lost to the first); `504
-   REQUEST_TIMEOUT` is re-sent once; `409 IDEMPOTENCY_KEY_REUSE` and `409
-   IDEMPOTENCY_REPLAY_UNAVAILABLE` are final. The loop is bounded by
+   REQUEST_TIMEOUT` is re-sent once; an uncoded 5xx or a 429 keeps the loop
+   going (the backend is overloaded or restarting, which says nothing about the
+   turn). Only answers about the turn itself end it with their own meaning —
+   `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal
+   case, a 404, a second version conflict, a 401; any other refusal while
+   recovering is reported as the unknown outcome it is. The loop is bounded by
    `FAULTMAVEN_TURN_RECOVERY_SECONDS` (a policy bound, 660 s by default) and ends
    at shutdown; the thread's gate is held throughout, so follow-ups get ⏭️.
    A terminal case is recognised by an unlabelled 409 or `x-error-code:

@@ -83,8 +83,8 @@ done when its check conclusions are green, not when local tests pass.
   acts as its own service account; an unbound workspace falls back to the
   process-wide credential unless `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=true`
   refuses it. That setting fails boot under Socket Mode, which has no bindings.
-- Every turn carries an `Idempotency-Key` (`listeners._turn.turn_key` of the
-  Slack message, click or shortcut; required by `submit_turn`, no default).
+- Every turn carries an `Idempotency-Key` (`listeners._turn`'s
+  `message_turn_key` / `click_turn_key` / `shortcut_turn_key`; required by `submit_turn`, no default).
   `submit_turn` re-sends a turn whose outcome is unknown under that key until
   the API answers with it, bounded by `FAULTMAVEN_TURN_RECOVERY_SECONDS`; every
   attempt must send the same bytes, or the API refuses the key as reused.

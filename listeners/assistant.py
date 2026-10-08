@@ -25,6 +25,7 @@ from ._turn import (
     Dedup,
     deliver_turn_result,
     disable_previous_actions,
+    message_turn_key,
     offload_turn,
     record_posted_turn,
     resolve_query,
@@ -32,7 +33,6 @@ from ._turn import (
     skipped_files_note,
     try_begin_turn,
     turn_error_text,
-    turn_key,
 )
 
 # Short conversational opener posted once on thread start. Kept deliberately
@@ -167,7 +167,9 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     text=query,
                     # The message is the turn: the identity its redelivery is
                     # deduped on above.
-                    idempotency_key=turn_key(team_id, channel, payload.get("ts")),
+                    idempotency_key=message_turn_key(
+                        team_id, channel, payload.get("ts")
+                    ),
                     pasted_content=pasted_text,
                     files=files or None,
                     on_waiting=still_working,

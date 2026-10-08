@@ -18,12 +18,20 @@ class FakeClock:
     wait and returns False. ``waits`` records every requested wait, in order.
     """
 
+    #: Reads after which the loop is a runaway. A loop that no longer
+    #: advances virtual time (no backoff) or has no end (no bound) would
+    #: otherwise spin forever on this clock; this fails it in milliseconds.
+    MAX_READS = 10_000
+
     def __init__(self, stop: threading.Event | None = None) -> None:
         self.now = 1000.0
         self.waits: list[float] = []
+        self.reads = 0
         self.stop = stop or threading.Event()
 
     def monotonic(self) -> float:
+        self.reads += 1
+        assert self.reads <= self.MAX_READS, "the recovery loop did not stop"
         return self.now
 
     def wait(self, seconds: float) -> bool:

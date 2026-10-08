@@ -101,11 +101,13 @@ REPLAY_UNAVAILABLE_TEXT = (
 )
 # The backend refused the turn's key as already used for a different turn. Every
 # key comes from one Slack message, click or shortcut, so this is a fault on our
-# side, never the user's. Nothing of this turn ran, so sending it again (a new
-# message, so a new key) is safe.
+# side, never the user's — and one we cannot see past: the turn the key DID
+# commit may be this one, sent with different bytes. So this points at the case,
+# as the timeout text does, rather than inviting a re-send.
 KEY_REUSE_TEXT = (
-    ":warning: FaultMaven refused that turn as a repeat of a different one — a "
-    "fault on my side, not yours. Nothing was applied; please send it again."
+    ":warning: FaultMaven refused that turn: its key was already used for "
+    "another turn (a fault on my side, not yours). Check the case before "
+    "re-sending."
 )
 #: How a thread starts over once its case is gone, by surface. Slack marks a
 #: 1:1 conversation with a ``D`` channel-id prefix; this is the one thing that
@@ -282,6 +284,10 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # undo, so "resend it in a minute" would run it twice.
     if isinstance(exc, IdempotencyReplayUnavailableError):
         return REPLAY_UNAVAILABLE_TEXT
+    # Above it for the same reason: whatever that key committed is still
+    # committed after a restart.
+    if isinstance(exc, IdempotencyKeyReuseError):
+        return KEY_REUSE_TEXT
     # Also checked before the shutdown override: a dead credential outlives the
     # restart the shutdown message promises, so "resend in a minute" would be a
     # false promise.
@@ -316,10 +322,6 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # neither is a malfunction.
     if isinstance(exc, CaseVersionConflictError):
         return CASE_BUSY_TEXT
-    # A labelled 409 and nothing ran, so the generic 4xx "won't help" below
-    # would be false: a re-send is a new key.
-    if isinstance(exc, IdempotencyKeyReuseError):
-        return KEY_REUSE_TEXT
     # Backend backpressure. Transient, so it must NOT get the generic 4xx
     # "re-sending won't help" — but TURN_ERROR_TEXT's bare "please try again"
     # was no better: it dropped both the reason and the wait, so the user
@@ -355,8 +357,9 @@ def retry_may_help(exc: Exception) -> bool:
     opposite things.
 
     False for the whole "don't re-send" family, each for its own reason:
-    a timeout's turn may have COMMITTED and an unreplayable one DID (a re-click
-    double-submits it against state the user never saw), a dead credential and
+    a timeout's turn may have COMMITTED, an unreplayable one DID, and a reused
+    key's may have (a re-click double-submits it against state the user never
+    saw), a dead credential and
     a concluded case reproduce identically forever, a 4xx rejects the same input every time, and a missing
     case has already been unlinked — its retry wouldn't repeat the failure, it
     would land the stale decision on whatever fresh case the thread opens next,
@@ -368,6 +371,7 @@ def retry_may_help(exc: Exception) -> bool:
         (
             FaultMavenTimeoutError,
             IdempotencyReplayUnavailableError,
+            IdempotencyKeyReuseError,
             FaultMavenCredentialError,
             FaultMavenWorkspaceUnlinkedError,
             CaseTerminalError,
@@ -377,10 +381,7 @@ def retry_may_help(exc: Exception) -> bool:
         return False
     if _shutting_down.is_set():
         return True  # RESTARTING_TEXT: "please resend it in a minute"
-    if isinstance(
-        exc,
-        (CaseVersionConflictError, IdempotencyKeyReuseError, FaultMavenRateLimitError),
-    ):
+    if isinstance(exc, (CaseVersionConflictError, FaultMavenRateLimitError)):
         return True
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         return exc.status_code == 429  # a 429 is backpressure, not a bad request
@@ -808,32 +809,55 @@ def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None
     return None
 
 
-def turn_key(*identity: str | None) -> str:
+def message_turn_key(team_id: str, channel: str, ts: str | None) -> str:
+    """The ``Idempotency-Key`` of a turn asked for by one Slack message."""
+
+    return _turn_key("msg", ts, team_id, channel)
+
+
+def click_turn_key(team_id: str, channel: str, action_ts: str | None) -> str:
+    """The ``Idempotency-Key`` of a turn asked for by one button click."""
+
+    return _turn_key("click", action_ts, team_id, channel)
+
+
+def shortcut_turn_key(team_id: str, trigger_id: str | None) -> str:
+    """The ``Idempotency-Key`` of a turn asked for by one shortcut invocation."""
+
+    return _turn_key("shortcut", trigger_id, team_id)
+
+
+def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     """The ``Idempotency-Key`` for one logical turn, from Slack's own identity.
 
-    A message turn is ``(team, channel, message ts)``, a button click
-    ``(team, channel, action_ts)`` and a shortcut ``(team, trigger_id)``. The
+    ``namespace:team:channel:ts`` for a message (``msg``), the same on the
+    click's ``action_ts`` (``click``), and ``shortcut:team:trigger_id``. The
     message ts and the trigger_id are what this agent already dedupes Slack's
     redeliveries on, so a redelivered event (even to a restarted process, whose
     in-memory dedup is empty) is the same turn to the backend too; an action_ts
-    names one click. Two different messages or clicks are never one key.
+    names one click. The namespace keeps the three apart: a click's action_ts
+    and a message's ts are both Slack timestamps and could coincide.
 
     sha256 hex: deterministic, 64 characters, and inside the header's published
     grammar (8–255 of ``[A-Za-z0-9_-]``) whatever the identity contains — a
     Slack ts carries a dot, which the grammar refuses. Not truncated; it fits.
 
-    A missing part would make every turn that lacks it share one key, and the
-    second would be refused as a reuse. Slack always sends these, but if one is
-    ever absent the turn gets a fresh random key: it still recovers within this
-    process, it only loses the redelivery match.
+    Only the ``distinguishing`` part — the one that names THIS message, click
+    or invocation — decides the fallback. Without it every such turn would
+    share one key and the second would be refused as a reuse, so the turn gets
+    a fresh random key instead: it still recovers within this process, it only
+    loses the redelivery match. An empty scope part is no reason to: an
+    org-wide (Grid) install can arrive with no ``team_id``, and the
+    distinguishing part still names one turn.
     """
 
-    if not all(identity):
+    if not distinguishing:
         logger.warning(
-            "turn identity incomplete (%r); using a one-off Idempotency-Key", identity
+            "no %s identity for this turn; using a one-off Idempotency-Key", namespace
         )
         return secrets.token_hex(32)
-    return hashlib.sha256(":".join(identity).encode("utf-8")).hexdigest()
+    identity = ":".join((namespace, *(part or "" for part in scope), distinguishing))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def slack_ts_to_iso(ts: str | None) -> str | None:
@@ -901,9 +925,9 @@ def run_turn(
       before this turn. It travels as structured metadata, never as text
       prepended to ``pasted_content``: the engine must not be able to tell a
       Slack-forwarded alert from the same alert pasted into the Copilot.
-    - ``idempotency_key`` names this logical turn (:func:`turn_key` of the
-      message that asked for it) and ``on_waiting`` is the surface's
-      "still working" notice; both go to :meth:`FaultMavenClient.submit_turn`,
+    - ``idempotency_key`` names this logical turn (:func:`message_turn_key` of
+      the message that asked for it, or :func:`shortcut_turn_key`) and
+      ``on_waiting`` is the surface's "still working" notice; both go to :meth:`FaultMavenClient.submit_turn`,
       whose recovery loop holds the thread's gate for as long as it waits.
     """
 
@@ -1072,9 +1096,10 @@ def run_turn_and_post(
     etiquette note about the one-at-a-time behavior (``intro_note`` overrides that
     note for surfaces with different etiquette, e.g. the plain DM).
     ``placeholder_ts`` reuses a placeholder a caller already posted (e.g. before a
-    slow file download). ``idempotency_key`` is the turn's :func:`turn_key`;
-    while the client waits on a slow turn under it, the placeholder is updated
-    once to :data:`STILL_WORKING_TEXT`.
+    slow file download). ``idempotency_key`` is the turn's key
+    (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
+    waits on a slow turn under it, the placeholder is updated once to
+    :data:`STILL_WORKING_TEXT`.
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise

@@ -150,7 +150,8 @@ class Settings(BaseSettings):
     # A policy bound, not a derivation: the API's per-provider ceilings are
     # unbounded, so no value here is "long enough" by construction, and
     # correctness never depends on it — a turn that outlives it still commits
-    # exactly once. Also sets the shutdown drain (see app.py).
+    # exactly once. It does not size the shutdown drain: at shutdown the loop
+    # stops after the attempt it is in (see app.py).
     faultmaven_turn_recovery_seconds: float = Field(
         default=660.0, gt=0, validation_alias="FAULTMAVEN_TURN_RECOVERY_SECONDS"
     )

@@ -48,7 +48,7 @@ _LOG = logging.getLogger("test")
 #: header parameter). The generated models do not carry it — a header parameter
 #: is not a model — so it is quoted here and checked against the document by
 #: :func:`test_the_quoted_grammar_is_the_published_one` whenever the spec is at
-#: hand (``FM_OPENAPI_SPEC``, the generator's own override).
+#: hand (``FM_OPENAPI_SPEC``, the generator's own override; CI sets it).
 _PUBLISHED_KEY_PATTERN = r"^[A-Za-z0-9_-]+$"
 _PUBLISHED_KEY_MIN_LENGTH = 8
 _PUBLISHED_KEY_MAX_LENGTH = 255
@@ -116,56 +116,89 @@ def _client(backend: _Backend, *, recovery: float = 660.0, **kw) -> tuple:
     return client, FakeClock().install(client)
 
 
-_KEY = _turn.turn_key("T1", "C1", "1754336177.123456")
+_KEY = _turn.message_turn_key("T1", "C1", "1754336177.123456")
 
 
 # -- 1. the key -----------------------------------------------------------------
 def test_the_key_is_deterministic_admitted_and_distinct_per_turn():
-    message = _turn.turn_key("T1", "C1", "1754336177.123456")
+    message = _turn.message_turn_key("T1", "C1", "1754336177.123456")
     # A redelivery of the same event (even to a restarted process) is the same
     # turn, so it must be the same key.
-    assert message == _turn.turn_key("T1", "C1", "1754336177.123456")
+    assert message == _turn.message_turn_key("T1", "C1", "1754336177.123456")
     assert _admitted(message)
     assert len(message) == 64  # sha256 hex, not truncated: it fits
     # Two messages, two turns — including in another channel or workspace.
-    assert message != _turn.turn_key("T1", "C1", "1754336177.123457")
-    assert message != _turn.turn_key("T1", "C2", "1754336177.123456")
-    assert message != _turn.turn_key("T2", "C1", "1754336177.123456")
+    assert message != _turn.message_turn_key("T1", "C1", "1754336177.123457")
+    assert message != _turn.message_turn_key("T1", "C2", "1754336177.123456")
+    assert message != _turn.message_turn_key("T2", "C1", "1754336177.123456")
 
     # A click: the same, on its action_ts. A shortcut: on its trigger_id.
-    click = _turn.turn_key("T1", "C1", "1754336199.000100")
-    assert _admitted(click) and click == _turn.turn_key("T1", "C1", "1754336199.000100")
-    shortcut = _turn.turn_key("T1", "12345.98765.abcd0123")
+    click = _turn.click_turn_key("T1", "C1", "1754336199.000100")
+    assert _admitted(click)
+    assert click == _turn.click_turn_key("T1", "C1", "1754336199.000100")
+    shortcut = _turn.shortcut_turn_key("T1", "12345.98765.abcd0123")
     assert _admitted(shortcut) and shortcut != click
+
+
+def test_a_click_and_a_message_with_one_timestamp_are_two_turns():
+    """F7: an action_ts and a message ts are both Slack timestamps. Without a
+    namespace, a click whose action_ts equalled a message's ts in the same
+    channel would share its key and be refused as a reuse (or worse, replayed
+    as that message's turn)."""
+
+    ts = "1754336177.123456"
+    assert _turn.click_turn_key("T1", "C1", ts) != _turn.message_turn_key("T1", "C1", ts)
+    # And a shortcut whose trigger_id happened to read like "C1:<ts>" too.
+    assert _turn.shortcut_turn_key("T1", f"C1:{ts}") != _turn.message_turn_key(
+        "T1", "C1", ts
+    )
 
 
 def test_a_raw_slack_ts_is_outside_the_grammar():
     """Why the key is hashed rather than the identity sent as is: a ts carries a
     dot, which the grammar refuses (a published 422)."""
 
-    assert not _admitted("T1:C1:1754336177.123456")
+    assert not _admitted("msg:T1:C1:1754336177.123456")
 
 
-def test_an_incomplete_identity_gets_a_fresh_key_not_a_shared_one():
-    """A missing part must not make every such turn share one key — the second
-    would be refused as a reuse of the first."""
+def test_a_missing_distinguishing_part_gets_a_fresh_key_not_a_shared_one():
+    """A missing ts/action_ts/trigger_id must not make every such turn share one
+    key — the second would be refused as a reuse of the first."""
 
-    first, second = _turn.turn_key("T1", "C1", None), _turn.turn_key("T1", "C1", None)
-    assert first != second
-    assert _admitted(first) and _admitted(second)
+    for derive in (
+        lambda: _turn.message_turn_key("T1", "C1", None),
+        lambda: _turn.click_turn_key("T1", "C1", ""),
+        lambda: _turn.shortcut_turn_key("T1", None),
+    ):
+        first, second = derive(), derive()
+        assert first != second
+        assert _admitted(first) and _admitted(second)
+
+
+def test_an_empty_team_still_derives_the_turn_key():
+    """An org-wide (Grid) install can arrive with no team_id. The ts still names
+    one turn, so the key stays deterministic — a random one would cost the
+    redelivery match for every turn such an install sends."""
+
+    assert _turn.message_turn_key("", "C1", "1.5") == _turn.message_turn_key("", "C1", "1.5")
+    assert _turn.click_turn_key("", "C1", "2.5") == _turn.click_turn_key("", "C1", "2.5")
+    assert _turn.shortcut_turn_key("", "trig") == _turn.shortcut_turn_key("", "trig")
+    assert _turn.message_turn_key("", "C1", "1.5") != _turn.message_turn_key("T1", "C1", "1.5")
 
 
 def test_the_quoted_grammar_is_the_published_one():
     """Pins the quoted grammar to the contract this repo is pinned to.
 
     Runs when the spec is at hand: ``FM_OPENAPI_SPEC`` names a local copy, as it
-    does for ``scripts/generate_api_models.py``. The suite stays hermetic (no
-    network) by skipping otherwise.
+    does for ``scripts/generate_api_models.py``. CI's test job fetches the
+    pinned one and sets it; elsewhere the suite stays hermetic (no network) by
+    skipping.
     """
 
     path = os.environ.get("FM_OPENAPI_SPEC")
-    if not path or not os.path.exists(path):
+    if not path:
         pytest.skip("FM_OPENAPI_SPEC not set to a local copy of the pinned contract")
+    # Set but unreadable is a broken setup (CI fetches it), never a skip.
     with open(path) as handle:
         spec = json.load(handle)
     pin_path = os.path.join(os.path.dirname(__file__), "..", "api-contract.pin.json")
@@ -341,6 +374,27 @@ def test_key_reuse_is_not_retried():
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert _turn.turn_error_text(err.value) == _turn.KEY_REUSE_TEXT
+    # F4: whatever the key committed may be this turn, sent with other bytes,
+    # so neither the text nor a re-armed button invites a re-send.
+    assert "check the case" in _turn.KEY_REUSE_TEXT.lower()
+    assert not _turn.retry_may_help(err.value)
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (IdempotencyReplayUnavailableError("x", status_code=409), "REPLAY_UNAVAILABLE_TEXT"),
+        (IdempotencyKeyReuseError("x", status_code=409), "KEY_REUSE_TEXT"),
+    ],
+    ids=["replay-unavailable", "key-reuse"],
+)
+def test_committed_or_reused_turns_say_so_during_shutdown_too(error, text):
+    """F3b: "resend it in a minute" (the restart text) would run a committed
+    turn twice. The fact outlives the restart, so its text and its buttons do."""
+
+    _turn.begin_shutdown()  # the autouse fixture clears it again after
+    assert _turn.turn_error_text(error) == getattr(_turn, text)
+    assert not _turn.retry_may_help(error)
 
 
 def test_replay_unavailable_is_not_retried():
@@ -454,6 +508,199 @@ def test_a_request_timeout_then_an_answer_is_the_answer():
     assert backend.keys == [_KEY, _KEY]
 
 
+# -- what ends a recovery, and what does not ---------------------------------------
+def test_an_overloaded_backend_mid_recovery_is_waited_out():
+    """F1: a 503 says the backend is restarting, not that the turn failed — the
+    attempt being recovered may have committed. Keep asking; the answer is
+    posted once."""
+
+    backend = _Backend(
+        _read_timeout,
+        httpx.Response(503, json={"detail": "unavailable"}, headers={"Retry-After": "5"}),
+        _ok(replayed=True),
+    )
+    client, clock = _client(backend)
+    slack = _Slack()
+
+    _turn.run_turn_and_post(
+        slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
+        team_id="T1", text="why", idempotency_key=_KEY,
+    )
+
+    assert [u["text"] for u in slack.updates] == [
+        _turn.STILL_WORKING_TEXT, _ANSWER["agent_response"]
+    ]
+    assert backend.keys == [_KEY] * 3
+    assert clock.waits == [1.0, 5.0]  # backoff, then the 503's own Retry-After
+
+
+def test_a_rate_limit_mid_recovery_ends_as_the_unknown_outcome():
+    """F1: a 429 while recovering is waited out too, and when the bound runs out
+    the thread is told the turn may have gone through — never "rate limited,
+    send it again", which would run a committed turn twice."""
+
+    backend = _Backend(
+        _read_timeout,
+        httpx.Response(429, json={"message": "slow down"}, headers={"Retry-After": "3600"}),
+    )
+    client, clock = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) > 2
+    assert all(w <= 60.0 for w in clock.waits)  # Retry-After clamped to a poll
+    assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
+    assert not _turn.retry_may_help(err.value)
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        httpx.Response(400, json={"detail": "file type not allowed"}),
+        httpx.Response(503, json={"detail": "cap"}, headers={"x-error-code": "TENANT_TURN_CAP_UNAVAILABLE"}),
+        _conflict("DUPLICATE_REQUEST"),
+    ],
+    ids=["400", "coded-503", "other-409"],
+)
+def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
+    """F1: a re-send's refusal says nothing about whether the FIRST attempt
+    committed, so its own class (here "won't help" / "try again") would be a
+    false statement about the turn. The unknown outcome is raised, chained."""
+
+    backend = _Backend(_read_timeout, later)
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == 2
+    assert err.value.__cause__ is not None  # the later refusal, kept for the log
+
+
+@pytest.mark.parametrize(
+    ("later", "expected"),
+    [
+        (httpx.Response(404, json={"detail": "Case not found"}), "CaseNotFoundError"),
+        (httpx.Response(409, json={"detail": "closed"}), "CaseTerminalError"),
+        (httpx.Response(401, json={"detail": "bad token"}), "FaultMavenAPIError"),
+    ],
+    ids=["404", "terminal", "401"],
+)
+def test_answers_about_the_turn_still_end_a_recovery(later, expected):
+    import faultmaven.client as fm_client
+
+    backend = _Backend(_read_timeout, later)
+    client, _ = _client(backend)
+    with pytest.raises(getattr(fm_client, expected)) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert not isinstance(err.value, FaultMavenTimeoutError)
+    assert len(backend.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "coded",
+    [
+        httpx.Response(504, headers={"x-error-code": "LLM_TIMEOUT"}),
+        httpx.Response(502, headers={"x-error-code": "LLM_PROVIDER_ERROR"}),
+        httpx.Response(504, headers={"x-error-code": "SOMETHING_NEW"}),
+    ],
+    ids=["LLM_TIMEOUT-504", "LLM_PROVIDER_ERROR-502", "unknown-coded-504"],
+)
+def test_a_coded_502_or_504_does_not_enter_recovery(coded):
+    """F3a: only an UNCODED 502/504 is a gateway in front of an unknown turn. A
+    coded one is the app's own answer; it stays today's timeout class, once."""
+
+    backend = _Backend(coded, _ok())
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError):
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == 1
+
+
+def _stop_on(response: httpx.Response, client_box: list):
+    def step(request):
+        client_box[0].begin_shutdown()
+        return response
+
+    return step
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        lambda stop: [stop(httpx.Response(504, headers={"x-error-code": "REQUEST_TIMEOUT"}))],
+        lambda stop: [_read_timeout, stop(_conflict("CASE_VERSION_CONFLICT"))],
+    ],
+    ids=["first-request-timeout", "in-loop-version-conflict"],
+)
+def test_shutdown_is_observed_on_the_paths_that_do_not_wait(script):
+    """F3c: these two re-send at once (wait 0), so the interruptible wait never
+    runs; the boundary check before it is what stops them at shutdown."""
+
+    box: list = [None]
+    steps = script(lambda r: _stop_on(r, box))
+    backend = _Backend(*steps, _ok())
+    client, _ = _client(backend)
+    box[0] = client
+    with pytest.raises(FaultMavenTimeoutError):
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == len(steps)  # nothing sent after shutdown
+
+
+def test_the_last_attempt_is_clamped_to_what_is_left_of_the_bound():
+    """F3d: an attempt that would outlive the bound is cut to the remainder."""
+
+    timeouts: list = []
+    box: list = [None]
+
+    def slow(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        box[0].now += 150.0  # the attempt takes its whole timeout
+        raise httpx.ReadTimeout("slow", request=request)
+
+    def answer(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        return _ok(replayed=True)
+
+    backend = _Backend(slow, answer)
+    client, clock = _client(backend, recovery=200.0, timeout=150.0)
+    box[0] = clock
+    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    # 150 s, then a 1 s backoff: 49 s of the 200 s bound remain.
+    assert timeouts == [150.0, 49.0]
+
+
+def test_the_re_auth_re_post_gets_only_what_the_attempt_has_left():
+    """F5: the 401 and the re-login spent part of the attempt; the re-POST is
+    not handed a fresh full timeout."""
+
+    timeouts: list = []
+    box: list = [None]
+
+    def expired(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        box[0].now += 100.0
+        return httpx.Response(401, json={"detail": "expired"})
+
+    def answer(request):
+        timeouts.append(request.extensions["timeout"]["read"])
+        return _ok()
+
+    backend = _Backend(expired, answer)
+    client, clock = _client(backend, token="", dev_login_username="admin", timeout=150.0)
+    box[0] = clock
+    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert timeouts == [150.0, 50.0]
+
+
+def test_the_backoff_doubles_and_caps():
+    """F3e: a gateway that fails fast is not hot-looped, and not left for
+    minutes either."""
+
+    gateway = httpx.Response(502, text="bad gateway")
+    backend = _Backend(*([gateway] * 8), _ok(replayed=True))
+    client, clock = _client(backend)
+    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert clock.waits == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
 # -- 6. CASE_TERMINAL ----------------------------------------------------------------
 @pytest.mark.parametrize("labelled", [True, False], ids=["labelled", "unlabelled"])
 def test_a_terminal_case_is_closed_labelled_or_not(labelled):
@@ -519,7 +766,7 @@ def test_shutdown_during_a_wait_ends_the_turn_with_the_timeout_text():
 
 
 def test_shutdown_stops_the_loop_before_the_drain(monkeypatch):
-    """The client is told first, then the drain waits out the turn's bound."""
+    """The client is told first, then the drain waits out one attempt."""
 
     import app
 
@@ -550,7 +797,9 @@ def test_shutdown_stops_the_loop_before_the_drain(monkeypatch):
     app.shutdown_runtime(SimpleNamespace(close=lambda: None), fm)
 
     assert seen["stopping"] is True
-    assert seen["timeout"] == 660.0 + app._SHUTDOWN_DRAIN_HEADROOM_SECONDS
+    # R1: one attempt, not the recovery bound — the loop stops at its next
+    # attempt boundary and its wait is interruptible.
+    assert seen["timeout"] == 150.0 + app._SHUTDOWN_DRAIN_HEADROOM_SECONDS
     assert seen["closed"]
 
 
@@ -589,7 +838,7 @@ def test_the_assistant_notice_is_its_status_line():
     _turn.drain_turns(5.0)
 
     assert len(statuses) == 2 and "still working" in statuses[1]
-    assert fm.turns[0][1] == _turn.turn_key("T1", "D1", "1.5")
+    assert fm.turns[0][1] == _turn.message_turn_key("T1", "D1", "1.5")
 
 
 def test_the_click_notice_rewrites_the_clicked_message():
@@ -628,7 +877,7 @@ def test_the_click_notice_rewrites_the_clicked_message():
         for e in b["elements"]
     ]
     assert sum("Still working on *Yes*" in n for n in notes) == 1
-    assert fm.turns[0][1] == _turn.turn_key("T1", "C1", "1754336199.000100")
+    assert fm.turns[0][1] == _turn.click_turn_key("T1", "C1", "1754336199.000100")
 
 
 def test_a_redelivered_mention_is_the_same_turn_to_the_backend():
@@ -651,7 +900,7 @@ def test_a_redelivered_mention_is_the_same_turn_to_the_backend():
         )
         _turn.drain_turns(5.0)
         keys.append(fm.turns[0][1])
-    assert keys[0] == keys[1] == _turn.turn_key("T1", "C1", "1754336177.123456")
+    assert keys[0] == keys[1] == _turn.message_turn_key("T1", "C1", "1754336177.123456")
 
 
 def test_a_shortcut_turn_is_keyed_on_its_trigger_id():
@@ -674,7 +923,7 @@ def test_a_shortcut_turn_is_keyed_on_its_trigger_id():
     )
     _turn.drain_turns(5.0)
 
-    assert fm.turns[0][1] == _turn.turn_key("T1", "12345.98765.abcd0123")
+    assert fm.turns[0][1] == _turn.shortcut_turn_key("T1", "12345.98765.abcd0123")
 
 
 def test_the_preflight_turn_is_keyed():

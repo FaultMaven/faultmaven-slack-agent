@@ -24,13 +24,13 @@ from store import CaseStore
 
 from ._turn import (
     case_gone_text,
+    click_turn_key,
     deliver_turn_result,
     record_posted_turn,
     retry_may_help,
     run_gated,
     stripped_blocks,
     turn_error_text,
-    turn_key,
     unlink_stale_case,
 )
 
@@ -54,7 +54,8 @@ def apply_action(
     whose handler unlinks a thread→case mapping that was never stale.
 
     ``idempotency_key`` is required for the reason every turn's is (see
-    :meth:`FaultMavenClient.submit_turn`): the click's :func:`turn_key`.
+    :meth:`FaultMavenClient.submit_turn`): the click's
+    :func:`~listeners._turn.click_turn_key`.
     """
 
     value = json.loads(value_json)
@@ -297,7 +298,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         # One click, one turn. A re-click after a failure is a
                         # new action_ts, so a new turn — and the buttons come
                         # back only when that is safe (retry_may_help).
-                        idempotency_key=turn_key(
+                        idempotency_key=click_turn_key(
                             team_id, channel, action.get("action_ts")
                         ),
                         on_waiting=still_working,
