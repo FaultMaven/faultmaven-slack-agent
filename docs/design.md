@@ -688,9 +688,11 @@ all — while `is_unlinked` preserves the memory:
    earlier attempt committed) is the answer; `409 TURN_IN_PROGRESS` waits
    `Retry-After`, clamped to a 1–60 s poll interval; `409 CASE_VERSION_CONFLICT`
    is re-sent once (a claimless duplicate that lost to the first); `504
-   REQUEST_TIMEOUT` (nothing committed; no `Retry-After`) is re-sent once; `504
+   REQUEST_TIMEOUT` (nothing committed; the input likely does it again) ends the
+   turn at once with a "nothing was saved, try narrowing it" notice; `504
    LLM_TIMEOUT` (nothing committed; `Retry-After: 30`) is re-sent after that
-   wait while the bound lasts (contract 12.4.0); an uncoded 5xx or a 429 keeps the loop
+   wait, twice at most, if a whole attempt still fits the bound (contract
+   12.4.0; both surface as `FaultMavenNothingCommittedError`); an uncoded 5xx or a 429 keeps the loop
    going (the backend is overloaded or restarting, which says nothing about the
    turn). Only answers about the turn itself end it with their own meaning —
    `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal

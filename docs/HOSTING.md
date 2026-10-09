@@ -63,7 +63,7 @@ the infra repo.
 | `FAULTMAVEN_REFRESH_TOKEN` | secret | **required against an `oauth`-mode backend** — provisioned refresh credential (ADR-012 D10). A one-time seed: the grant rotates and the live token then lives in `CREDENTIAL_STORE_PATH`. See [Service account credentials](#service-account-credentials-oauth-mode-backends) |
 | `FAULTMAVEN_OAUTH_CLIENT_ID` | config | client id presented on the refresh grant (default `faultmaven-slack-agent`) |
 | `FAULTMAVEN_REQUEST_TIMEOUT` | config | seconds ONE attempt at a turn waits. **Unset (the default): derived** from the API's published `limits.turnResponseBoundSeconds` (`GET /api/v1/meta/capabilities`) plus 15 s, re-read every 5 minutes; `150` when the API publishes none (logged). Set, it pins every attempt; a pin below the bound re-sends a turn the API is still running |
-| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all. **Unset: 3 x the attempt timeout** (the first attempt, the one re-send a `REQUEST_TIMEOUT` is allowed, one more for a `TURN_IN_PROGRESS` wait); `660` when nothing is published. A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
+| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all. **Unset: 3 x the attempt timeout** (the first attempt, a re-send after a doubtful outcome, one more for a `TURN_IN_PROGRESS` wait or an `LLM_TIMEOUT`), and never less than 3 x the API's published bound + 15 s even under a shorter `FAULTMAVEN_REQUEST_TIMEOUT` pin; `660` when nothing is published. A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
 
@@ -104,9 +104,12 @@ number, the agent falls back to 150 s per attempt and 660 s per turn and logs a
 warning (re-probed after 30 s).
 
 Retry semantics by `x-error-code` on a 504 (both commit nothing): `REQUEST_TIMEOUT`
-(the turn used its whole ceiling on this input; no `Retry-After`) is re-sent at
-most once; `LLM_TIMEOUT` (a transient provider timeout, `Retry-After: 30`) is
-re-sent after that wait while the recovery bound lasts. An unlabelled gateway
+(the turn used its whole ceiling on this input; no `Retry-After`) is NOT re-sent:
+the user is told nothing was saved and that the request may time out again, and
+the buttons re-arm; `LLM_TIMEOUT` (a transient provider timeout,
+`Retry-After: 30`) is re-sent after that wait, at most twice, and only if a
+whole attempt still fits in the recovery bound. When those run out the user is
+told nothing was saved and may try again. An unlabelled gateway
 502/504 may front a turn that did commit, and is recovered under the
 `Idempotency-Key` instead. Give `terminationGracePeriodSeconds` room for the
 derived attempt (see the drain above), not for the old 150 s.

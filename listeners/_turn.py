@@ -34,6 +34,7 @@ from faultmaven import (
     FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenCredentialError,
+    FaultMavenNothingCommittedError,
     FaultMavenRateLimitError,
     FaultMavenTimeoutError,
     FaultMavenWorkspaceUnlinkedError,
@@ -73,7 +74,7 @@ TURN_ERROR_TEXT = (
     ":warning: FaultMaven hit an error on that turn. Please try again or "
     "@mention me."
 )
-# Shown only once the recovery loop has run out (FAULTMAVEN_TURN_RECOVERY_SECONDS):
+# Shown only once the recovery loop has run out on an UNKNOWN outcome (FAULTMAVEN_TURN_RECOVERY_SECONDS):
 # until then the turn is re-sent under its own key and its answer, when it
 # comes, is posted instead. The turn may have committed, so this points at the
 # case rather than at a re-send: a re-send is a NEW message with a new key, so
@@ -84,6 +85,20 @@ TURN_TIMEOUT_TEXT = (
     ":hourglass: I stopped waiting on the backend — that turn may still have "
     "gone through. Check the case before sending it again: a re-send runs as a "
     "new turn, and would repeat it if it did."
+)
+# The backend ran the turn out of time and committed NOTHING (a labelled 504,
+# contract 12.4.0), so a retry is safe: it carries a new key and repeats nothing.
+NOTHING_COMMITTED_TEXT = (
+    ":hourglass: FaultMaven ran out of time on that turn, and nothing was "
+    "saved. You can try again."
+)
+# REQUEST_TIMEOUT: the turn used its whole time allowance on this input, so the
+# same request is likely to again.
+NOTHING_COMMITTED_NARROW_TEXT = (
+    ":hourglass: FaultMaven ran out of time on that turn, and nothing was "
+    "saved. You can try again, but the same request may time out again, so "
+    "try narrowing it first (a more specific question, or a smaller file or "
+    "paste)."
 )
 #: What the thread shows, once, when a turn's first attempt went unanswered and
 #: the agent is waiting on it under its key. "Working", not "investigating", for
@@ -322,6 +337,13 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # neither is a malfunction.
     if isinstance(exc, CaseVersionConflictError):
         return CASE_BUSY_TEXT
+    # A labelled 504: the backend ran the turn and committed nothing, so unlike
+    # the timeout class above a retry is exactly right (below the override for
+    # the same reason as the version conflict).
+    if isinstance(exc, FaultMavenNothingCommittedError):
+        if exc.kind == "request_timeout":
+            return NOTHING_COMMITTED_NARROW_TEXT
+        return NOTHING_COMMITTED_TEXT
     # Backend backpressure. Transient, so it must NOT get the generic 4xx
     # "re-sending won't help" — but TURN_ERROR_TEXT's bare "please try again"
     # was no better: it dropped both the reason and the wait, so the user
@@ -357,7 +379,7 @@ def retry_may_help(exc: Exception) -> bool:
     opposite things.
 
     False for the whole "don't re-send" family, each for its own reason:
-    a timeout's turn may have COMMITTED, an unreplayable one DID, and a reused
+    a timeout's turn may have COMMITTED (a labelled 504's did not, and re-arms), an unreplayable one DID, and a reused
     key's may have (a re-click double-submits it against state the user never
     saw), a dead credential and
     a concluded case reproduce identically forever, a 4xx rejects the same input every time, and a missing
@@ -381,7 +403,14 @@ def retry_may_help(exc: Exception) -> bool:
         return False
     if _shutting_down.is_set():
         return True  # RESTARTING_TEXT: "please resend it in a minute"
-    if isinstance(exc, (CaseVersionConflictError, FaultMavenRateLimitError)):
+    if isinstance(
+        exc,
+        (
+            CaseVersionConflictError,
+            FaultMavenRateLimitError,
+            FaultMavenNothingCommittedError,  # nothing committed: a re-click is safe
+        ),
+    ):
         return True
     if isinstance(exc, FaultMavenAPIError) and 400 <= exc.status_code < 500:
         return exc.status_code == 429  # a 429 is backpressure, not a bad request

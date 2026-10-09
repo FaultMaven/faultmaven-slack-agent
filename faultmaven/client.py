@@ -179,9 +179,9 @@ _CAPABILITIES_PATH = "/api/v1/meta/capabilities"
 #: network round trip, the case and receipt lookups before the API's deadline
 #: starts, and the commit's actual duration (the bound is nominal).
 TURN_NETWORK_MARGIN_SECONDS = 15.0
-#: The recovery bound as a multiple of one attempt: the first attempt, the one
-#: re-send a REQUEST_TIMEOUT is allowed, and one more for a re-send that waits
-#: out a TURN_IN_PROGRESS claim.
+#: The recovery bound as a multiple of one attempt: the first attempt, a re-send
+#: after a doubtful outcome, and one more for a re-send that waits out a
+#: TURN_IN_PROGRESS claim or an LLM_TIMEOUT.
 TURN_RECOVERY_ATTEMPTS = 3
 #: When the backend publishes nothing usable: the numbers this client used
 #: before the bound was published (the old defaults). A 150 s attempt covers
@@ -195,8 +195,18 @@ _TIMING_TTL_SECONDS = 300.0
 _TIMING_RETRY_SECONDS = 30.0
 #: The capabilities probe is a side request: it must not stall a turn.
 _TIMING_PROBE_TIMEOUT_SECONDS = 5.0
-#: A published bound outside (0, this] is treated as unusable, not obeyed.
-_TIMING_MAX_BOUND_SECONDS = 3600.0
+#: A published bound must be finite and within this range, or it is treated as
+#: unusable, not obeyed (NaN and infinity fail the comparison). The backend's
+#: real range is about 48.5-618.5 s.
+_TIMING_MIN_BOUND_SECONDS = 30.0
+_TIMING_MAX_BOUND_SECONDS = 1200.0
+#: Re-sends allowed after a labelled 504 (nothing committed), per message. Each
+#: one is a fresh, charged run of the turn. REQUEST_TIMEOUT gets none: the same
+#: input likely exhausts the ceiling again, which would spend a second
+#: full-ceiling run and double the user's wait, so the user decides whether to
+#: retry. LLM_TIMEOUT is transient and gets two, after its Retry-After.
+_REQUEST_TIMEOUT_RESENDS = 0
+_LLM_TIMEOUT_RESENDS = 2
 
 # How long to wait before re-polling a TURN_IN_PROGRESS key. ``Retry-After`` is
 # the remaining TTL of the first request's claim, which is an UPPER bound: the
@@ -425,11 +435,10 @@ class FaultMavenTimeoutError(FaultMavenError):
     """The turn ended without an answer: usually the client gave up waiting and
     the backend may still complete it.
 
-    The "may still complete" reading is real for a client-side timeout, a
-    dropped connection and an unlabelled gateway 502/504. It is NOT what a
-    labelled 504 means (``REQUEST_TIMEOUT``, ``LLM_TIMEOUT``, contract 12.4.0):
-    those commit nothing, and the same class is raised only after the recovery
-    bound spent its re-sends on them.
+    Raised only for a genuine unknown outcome: a client-side timeout, a dropped
+    connection, an unlabelled gateway 502/504 or a claim still held. A labelled
+    504 commits nothing (contract 12.4.0) and is
+    :class:`FaultMavenNothingCommittedError` instead.
 
     Distinguished so the user-facing message can warn against blind re-sends
     (a resent message runs a duplicate turn against state the user never saw).
@@ -439,6 +448,22 @@ class FaultMavenTimeoutError(FaultMavenError):
     to, so "the agent gave up" is final for this message: a re-send is a NEW
     message, a new key, and a second turn if the first one committed.
     """
+
+
+class FaultMavenNothingCommittedError(FaultMavenError):
+    """The backend answered a labelled 504 (contract 12.4.0): it ran the turn and
+    COMMITTED NOTHING, so the user may simply try again (a new message, a new key).
+
+    Raised once the re-sends allowed for it are spent, or would not fit in the
+    recovery bound. ``kind`` says which: ``"request_timeout"`` (the turn used its
+    whole ceiling on this input, so the same request may time out again),
+    ``"llm_timeout"`` (a transient provider timeout) or ``"coded_504"`` (a 504
+    label this client does not model; the contract says no 504 commits).
+    """
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def _unknown_outcome(message: str, cause: BaseException) -> FaultMavenTimeoutError:
@@ -838,7 +863,9 @@ class FaultMavenClient:
                 if (
                     isinstance(value, bool)
                     or not isinstance(value, (int, float))
-                    or not 0 < value <= _TIMING_MAX_BOUND_SECONDS
+                    or not (
+                        _TIMING_MIN_BOUND_SECONDS <= value <= _TIMING_MAX_BOUND_SECONDS
+                    )
                 ):
                     raise ValueError(f"unusable turnResponseBoundSeconds {value!r}")
                 bound = float(value)
@@ -866,7 +893,8 @@ class FaultMavenClient:
         derive it — computed from the bound the backend publishes:
 
         - attempt = ``turnResponseBoundSeconds`` + :data:`TURN_NETWORK_MARGIN_SECONDS`
-        - recovery = :data:`TURN_RECOVERY_ATTEMPTS` x the attempt in force
+        - recovery = :data:`TURN_RECOVERY_ATTEMPTS` x the larger of the attempt in
+          force and the bound + margin (a short attempt pin does not shorten it)
 
         The published bound is the nominal time to the API's answer (ceiling +
         commit reserve + auto-title). An attempt shorter than that abandons a
@@ -883,7 +911,12 @@ class FaultMavenClient:
                 if self._derive_attempt:
                     attempt = bound + TURN_NETWORK_MARGIN_SECONDS
                 if self._derive_recovery:
-                    recovery = TURN_RECOVERY_ATTEMPTS * attempt
+                    # From the BACKEND's bound, never below it: an attempt pin
+                    # shorter than the bound must not shrink the time a thread
+                    # waits for a turn the backend legitimately takes that long on.
+                    recovery = TURN_RECOVERY_ATTEMPTS * max(
+                        attempt, bound + TURN_NETWORK_MARGIN_SECONDS
+                    )
         self._longest_attempt = max(self._longest_attempt, attempt)
         return attempt, recovery
 
@@ -2080,21 +2113,26 @@ class FaultMavenClient:
         - ``409 CASE_VERSION_CONFLICT`` while recovering: without a claim store
           a re-send can run beside the first attempt and lose to it; the next
           attempt replays. Re-sent once; a second one is the ordinary conflict.
-        - ``504 REQUEST_TIMEOUT``: the backend ran the turn out of time and
-          committed nothing. Re-sent once, at once (it carries no
-          ``Retry-After``); a second one is final, because the turn exhausts the
-          ceiling on this input.
-        - ``504 LLM_TIMEOUT``: a transient provider timeout; nothing committed.
-          Re-sent after its ``Retry-After`` (clamped to a poll interval), for as
-          long as the recovery bound allows.
+        - a labelled ``504`` commits nothing (contract 12.4.0), and clears the
+          doubt about earlier attempts. ``REQUEST_TIMEOUT`` (the turn used its
+          whole ceiling on this input; no ``Retry-After``) is final at once: the
+          same input likely does it again, so the user decides whether to retry.
+          ``LLM_TIMEOUT`` (a transient provider timeout) is re-sent after its
+          ``Retry-After`` (clamped to a poll interval), twice at most. A re-send
+          is a fresh, charged run, so it starts only if a whole attempt still
+          fits in the bound. Any other labelled 504 is final. Whatever ends
+          these is raised as :class:`FaultMavenNothingCommittedError`.
         - an uncoded 5xx or a 429 while recovering: the backend is overloaded
           or restarting, which says nothing about the turn. Keep asking, after
           ``Retry-After`` (clamped) or the backoff.
-        - anything else is mapped as it always was on a first attempt. While
-          recovering, only an answer about the turn itself ends the loop with
-          its own class (see :data:`_DEFINITIVE_WHILE_RECOVERING`); any other
-          refusal raises the unknown outcome, because an earlier attempt may
-          have committed the turn.
+        - anything else is mapped as it always was on a first attempt. While an
+          earlier attempt may have committed the turn (a transport loss, a
+          client timeout, an unlabelled gateway 502/504, a claim still held),
+          only an answer about the turn itself ends the loop with its own class
+          (see :data:`_DEFINITIVE_WHILE_RECOVERING`); any other refusal raises
+          the unknown outcome. When no earlier attempt can have committed (none
+          yet, or a labelled 504 since), a refusal is the real answer and
+          surfaces as itself.
 
         The per-attempt cap and the bound come from :meth:`turn_timing` (the
         backend's published turn bound plus a margin, or the configured
@@ -2108,7 +2146,9 @@ class FaultMavenClient:
         decided, so a surface can tell the user the turn is taking longer than
         usual. It must not raise; if it does, the failure is logged and the turn
         goes on. When the bound runs out (or the process starts shutting down)
-        the last unknown outcome is raised as :class:`FaultMavenTimeoutError`.
+        the last unknown outcome is raised as :class:`FaultMavenTimeoutError`
+        (or, if the last answer was a labelled 504,
+        :class:`FaultMavenNothingCommittedError`).
         """
 
         form: dict[str, str] = {}
@@ -2152,10 +2192,19 @@ class FaultMavenClient:
         # The last attempt whose outcome is unknown, raised if the loop ends
         # without an answer. None until the first such attempt: before it, a
         # failure that never reached the backend is safe to report as retryable.
-        pending: FaultMavenTimeoutError | None = None
+        pending: FaultMavenTimeoutError | FaultMavenNothingCommittedError | None = None
+        # Can an EARLIER attempt have committed this turn? Set by a transport
+        # loss, a client timeout, an unlabelled gateway 502/504 or a claim still
+        # held; cleared by a labelled 504, which says the backend ran it and
+        # committed nothing. While it is False a refusal is the real answer.
+        maybe_committed = False
         backoff = _RECOVERY_BACKOFF_FIRST_SECONDS
         version_conflicts = 0
         request_timeouts = 0
+        llm_timeouts = 0
+        # Set when this attempt was answered by a labelled 504: the next attempt
+        # is a fresh, charged run, and starts only if a whole attempt fits.
+        fresh_run_next = False
         notified = False
 
         while True:
@@ -2164,6 +2213,7 @@ class FaultMavenClient:
             timeout = max(0.0, min(attempt_seconds, deadline - self._clock()))
             # Seconds to wait before the next attempt, when this one is retried.
             wait = 0.0
+            fresh_run_next = False
             try:
                 resp, polled = self._send_turn(
                     case_id, cred, form, file_parts, headers,
@@ -2176,6 +2226,7 @@ class FaultMavenClient:
                     "still complete on the backend",
                     exc,
                 )
+                maybe_committed = True
                 wait, backoff = backoff, _next_backoff(backoff)
             except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
                 # The full request body was already sent and we failed while
@@ -2188,11 +2239,13 @@ class FaultMavenClient:
                     "the turn may still complete on the backend",
                     exc,
                 )
+                maybe_committed = True
                 wait, backoff = backoff, _next_backoff(backoff)
             except FaultMavenTimeoutError as exc:
                 # The 202 poll, or the re-authentication, ran out of this
                 # attempt's time.
                 pending = exc
+                maybe_committed = True
                 wait, backoff = backoff, _next_backoff(backoff)
             except httpx.HTTPError as exc:
                 # The request never reached the backend (refused, reset
@@ -2201,36 +2254,50 @@ class FaultMavenClient:
                 # EARLIER attempt may have committed, so the outcome stays
                 # unknown and the loop keeps asking (a backend mid-restart
                 # refuses connections for a while).
-                if pending is None:
+                if not maybe_committed:
                     raise FaultMavenError(f"submit_turn failed: {exc}") from exc
                 wait, backoff = backoff, _next_backoff(backoff)
             else:
                 if resp.is_success:
                     return self._turn_result(resp, case_id)
                 code = resp.headers.get("x-error-code")
-                if resp.status_code == 504 and code == _REQUEST_TIMEOUT_CODE:
-                    request_timeouts += 1
-                    timed_out = FaultMavenTimeoutError(
-                        "submit_turn ran out of time on the backend (HTTP 504 "
-                        "REQUEST_TIMEOUT); nothing of it committed"
-                    )
-                    if request_timeouts > 1:
-                        raise timed_out
-                    pending = timed_out
-                elif resp.status_code == 504 and code == _LLM_TIMEOUT_CODE:
-                    # A transient provider timeout: the API answered, committed
-                    # nothing, and says when to ask again. Unlike REQUEST_TIMEOUT
-                    # the input is not implicated, so it is asked again at the
-                    # pace the API names, for as long as the bound allows.
-                    pending = FaultMavenTimeoutError(
-                        "submit_turn hit a provider timeout on the backend "
-                        "(HTTP 504 LLM_TIMEOUT); nothing of it committed"
-                    )
-                    retry_after = self._retry_after(resp)
-                    if retry_after is None:
-                        wait, backoff = backoff, _next_backoff(backoff)
+                if resp.status_code == 504 and code:
+                    # A labelled 504 commits nothing (contract 12.4.0). Whether
+                    # it is asked again depends on what it says about the input.
+                    maybe_committed = False
+                    retry_after = None
+                    if code == _REQUEST_TIMEOUT_CODE:
+                        # The turn used its whole ceiling on this input: no
+                        # Retry-After, and the same input likely does again, so
+                        # it is not re-sent automatically.
+                        request_timeouts += 1
+                        kind, resends = "request_timeout", request_timeouts
+                        limit = _REQUEST_TIMEOUT_RESENDS
+                        text = "HTTP 504 REQUEST_TIMEOUT"
+                    elif code == _LLM_TIMEOUT_CODE:
+                        # Transient and not the input's fault: asked again at
+                        # the pace the API names.
+                        llm_timeouts += 1
+                        kind, resends = "llm_timeout", llm_timeouts
+                        limit = _LLM_TIMEOUT_RESENDS
+                        text = "HTTP 504 LLM_TIMEOUT"
+                        retry_after = self._retry_after(resp)
                     else:
-                        wait = _in_progress_poll_seconds(retry_after)
+                        kind, resends, limit = "coded_504", 1, 0
+                        text = f"HTTP 504 {code}"
+                    pending = FaultMavenNothingCommittedError(
+                        f"submit_turn ran out of time on the backend ({text}); "
+                        "nothing of it committed",
+                        kind=kind,
+                    )
+                    if resends > limit:
+                        raise pending
+                    if kind == "llm_timeout":
+                        if retry_after is None:
+                            wait, backoff = backoff, _next_backoff(backoff)
+                        else:
+                            wait = _in_progress_poll_seconds(retry_after)
+                    fresh_run_next = True
                 elif resp.status_code in (502, 504) and not code:
                     # A gateway timed out on an upstream it had forwarded to:
                     # the turn may be running, or committed, behind it.
@@ -2239,24 +2306,26 @@ class FaultMavenClient:
                         f"{resp.status_code}); the turn may still complete on "
                         "the backend"
                     )
+                    maybe_committed = True
                     wait, backoff = backoff, _next_backoff(backoff)
                 elif resp.status_code == 409 and code == _TURN_IN_PROGRESS_CODE:
                     pending = FaultMavenTimeoutError(
                         "submit_turn: the turn is still in progress on the "
                         "backend (409 TURN_IN_PROGRESS)"
                     )
+                    maybe_committed = True
                     wait = _in_progress_poll_seconds(self._retry_after(resp))
                 elif (
                     resp.status_code == 409
                     and code == _VERSION_CONFLICT_CODE
-                    and pending is not None
+                    and maybe_committed
                     and version_conflicts == 0
                 ):
                     # A re-send that ran beside the attempt it recovers, with no
                     # claim to stop it, and lost the case version to it: the
                     # next attempt is answered from that attempt's receipt.
                     version_conflicts += 1
-                elif pending is not None and (
+                elif maybe_committed and (
                     resp.status_code == 429 or (resp.status_code >= 500 and not code)
                 ):
                     # A backend that is overloaded, restarting or rate-limiting
@@ -2271,7 +2340,7 @@ class FaultMavenClient:
                     try:
                         self._raise_turn_error(resp, polled=polled)
                     except FaultMavenError as error:
-                        if pending is None or _is_definitive(error):
+                        if not maybe_committed or _is_definitive(error):
                             raise
                         # A later attempt's refusal is not an answer about the
                         # turn: an earlier attempt may have committed it. The
@@ -2281,6 +2350,10 @@ class FaultMavenClient:
             # Retry: the same request, under the same key.
             remaining = deadline - self._clock()
             if remaining <= 0 or self._stopping.is_set():
+                raise pending
+            if fresh_run_next and remaining - wait < attempt_seconds:
+                # A re-send after a labelled 504 is a fresh, charged run. Do not
+                # launch one the bound will cut off: end with what the backend said.
                 raise pending
             if not notified and on_waiting is not None:
                 notified = True

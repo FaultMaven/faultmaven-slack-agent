@@ -91,8 +91,9 @@ done when its check conclusions are green, not when local tests pass.
   recovery bound derive from `limits.turnResponseBoundSeconds` on
   `GET /api/v1/meta/capabilities` (`FaultMavenClient.turn_timing`; env pins
   `FAULTMAVEN_REQUEST_TIMEOUT` / `FAULTMAVEN_TURN_RECOVERY_SECONDS`, fallback
-  150 s / 660 s). A labelled 504 (`REQUEST_TIMEOUT` once, `LLM_TIMEOUT` after
-  its `Retry-After`) committed nothing.
+  150 s / 660 s). A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
+  after its `Retry-After`, at most twice) committed nothing and surfaces as
+  `FaultMavenNothingCommittedError`.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
   regenerated `faultmaven/api_generated.py` in the same PR.
