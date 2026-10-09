@@ -621,6 +621,145 @@ def test_close_waits_for_an_in_flight_renewal():
     assert store.closed is True
 
 
+def test_begin_shutdown_stops_the_keepalive_without_closing_anything():
+    """The keepalive stops when the drain BEGINS, not at the post-drain close():
+    a renewal it started during the drain could still be mid-rotation when the
+    grace period runs out, and a SIGKILL then loses the rotated token (#93)."""
+    store = FakeStore(token="rt-0")
+    client = make_client(lambda r: token_response(), store=store)
+    client._start_keepalive()
+    keepalive = client._keepalive
+
+    client.begin_shutdown()
+
+    assert client._keepalive_stop.is_set()
+    keepalive.join(timeout=5)
+    assert not keepalive.is_alive()
+    # Nothing is torn down yet: in-flight turns are still draining on these.
+    assert store.closed is False
+    assert client._http.is_closed is False
+    client.close()
+
+
+def _due_refresh_token() -> str:
+    return jwt_with_exp(time.time() + 60)
+
+
+def _run_keepalive_loop(client: FaultMavenClient) -> None:
+    loop = threading.Thread(target=client._keepalive_loop, daemon=True)
+    loop.start()
+    loop.join(timeout=5)
+    assert not loop.is_alive(), "the keepalive loop did not stop at shutdown"
+
+
+def test_keepalive_starts_no_renewal_once_shutdown_begins(monkeypatch):
+    """Shutdown lands after the loop's head check — here, while it enumerates
+    credentials (which reads the binding store). The loop must look again
+    before renewing, or it starts a rotation the drain cannot see. A pending
+    write is still retried: that only heals a failed write."""
+    import faultmaven.client as client_module
+
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.url.path)
+        return token_response()
+
+    store = FakeStore(token="rt-0")
+    client = make_client(handler, store=store)
+    due = _due_refresh_token()
+    client._default.refresh_token = due
+    client._default.unpersisted = True
+    assert client._refresh_credential_is_due(client._default) is True
+
+    def credentials_while_shutdown_begins():
+        client.begin_shutdown()
+        return [client._default]
+
+    monkeypatch.setattr(client_module, "_KEEPALIVE_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(client, "_live_credentials", credentials_while_shutdown_begins)
+
+    _run_keepalive_loop(client)
+
+    assert posts == []
+    assert client._default.refresh_token == due
+    assert store.puts == [due]  # the pending write still healed
+    assert client._default.unpersisted is False
+
+
+def test_keepalive_stops_mid_walk_when_shutdown_begins(monkeypatch):
+    """Shutdown begins while the keepalive is renewing one credential: that
+    renewal completes and persists, and the next credential is not renewed."""
+    import faultmaven.client as client_module
+    from faultmaven.client import _Credential
+
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content)["refresh_token"])
+        client.begin_shutdown()  # SIGTERM arrives mid-rotation
+        return token_response(refresh=f"rotated-{len(posts)}")
+
+    store = FakeStore(token="rt-0")
+    client = make_client(handler, store=store)
+    first = client._default
+    first.refresh_token = _due_refresh_token()
+    second = _Credential(
+        key="T2", refresh_token=_due_refresh_token(), fm_enterprise_id="ent-a"
+    )
+    assert client._refresh_credential_is_due(second) is True
+
+    monkeypatch.setattr(client_module, "_KEEPALIVE_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(client, "_live_credentials", lambda: [first, second])
+
+    _run_keepalive_loop(client)
+
+    assert len(posts) == 1
+    assert store.puts == ["rotated-1"]
+    assert first.refresh_token == "rotated-1"
+    assert second.refresh_token != "rotated-1"
+
+
+def test_shutdown_waits_for_a_keepalive_renewal_in_flight_at_sigterm(monkeypatch):
+    """Stopping the keepalive interrupts nothing: a rotation already under way
+    when shutdown begins completes, is persisted, and close() waits for it."""
+    import faultmaven.client as client_module
+
+    started = threading.Event()
+    release = threading.Event()
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.url.path)
+        started.set()
+        release.wait(timeout=5)
+        return token_response()
+
+    store = FakeStore(token="rt-0")
+    client = make_client(handler, store=store)
+    client._default.refresh_token = _due_refresh_token()
+    monkeypatch.setattr(client_module, "_KEEPALIVE_INTERVAL_SECONDS", 0.0)
+    client._start_keepalive()
+    keepalive = client._keepalive
+    assert started.wait(timeout=5), "the keepalive never started its renewal"
+
+    client.begin_shutdown()
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    closer.join(timeout=0.5)
+    assert closer.is_alive(), "close() returned while a renewal was in flight"
+    assert store.closed is False
+
+    release.set()
+    closer.join(timeout=10)
+    keepalive.join(timeout=5)
+    assert not closer.is_alive()
+    assert not keepalive.is_alive()
+    assert posts == ["/api/v1/auth/oauth/token"]
+    assert store.puts == ["rt-2"]
+    assert store.closed is True
+
+
 # -- diagnostics --------------------------------------------------------------
 def test_auth_mode_reports_the_refresh_grant_without_a_configured_seed():
     """The steady state after bootstrap: credential in the store, seed cleared.

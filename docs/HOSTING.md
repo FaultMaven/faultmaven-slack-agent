@@ -84,7 +84,8 @@ The bound is approximate: token acquisition or renewal before an attempt counts
 against it but is never cut short, and `httpx` applies its timeout per phase
 (connect, write, each read), not to the request as a whole. Give the pod's
 `terminationGracePeriodSeconds` some slack above it, or a SIGKILL can land
-mid-drain and strand a thread at "Working…".
+mid-drain and strand a thread at "Working…". The credential keepalive starts no
+renewal once SIGTERM arrives, but a turn's own renewal before its attempt still can.
 
 ## Known residual: a ceiling above the attempt timeout
 
