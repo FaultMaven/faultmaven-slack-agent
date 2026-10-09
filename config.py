@@ -130,14 +130,24 @@ class Settings(BaseSettings):
     # How long ONE attempt at a turn waits for its answer (incl. 202+poll). Runs
     # behind the Slack ack, so it can comfortably exceed Slack's 3s budget.
     #
-    # 150 s is a latency choice, not a derived bound: it sits above the API's
-    # DEFAULT turn ceiling (120 s) plus the up-to-18.5 s a turn spends after it
-    # (a 3.5 s commit reserve and a 15 s auto-title), so an ordinary turn answers
-    # on its first attempt. Per-provider ceilings can be longer; a turn that
-    # outlasts this is not lost, it is recovered under its key within
-    # FAULTMAVEN_TURN_RECOVERY_SECONDS.
-    faultmaven_request_timeout: float = Field(
-        default=150.0, validation_alias="FAULTMAVEN_REQUEST_TIMEOUT"
+    # Unset (the default): sized from the backend. The API publishes the nominal
+    # bound on the turn route's answer (`limits.turnResponseBoundSeconds` on
+    # GET /api/v1/meta/capabilities: its turn ceiling for the chat provider in
+    # force, plus the commit reserve and the auto-title), and an attempt waits
+    # that plus a 15 s network margin, so an attempt outlasts the API's own
+    # deadline instead of abandoning a turn it is still running. Re-read as
+    # operators switch providers. When the backend publishes nothing usable the
+    # attempt falls back to 150 s (the API's default 120 s ceiling plus its
+    # 18.5 s after-ceiling work) and the log says so.
+    #
+    # Set: pins every attempt to this many seconds, for a proxy that cuts idle
+    # connections sooner than the API answers. A pin below the bound reintroduces
+    # re-sends of a turn the API is still running.
+    faultmaven_request_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="FAULTMAVEN_REQUEST_TIMEOUT",
     )
     # How long a Slack thread is willing to wait for one turn, every attempt
     # included. When an attempt times out, hits a gateway 502/504 or loses its
@@ -147,14 +157,33 @@ class Settings(BaseSettings):
     # thread's one-turn gate is held for the whole wait, so replies meanwhile
     # get ⏭️ as usual.
     #
-    # A policy bound, not a derivation: the API's per-provider ceilings are
-    # unbounded, so no value here is "long enough" by construction, and
-    # correctness never depends on it — a turn that outlives it still commits
-    # exactly once. It does not size the shutdown drain: at shutdown the loop
-    # stops after the attempt it is in (see app.py).
-    faultmaven_turn_recovery_seconds: float = Field(
-        default=660.0, gt=0, validation_alias="FAULTMAVEN_TURN_RECOVERY_SECONDS"
+    # Unset (the default): 3 attempts' worth — the first attempt, a
+    # re-send after a doubtful outcome, and one more for a re-send that waits
+    # out a TURN_IN_PROGRESS claim or an LLM_TIMEOUT — so it scales with the backend's
+    # published bound (never less than 3 x that bound + margin, even under a
+    # shorter attempt pin); 660 s when nothing is published. Set: pins it.
+    #
+    # A policy bound, not a derivation of correctness: a turn that outlives it
+    # still commits exactly once. It does not size the shutdown drain: at
+    # shutdown the loop stops after the attempt it is in (see app.py).
+    faultmaven_turn_recovery_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="FAULTMAVEN_TURN_RECOVERY_SECONDS",
     )
+
+    @field_validator(
+        "faultmaven_request_timeout", "faultmaven_turn_recovery_seconds", mode="before"
+    )
+    @classmethod
+    def _blank_pin_is_unset(cls, v: object) -> object:
+        """``FAULTMAVEN_REQUEST_TIMEOUT=`` (an empty line in a copied
+        ``.env.example``) means unset, not a startup failure."""
+
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     # --- Local state -------------------------------------------------------
     # SQLite file backing the thread→case map (the source of truth for "which

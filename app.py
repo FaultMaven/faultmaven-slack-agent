@@ -39,6 +39,7 @@ from slack_sdk.http_retry.builtin_handlers import (
 from config import DEFAULT_BOT_SCOPES, Settings, get_settings
 from credentials import CredentialStore
 from faultmaven import FaultMavenClient
+from faultmaven.client import FALLBACK_ATTEMPT_SECONDS, FALLBACK_RECOVERY_SECONDS
 from listeners import register_listeners
 from listeners._turn import begin_shutdown, drain_turns
 import install_pages
@@ -57,7 +58,9 @@ logger = logging.getLogger("faultmaven.slack")
 _WATCH_POLL_SECONDS = 30.0
 _MAX_DISCONNECTED_SECONDS = 600.0
 # Headroom added to the turn timeout for the shutdown drain: a turn attempt can
-# legitimately run the full FAULTMAVEN_REQUEST_TIMEOUT, so the drain must
+# legitimately run its full attempt timeout (the backend's published turn bound
+# plus a margin, or FAULTMAVEN_REQUEST_TIMEOUT when pinned; the client reports
+# the longest it has used as ``longest_attempt_seconds``), so the drain must
 # outlast it or closing the store/API client yanks resources from live workers
 # mid-turn. One attempt is enough even for a turn being recovered under its
 # key: the client is told first (``fm.begin_shutdown``), so the recovery loop
@@ -119,8 +122,15 @@ def make_fault_client(
         settings.faultmaven_api_url,
         token=settings.faultmaven_api_token,
         dev_login_username=settings.faultmaven_dev_login_username,
-        timeout=settings.faultmaven_request_timeout,
-        turn_recovery_seconds=settings.faultmaven_turn_recovery_seconds,
+        # Unset knobs are derived from the backend's published turn bound
+        # (FaultMavenClient.turn_timing); a set one pins, and the client's
+        # fallback numbers apply only when nothing is published.
+        timeout=settings.faultmaven_request_timeout or FALLBACK_ATTEMPT_SECONDS,
+        turn_recovery_seconds=(
+            settings.faultmaven_turn_recovery_seconds or FALLBACK_RECOVERY_SECONDS
+        ),
+        derive_attempt_timeout=settings.faultmaven_request_timeout is None,
+        derive_recovery_seconds=settings.faultmaven_turn_recovery_seconds is None,
         refresh_token=settings.faultmaven_refresh_token,
         credential_store=credential_store,
         oauth_client_id=settings.faultmaven_oauth_client_id,
@@ -398,10 +408,7 @@ def shutdown_runtime(store: CaseStore, fm: FaultMavenClient) -> None:
     # its next attempt boundary instead of running out its recovery bound —
     # which is what lets the drain below cover one attempt, not the bound.
     fm.begin_shutdown()
-    drain_turns(
-        get_settings().faultmaven_request_timeout
-        + _SHUTDOWN_DRAIN_HEADROOM_SECONDS
-    )
+    drain_turns(fm.longest_attempt_seconds + _SHUTDOWN_DRAIN_HEADROOM_SECONDS)
     store.close()
     fm.close()
 

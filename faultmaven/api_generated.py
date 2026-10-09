@@ -148,6 +148,50 @@ class AvailableScopesResponse(BaseModel):
     scopes: list[str] = Field(..., title="Scopes")
 
 
+class BackendBranding(BaseModel):
+    name: str = Field(..., title="Name")
+    supportUrl: str = Field(..., title="Supporturl")
+
+
+class DeploymentMode(Enum):
+    cloud = "cloud"
+    self_hosted = "self-hosted"
+
+
+class BackendCapabilityFeatures(BaseModel):
+    adminKB: bool = Field(..., title="Adminkb")
+    caseHistory: bool = Field(..., title="Casehistory")
+    extensionKB: bool = Field(
+        ..., description="Always false: the extension KB was removed.", title="Extensionkb"
+    )
+    managementConsole: bool = Field(
+        ...,
+        description="The org/team management console; same signal as teamSharing.",
+        title="Managementconsole",
+    )
+    sso: bool = Field(..., title="Sso")
+    teamSharing: bool = Field(
+        ...,
+        description="Team-based KB/case sharing; true only when team management is live.",
+        title="Teamsharing",
+    )
+
+
+class BackendCapabilityLimits(BaseModel):
+    allowedExtensions: list[str] = Field(..., title="Allowedextensions")
+    maxFileBytes: int = Field(..., title="Maxfilebytes")
+    turnCeilingSeconds: float = Field(
+        ...,
+        description="The turn ceiling for the chat provider in force: a turn that uses all of it is answered 504 REQUEST_TIMEOUT, nothing committed.",
+        title="Turnceilingseconds",
+    )
+    turnResponseBoundSeconds: float = Field(
+        ...,
+        description="The nominal bound on how long POST /cases/{case_id}/turns takes to answer: the ceiling plus the commit reserve and the auto-title bound after it. Not a hard guarantee: it leaves out short steps (the case and receipt lookups before the deadline starts, the commit's actual duration), so size a client timeout as this plus a network margin that covers them. Both values are resolved per request and change when an operator switches the chat provider, so re-read them per session.",
+        title="Turnresponseboundseconds",
+    )
+
+
 class BatchDraftRef(BaseModel):
     conversion_id: str = Field(..., title="Conversion Id")
     draft_id: str = Field(..., title="Draft Id")
@@ -1174,6 +1218,24 @@ class TokenResponse(BaseModel):
     username: str = Field(..., description="Username", title="Username")
 
 
+class TurnTimingStatus(BaseModel):
+    chat_provider: str | None = Field(
+        ...,
+        description="The chat provider the ceiling was resolved for; null when none is configured and AGENT_REQUEST_TIMEOUT applies.",
+        title="Chat Provider",
+    )
+    turn_ceiling_seconds: float = Field(
+        ...,
+        description="AGENT_REQUEST_TIMEOUT, or this provider's AGENT_PROVIDER_TIMEOUT_OVERRIDES entry: the bound on a turn's preparation and the deadline its LLM calls budget against.",
+        title="Turn Ceiling Seconds",
+    )
+    turn_response_bound_seconds: float = Field(
+        ...,
+        description="The nominal bound on the turn route's answer: the ceiling plus the commit reserve and the auto-title bound. Clients size their timeout from it plus a network margin, which also covers the short steps it leaves out (the case and receipt lookups before the deadline starts, the commit's actual duration).",
+        title="Turn Response Bound Seconds",
+    )
+
+
 class UploadedFileDetailsResponse(BaseModel):
     content_hash: str | None = Field(
         None, description="SHA-256 of file contents (storage-backend dedup)", title="Content Hash"
@@ -1384,6 +1446,15 @@ class AuthTokenResponse(BaseModel):
         "bearer", description="Token type (always 'bearer')", title="Token Type"
     )
     user: UserProfile = Field(..., description="Authenticated user profile")
+
+
+class BackendCapabilities(BaseModel):
+    branding: BackendBranding
+    dashboardUrl: str = Field(..., title="Dashboardurl")
+    deploymentMode: DeploymentMode = Field(..., title="Deploymentmode")
+    features: BackendCapabilityFeatures
+    kbManagement: str = Field(..., title="Kbmanagement")
+    limits: BackendCapabilityLimits
 
 
 class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
@@ -1620,6 +1691,10 @@ class EnvConfigStatusResponse(BaseModel):
         title="Session Storage",
     )
     timestamp: AwareDatetime = Field(..., title="Timestamp")
+    turn_timing: TurnTimingStatus = Field(
+        ...,
+        description="The resolved turn ceiling and response bound for the chat provider in force, as clients read them on GET /api/v1/meta/capabilities.",
+    )
     vector_storage: str = Field(
         ...,
         description="What the running process's KB and evidence ChromaDB clients talk to: 'chromadb (server)', 'chromadb (persistent, split: kb + evidence)', 'disabled' when neither was built, or a per-client breakdown when they differ",

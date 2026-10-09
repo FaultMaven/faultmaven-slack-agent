@@ -34,6 +34,7 @@ from faultmaven.client import (
     FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenError,
+    FaultMavenNothingCommittedError,
     FaultMavenTimeoutError,
     IdempotencyKeyReuseError,
     IdempotencyReplayUnavailableError,
@@ -485,28 +486,23 @@ def test_a_refused_connection_while_recovering_keeps_recovering():
 
 
 # -- A3: the app's own 504 ----------------------------------------------------------
-def test_two_request_timeouts_are_two_posts_then_the_timeout():
-    """REQUEST_TIMEOUT means nothing committed: the turn exhausted the ceiling
-    on this input. One re-send, then today's timeout text."""
+def test_a_request_timeout_is_one_post_then_the_nothing_committed_outcome():
+    """R9: REQUEST_TIMEOUT means nothing committed: the turn exhausted the
+    ceiling on this input, so it likely does again. No automatic re-send; the
+    user is told, and the buttons re-arm."""
 
     timed_out = httpx.Response(
         504, json={"detail": "timeout"},
-        headers={"x-error-code": "REQUEST_TIMEOUT", "Retry-After": "30"},
+        headers={"x-error-code": "REQUEST_TIMEOUT"},
     )
-    backend = _Backend(timed_out, timed_out, _ok())
-    client, _ = _client(backend)
-    with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
-    assert len(backend.requests) == 2
-    assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
-
-
-def test_a_request_timeout_then_an_answer_is_the_answer():
-    timed_out = httpx.Response(504, headers={"x-error-code": "REQUEST_TIMEOUT"})
     backend = _Backend(timed_out, _ok())
     client, _ = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").agent_response
-    assert backend.keys == [_KEY, _KEY]
+    with pytest.raises(FaultMavenNothingCommittedError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == 1
+    assert not isinstance(err.value, FaultMavenTimeoutError)
+    assert _turn.turn_error_text(err.value) == _turn.NOTHING_COMMITTED_NARROW_TEXT
+    assert _turn.retry_may_help(err.value)
 
 
 # -- what ends a recovery, and what does not ---------------------------------------
@@ -603,15 +599,14 @@ def test_answers_about_the_turn_still_end_a_recovery(later, expected):
 @pytest.mark.parametrize(
     "coded",
     [
-        httpx.Response(504, headers={"x-error-code": "LLM_TIMEOUT"}),
         httpx.Response(502, headers={"x-error-code": "LLM_PROVIDER_ERROR"}),
-        httpx.Response(504, headers={"x-error-code": "SOMETHING_NEW"}),
     ],
-    ids=["LLM_TIMEOUT-504", "LLM_PROVIDER_ERROR-502", "unknown-coded-504"],
+    ids=["LLM_PROVIDER_ERROR-502"],
 )
 def test_a_coded_502_or_504_does_not_enter_recovery(coded):
     """F3a: only an UNCODED 502/504 is a gateway in front of an unknown turn. A
-    coded one is the app's own answer; it stays today's timeout class, once."""
+    coded 502 is the app's own answer; it stays today's timeout class, once.
+    (Coded 504s commit nothing and are tested in test_turn_timing.py.)"""
 
     backend = _Backend(coded, _ok())
     client, _ = _client(backend)
@@ -645,7 +640,7 @@ def test_shutdown_is_observed_on_the_paths_that_do_not_wait(script):
     backend = _Backend(*steps, _ok())
     client, _ = _client(backend)
     box[0] = client
-    with pytest.raises(FaultMavenTimeoutError):
+    with pytest.raises((FaultMavenTimeoutError, FaultMavenNothingCommittedError)):
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert len(backend.requests) == len(steps)  # nothing sent after shutdown
 
@@ -793,6 +788,7 @@ def test_shutdown_stops_the_loop_before_the_drain(monkeypatch):
 
     class _FM:
         stopping = False
+        longest_attempt_seconds = 273.5
 
         def begin_shutdown(self):
             self.stopping = True
@@ -806,19 +802,12 @@ def test_shutdown_stops_the_loop_before_the_drain(monkeypatch):
         seen["timeout"], seen["stopping"] = timeout, fm.stopping
 
     monkeypatch.setattr(app, "drain_turns", drain)
-    monkeypatch.setattr(
-        app,
-        "get_settings",
-        lambda: SimpleNamespace(
-            faultmaven_request_timeout=150.0, faultmaven_turn_recovery_seconds=660.0
-        ),
-    )
     app.shutdown_runtime(SimpleNamespace(close=lambda: None), fm)
 
     assert seen["stopping"] is True
-    # R1: one attempt, not the recovery bound — the loop stops at its next
+    # R1: one attempt (the longest in use), not the recovery bound — the loop stops at its next
     # attempt boundary and its wait is interruptible.
-    assert seen["timeout"] == 150.0 + app._SHUTDOWN_DRAIN_HEADROOM_SECONDS
+    assert seen["timeout"] == 273.5 + app._SHUTDOWN_DRAIN_HEADROOM_SECONDS
     assert seen["closed"]
 
 

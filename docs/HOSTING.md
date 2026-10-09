@@ -62,8 +62,8 @@ the infra repo.
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
 | `FAULTMAVEN_REFRESH_TOKEN` | secret | **required against an `oauth`-mode backend** — provisioned refresh credential (ADR-012 D10). A one-time seed: the grant rotates and the live token then lives in `CREDENTIAL_STORE_PATH`. See [Service account credentials](#service-account-credentials-oauth-mode-backends) |
 | `FAULTMAVEN_OAUTH_CLIENT_ID` | config | client id presented on the refresh grant (default `faultmaven-slack-agent`) |
-| `FAULTMAVEN_REQUEST_TIMEOUT` | config | seconds ONE attempt at a turn waits (default `150`: above the API's default 120 s turn ceiling plus its commit and auto-title time) |
-| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all (default `660`). A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
+| `FAULTMAVEN_REQUEST_TIMEOUT` | config | seconds ONE attempt at a turn waits. **Unset (the default): derived** from the API's published `limits.turnResponseBoundSeconds` (`GET /api/v1/meta/capabilities`) plus 15 s, re-read every 5 minutes; `150` when the API publishes none (logged). Set, it pins every attempt; a pin below the bound re-sends a turn the API is still running |
+| `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all. **Unset: 3 x the attempt timeout** (the first attempt, a re-send after a doubtful outcome, one more for a `TURN_IN_PROGRESS` wait or an `LLM_TIMEOUT`), and never less than 3 x the API's published bound + 15 s even under a shorter `FAULTMAVEN_REQUEST_TIMEOUT` pin; `660` when nothing is published. A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
 
@@ -75,7 +75,9 @@ error on the first Slack event.
 
 On SIGTERM the agent stops starting new recovery attempts, then waits for
 in-flight turns before closing its stores: up to
-`FAULTMAVEN_REQUEST_TIMEOUT + 10` seconds (160 at the defaults). A turn being
+the longest attempt timeout in use + 10 seconds (the attempt timeout is the
+API's published turn bound + 15 s: 153.5 + 10 at the API's default 120 s
+ceiling, about 273 + 10 at a 240 s per-provider ceiling). A turn being
 recovered finishes the attempt it is in and then stops (a wait between
 attempts ends at once) and tells its thread it stopped waiting, so one attempt
 is the most the drain needs.
@@ -87,18 +89,30 @@ against it but is never cut short, and `httpx` applies its timeout per phase
 mid-drain and strand a thread at "Working…". The credential keepalive starts no
 renewal once SIGTERM arrives, but a turn's own renewal before its attempt still can.
 
-## Known residual: a ceiling above the attempt timeout
+## Turn timeouts follow the API's published bound
 
-Each attempt is capped at `FAULTMAVEN_REQUEST_TIMEOUT` (150 s). When the API's
-turn ceiling for the configured provider exceeds about 131 s (150 less the
-18.5 s it spends committing and auto-titling), an attempt can end before the
-API answers. A turn that then runs out the ceiling at the API (nothing commits)
-releases its claim, and the next re-send under the same key runs it again, so
-within the default recovery bound such a turn can run up to about three times
-where it used to run once. It only happens to turns that fail at the ceiling
-anyway, and correctness holds: at most one commit per key. Publishing the
-ceiling (FaultMaven/faultmaven#1905) would let the first attempt be sized from
-it.
+Since contract 12.4.0 the API publishes its turn ceiling and the nominal bound
+on the turn route's answer (`limits.turnCeilingSeconds`,
+`limits.turnResponseBoundSeconds` on `GET /api/v1/meta/capabilities`: ceiling +
+commit reserve + auto-title). The agent sizes each attempt as that bound + 15 s
+(the bound omits the pre-deadline lookups and the commit's actual duration, and
+there is the network), so an attempt outlasts the API's own deadline rather
+than abandoning a turn the API is still running. The value is per chat
+provider and moves when an operator switches it, so it is re-read every five
+minutes. If the capabilities request fails, answers non-JSON, or lacks a usable
+number, the agent falls back to 150 s per attempt and 660 s per turn and logs a
+warning (re-probed after 30 s).
+
+Retry semantics by `x-error-code` on a 504 (both commit nothing): `REQUEST_TIMEOUT`
+(the turn used its whole ceiling on this input; no `Retry-After`) is NOT re-sent:
+the user is told nothing was saved and that the request may time out again, and
+the buttons re-arm; `LLM_TIMEOUT` (a transient provider timeout,
+`Retry-After: 30`) is re-sent after that wait, at most twice, and only if a
+whole attempt still fits in the recovery bound. When those run out the user is
+told nothing was saved and may try again. An unlabelled gateway
+502/504 may front a turn that did commit, and is recovered under the
+`Idempotency-Key` instead. Give `terminationGracePeriodSeconds` room for the
+derived attempt (see the drain above), not for the old 150 s.
 
 ## State that must persist (a deploy requirement for the infra repo)
 
