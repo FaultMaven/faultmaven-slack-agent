@@ -682,20 +682,26 @@ all — while `is_unlinked` preserves the memory:
    (`msg:team:channel:ts`, `click:team:channel:action_ts`,
    `shortcut:team:trigger_id`), so a redelivered event is the same turn and two
    messages or clicks never are. When an attempt's outcome is unknown (the client
-   timed out after `FAULTMAVEN_REQUEST_TIMEOUT`, a gateway 502/504, a connection
+   timed out after the attempt timeout, a gateway 502/504, a connection
    dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
    request under the same key: `200` (with `X-Idempotency-Replayed: true` when an
    earlier attempt committed) is the answer; `409 TURN_IN_PROGRESS` waits
    `Retry-After`, clamped to a 1–60 s poll interval; `409 CASE_VERSION_CONFLICT`
    is re-sent once (a claimless duplicate that lost to the first); `504
-   REQUEST_TIMEOUT` is re-sent once; an uncoded 5xx or a 429 keeps the loop
+   REQUEST_TIMEOUT` (nothing committed; no `Retry-After`) is re-sent once; `504
+   LLM_TIMEOUT` (nothing committed; `Retry-After: 30`) is re-sent after that
+   wait while the bound lasts (contract 12.4.0); an uncoded 5xx or a 429 keeps the loop
    going (the backend is overloaded or restarting, which says nothing about the
    turn). Only answers about the turn itself end it with their own meaning —
    `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal
    case, a 404, a second version conflict, a 401; any other refusal while
    recovering is reported as the unknown outcome it is. The loop is bounded by
-   `FAULTMAVEN_TURN_RECOVERY_SECONDS` (a policy bound, 660 s by default) and ends
-   at shutdown; the thread's gate is held throughout, so follow-ups get ⏭️.
+   the recovery bound (3 attempts' worth, `FAULTMAVEN_TURN_RECOVERY_SECONDS` to
+   pin; a policy bound) and ends at shutdown. The attempt timeout is the API's
+   published `limits.turnResponseBoundSeconds` + 15 s, read from
+   `GET /api/v1/meta/capabilities` and re-read every 5 min, falling back to
+   150 s / 660 s (logged) when it is not published (docs/HOSTING.md). The
+   thread's gate is held throughout, so follow-ups get ⏭️.
    A terminal case is recognised by `x-error-code: CASE_TERMINAL` (contract
    12.3.0); an unlabelled 409 is not one and gets the generic handling.
 
