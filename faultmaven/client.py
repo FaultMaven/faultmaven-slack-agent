@@ -656,16 +656,28 @@ class FaultMavenClient:
         one), but none re-sends after it and a wait between attempts ends at
         once. The turn then reports the timeout, so its thread is told it may
         have gone through rather than left at "Working…".
+
+        It also stops the credential keepalive, so no renewal it would start
+        can run into the drain: a rotation SIGKILLed after the grace period
+        loses the rotated token, and the presented one is already revoked. A
+        renewal already in flight is not interrupted — it holds the
+        credential's renew lock, and :meth:`close` waits for it. No join here:
+        the drain must not wait on the keepalive.
         """
 
         self._stopping.set()
+        self._keepalive_stop.set()
 
     def close(self) -> None:
         self._stopping.set()
         self._keepalive_stop.set()
         keepalive = self._keepalive
         if keepalive is not None:
-            # Bounded: the thread only ever waits on the stop event.
+            # Bounded, but not a drain: the thread may be inside a renewal
+            # (one request, under the credential's renew lock), which setting
+            # the stop event does not interrupt. The lock wait below is what
+            # outlasts that renewal; this join only gives an idle thread a
+            # chance to exit.
             keepalive.join(timeout=5.0)
 
         # Wait out an in-flight renewal before tearing down what it is using.
@@ -1332,6 +1344,12 @@ class FaultMavenClient:
                     continue
                 try:
                     self._retry_pending_persist(cred)
+                    # Per credential, not just at the loop head: shutdown can
+                    # begin while this walk is under way, and a renewal started
+                    # after it would run into the drain (see begin_shutdown).
+                    # After the persist retry, which only heals a failed write.
+                    if self._keepalive_stop.is_set():
+                        return
                     if self._refresh_credential_is_due(cred):
                         # force: the access token's remaining life is irrelevant
                         # — this renewal exists to slide the refresh window.
