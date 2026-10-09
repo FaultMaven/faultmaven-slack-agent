@@ -218,13 +218,14 @@ def test_submit_turn_gateway_timeout_is_indeterminate():
 
 def test_submit_turn_409_terminal_case_is_its_own_class():
     """The backend refuses evidence / status changes on a terminal (resolved or
-    closed) case with a bare 409. It must not surface as a generic API error —
+    closed) case with a 409 labelled CASE_TERMINAL. It must not surface as a generic API error —
     the case is working as designed, not malfunctioning."""
 
     client = make_client(
         lambda req: httpx.Response(
             409,
             json={"detail": "Cannot submit new data to a closed case."},
+            headers={"x-error-code": "CASE_TERMINAL"},
         ),
         token="tok",
     )
@@ -239,8 +240,8 @@ def test_submit_turn_409_terminal_case_is_its_own_class():
 def test_submit_turn_409_version_conflict_is_not_mistaken_for_terminal():
     """Two unrelated conflicts share 409 on this endpoint and need OPPOSITE
     advice: an OCC conflict did not commit and should be re-sent, a terminal
-    case never will. Only the OCC one carries x-error-code, so it is matched
-    positively — an unlabelled 409 is the terminal rejection."""
+    case never will. Each carries its own x-error-code (CASE_VERSION_CONFLICT vs CASE_TERMINAL), so
+    each is matched positively."""
 
     client = make_client(
         lambda req: httpx.Response(
@@ -322,8 +323,8 @@ def test_409_labelled_with_some_other_code_is_never_called_terminal():
 def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
     """The split must survive the backend rewording a message we don't own: a
     version conflict whose detail says nothing about versions is still routed by
-    its header, and a terminal 409 phrased any way at all still routes by the
-    header's absence."""
+    its header, and a terminal 409 phrased any way at all still routes by its
+    CASE_TERMINAL label."""
 
     conflict = make_client(
         lambda req: httpx.Response(
@@ -337,7 +338,11 @@ def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
         conflict.submit_turn("c1", query="x", idempotency_key="test-turn-key")
 
     terminal = make_client(
-        lambda req: httpx.Response(409, json={"detail": "unexpected wording"}),
+        lambda req: httpx.Response(
+            409,
+            json={"detail": "unexpected wording"},
+            headers={"x-error-code": "CASE_TERMINAL"},
+        ),
         token="tok",
     )
     with pytest.raises(CaseTerminalError):

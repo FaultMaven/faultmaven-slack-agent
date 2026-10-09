@@ -31,6 +31,7 @@ import listeners._turn as _turn
 from faultmaven.client import (
     CaseTerminalError,
     CaseVersionConflictError,
+    FaultMavenAPIError,
     FaultMavenClient,
     FaultMavenError,
     FaultMavenTimeoutError,
@@ -43,7 +44,7 @@ from tests._clock import FakeClock
 
 _LOG = logging.getLogger("test")
 
-#: The ``Idempotency-Key`` header's grammar as contract 12.2.0 publishes it
+#: The ``Idempotency-Key`` header's grammar as the pinned contract publishes it
 #: (``docs/reference/api/openapi.json`` at the pinned ref, the turn route's
 #: header parameter). The generated models do not carry it — a header parameter
 #: is not a model — so it is quoted here and checked against the document by
@@ -578,7 +579,12 @@ def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
     ("later", "expected"),
     [
         (httpx.Response(404, json={"detail": "Case not found"}), "CaseNotFoundError"),
-        (httpx.Response(409, json={"detail": "closed"}), "CaseTerminalError"),
+        (
+            httpx.Response(
+                409, json={"detail": "closed"}, headers={"x-error-code": "CASE_TERMINAL"}
+            ),
+            "CaseTerminalError",
+        ),
         (httpx.Response(401, json={"detail": "bad token"}), "FaultMavenAPIError"),
     ],
     ids=["404", "terminal", "401"],
@@ -702,19 +708,32 @@ def test_the_backoff_doubles_and_caps():
 
 
 # -- 6. CASE_TERMINAL ----------------------------------------------------------------
-@pytest.mark.parametrize("labelled", [True, False], ids=["labelled", "unlabelled"])
-def test_a_terminal_case_is_closed_labelled_or_not(labelled):
-    """S4: the core will label its terminal 409s CASE_TERMINAL after this ships;
-    both must read as a closed case, so the label can land without a window."""
+def test_a_labelled_terminal_case_is_closed():
+    """Every terminal-case 409 carries CASE_TERMINAL (contract 12.3.0)."""
 
-    headers = {"x-error-code": "CASE_TERMINAL"} if labelled else {}
     backend = _Backend(
-        httpx.Response(409, json={"detail": "Cannot submit new data"}, headers=headers)
+        httpx.Response(
+            409,
+            json={"detail": "Cannot submit new data"},
+            headers={"x-error-code": "CASE_TERMINAL"},
+        )
     )
     client, _ = _client(backend)
     with pytest.raises(CaseTerminalError) as err:
         client.submit_turn("c1", idempotency_key=_KEY, query="x", pasted_content="log")
     assert _turn.turn_error_text(err.value) == _turn.CASE_CLOSED_TEXT
+    assert len(backend.requests) == 1
+
+
+def test_an_unlabelled_409_is_not_a_terminal_case():
+    backend = _Backend(httpx.Response(409, json={"detail": "something else"}))
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x", pasted_content="log")
+    assert not isinstance(err.value, CaseTerminalError)
+    assert err.value.status_code == 409
+    assert _turn.turn_error_text(err.value) != _turn.CASE_CLOSED_TEXT
+    assert not _turn.retry_may_help(err.value)
     assert len(backend.requests) == 1
 
 
