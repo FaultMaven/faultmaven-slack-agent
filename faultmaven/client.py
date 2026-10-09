@@ -842,7 +842,7 @@ class FaultMavenClient:
         Unavailable is any failure to read a usable number: the request fails,
         the status is not 2xx, the body is not JSON (a same-origin proxy answers
         an SPA page), or the field is absent, non-numeric or outside
-        ``(0, 3600]``. The caller then keeps the configured fallback, and says
+        ``[30, 1200]`` s. The caller then keeps the configured fallback, and says
         so once per probe.
         """
 
