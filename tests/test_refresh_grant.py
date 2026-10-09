@@ -722,7 +722,11 @@ def test_keepalive_stops_mid_walk_when_shutdown_begins(monkeypatch):
 
 def test_shutdown_waits_for_a_keepalive_renewal_in_flight_at_sigterm(monkeypatch):
     """Stopping the keepalive interrupts nothing: a rotation already under way
-    when shutdown begins completes, is persisted, and close() waits for it."""
+    when shutdown begins completes, is persisted, and close() waits for it.
+
+    close() first joins the keepalive, and that join alone would hold it past
+    a short check. The join is capped here so the test sees the renew-lock
+    wait: close() has finished joining and is still blocked."""
     import faultmaven.client as client_module
 
     started = threading.Event()
@@ -743,21 +747,52 @@ def test_shutdown_waits_for_a_keepalive_renewal_in_flight_at_sigterm(monkeypatch
     keepalive = client._keepalive
     assert started.wait(timeout=5), "the keepalive never started its renewal"
 
+    real_join = keepalive.join
+    joined = threading.Event()
+
+    def capped_join(timeout=None):
+        real_join(timeout=0.1)
+        joined.set()
+
+    monkeypatch.setattr(keepalive, "join", capped_join)
+
     client.begin_shutdown()
     closer = threading.Thread(target=client.close)
     closer.start()
     closer.join(timeout=0.5)
+    assert joined.is_set(), "close() never got past the keepalive join"
+    assert keepalive.is_alive()  # the renewal is still in flight
     assert closer.is_alive(), "close() returned while a renewal was in flight"
     assert store.closed is False
 
     release.set()
     closer.join(timeout=10)
-    keepalive.join(timeout=5)
+    real_join(timeout=5)
     assert not closer.is_alive()
     assert not keepalive.is_alive()
     assert posts == ["/api/v1/auth/oauth/token"]
     assert store.puts == ["rt-2"]
     assert store.closed is True
+
+
+def test_a_turn_still_renews_its_credential_during_the_drain():
+    """Only the keepalive stops at shutdown. A turn still draining may need a
+    fresh access token before its attempt, and that renewal must go through
+    and persist — refusing it would fail the very turn the drain waits on."""
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.url.path)
+        return token_response(access="at-drain", refresh="rt-drain")
+
+    store = FakeStore(token="rt-0")
+    client = make_client(handler, store=store)
+    client.begin_shutdown()
+
+    assert client._current_token(client._default) == "at-drain"
+    assert posts == ["/api/v1/auth/oauth/token"]
+    assert store.puts == ["rt-drain"]
+    client.close()
 
 
 # -- diagnostics --------------------------------------------------------------
