@@ -502,7 +502,7 @@ the next message and answering it clearly.
 
 | Condition | What the agent sees | Reply |
 |---|---|---|
-| **Terminal, still online** (`resolved`/`closed`) | `409` with no `x-error-code` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
+| **Terminal, still online** (`resolved`/`closed`) | `409` with `x-error-code: CASE_TERMINAL` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
 | **Missing** | `404` on the turn POST | Says it *couldn't find* the case — a 404 is the whole of what we know, and deletion, a DB reset and a restore that predates the case are indistinguishable from here. **Tombstones** the thread (§6.4a) and refuses the turn rather than answering it on a new case: the message was written into a conversation whose history is what has gone missing. Points at the deliberate restart that suits the surface — an `@mention` in a channel, a new chat in a 1:1. |
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
 | **Rate limited** (*not* a lifecycle event) | `429` + `Retry-After` | Says FaultMaven is rate-limiting and quotes the wait ("send it again in 45 seconds" / "about an hour"). Not framed as an error — nothing is broken — and never "re-sending won't help", because a 429 *does* succeed later. |
@@ -518,42 +518,17 @@ caller, and the only one present when the body is not JSON — with the body's
 little while": a guessed number earns the user a second refusal.
 
 These `409`s are unrelated conflicts sharing one status and needing opposite
-advice, so the client separates them at the boundary (`CaseTerminalError` vs
-`CaseVersionConflictError`). The version conflict is the only one the backend
-labels, so *that* is matched positively by its `x-error-code`, and the terminal
-rejection is identified by the header being **absent** — not by "isn't the
-version-conflict code". Other middleware emits *labelled* `409`s on this path
-(the deduplication middleware sends `DUPLICATE_REQUEST` + `Retry-After`, and it
-skips only multipart, so a text-only turn is in scope); reading those as
-terminal would tell someone with a live case that their investigation is closed.
-A labelled but unrecognized `409` falls through to the generic 4xx reply, which
-is the honest answer for a conflict we don't model. Matching on the wording of
-`detail` instead would break the moment the backend rephrases a message we
-don't own.
-
-> **This rule reads *absence* as evidence, and it concludes something about the
-> user's case.** That makes it only as sound as the premise "no non-terminal
-> `409` is unlabelled" — a premise this repo depends on and does not own. It had
-> already been broken once: the deduplication middleware carried a second,
-> unlabelled `409` builder (`_create_duplicate_error_response`) that would have
-> produced exactly the false "your investigation is closed" reply. It was
-> unreachable — `DuplicateRequestError` is constructed but never raised — so no
-> user ever saw it, but nothing would have caught it becoming reachable.
->
-> The premise is now enforced on the side that owns it: the backend's
-> `tests/unit/api/middleware/test_conflict_labelling.py` fails if any `409`
-> emitter outside the terminal-case handler lacks `x-error-code`, **and** if the
-> terminal one ever gains a label (which would silently stop this rule firing,
-> stranding a user whose case really is closed on "try again" advice). The dead
-> deduplication path is deleted and the idempotency key-reuse `409` — the one
-> reachable unlabelled non-terminal conflict — is now labelled
-> `IDEMPOTENCY_KEY_REUSE`.
->
-> The agent does not currently send `Idempotency-Key`, so that one was never
-> reachable from here. It was labelled anyway: "no client sends the header that
-> triggers it" is a property of today's callers, not an invariant, and this rule
-> is one where being wrong means telling someone their live investigation is
-> over.
+advice, so the client separates them at the boundary by `x-error-code`, matched
+positively: `CASE_TERMINAL` is `CaseTerminalError`, `CASE_VERSION_CONFLICT` is
+`CaseVersionConflictError`, and the idempotency and in-progress labels have
+their own classes. Since contract 12.3.0 the backend labels every terminal-case
+`409`, and its CI fails on any unlabelled, unclassified one. So an unlabelled or
+unrecognised `409` is **not** read as a closed case: it falls through to the
+generic 4xx reply, the honest answer for a conflict we don't model. Reading
+*absence* of a label as "your investigation is closed" was the earlier rule; it
+was only as sound as a premise this repo did not own, and it is gone. Matching on
+the wording of `detail` instead would break the moment the backend rephrases a
+message we don't own.
 
 **Ordering against shutdown.** A terminal case is *permanent*, so its reply
 outranks the "I'm restarting — resend in a minute" drain notice: that promise
@@ -721,8 +696,8 @@ all — while `is_unlinked` preserves the memory:
    recovering is reported as the unknown outcome it is. The loop is bounded by
    `FAULTMAVEN_TURN_RECOVERY_SECONDS` (a policy bound, 660 s by default) and ends
    at shutdown; the thread's gate is held throughout, so follow-ups get ⏭️.
-   A terminal case is recognised by an unlabelled 409 or `x-error-code:
-   CASE_TERMINAL` (honored ahead of the core sending it).
+   A terminal case is recognised by `x-error-code: CASE_TERMINAL` (contract
+   12.3.0); an unlabelled 409 is not one and gets the generic handling.
 
 5. **Async turns.** A turn may return `202 Accepted` with a `Location` URL; poll
    it (exponential backoff, ~1.5×, cap ~10 s, ~5 min ceiling) until the

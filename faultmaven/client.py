@@ -142,13 +142,12 @@ def _as_list(value: Any) -> list:
 
 
 # The backend's ``x-error-code`` marking a 409 as an optimistic-concurrency
-# version conflict, as opposed to the (unlabelled) terminal-case rejection that
-# shares the status. Sent alongside x-expected-version / x-actual-version.
+# version conflict, as opposed to the terminal-case rejection (``CASE_TERMINAL``)
+# that shares the status. Sent alongside x-expected-version / x-actual-version.
 _VERSION_CONFLICT_CODE = "CASE_VERSION_CONFLICT"
-# The label the core will put on its terminal-case 409s. Honored here BEFORE the
-# core sends it (faultmaven#1888 A11): the unlabelled mapping below stays, so the
-# core can start labelling without a window where Slack calls a closed case a
-# generic rejection.
+# The label the core puts on every terminal-case 409 (contract 12.3.0,
+# faultmaven#1908). It is the only signal: an unlabelled 409 is not a terminal
+# case.
 _CASE_TERMINAL_CODE = "CASE_TERMINAL"
 
 # The turn receipt's answers (contract 12.2.0, faultmaven#1888). A turn sent with
@@ -2180,9 +2179,8 @@ class FaultMavenClient:
             if exc.status_code == 409:
                 # Several unrelated conflicts share this status, and they need
                 # different advice. The labelled ones are matched by label, and
-                # the terminal-case rejection the route raises with no
-                # ``x-error-code`` is matched by the header being ABSENT — not
-                # by "isn't a code we know". Other middleware emits labelled
+                # the terminal-case rejection is matched by its
+                # ``CASE_TERMINAL`` label — not by "isn't a code we know". Other middleware emits labelled
                 # 409s on this path (the deduplication middleware sends
                 # ``DUPLICATE_REQUEST`` + ``Retry-After``, and it skips only
                 # multipart, so a text-only turn is in scope); treating those as
@@ -2207,14 +2205,8 @@ class FaultMavenClient:
                     raise labelled(
                         str(exc), status_code=409, detail=exc.detail
                     ) from exc
-                # Unlabelled, and only off the POST itself: like the 404 above,
-                # "this case is terminal" is a claim about the turn submission.
-                # Asserting it from an unexpected 409 on the status resource
-                # would tell a user with a live case that it is closed.
-                if not error_code and not polled:
-                    raise CaseTerminalError(
-                        str(exc), status_code=409, detail=exc.detail
-                    ) from exc
+                # An unlabelled 409 is not a terminal case (every terminal 409
+                # is labelled since 12.3.0): generic handling below.
             raise
         # Reached only for a status that is neither 2xx nor an error (a 1xx or
         # 3xx httpx did not follow): no turn to render.
