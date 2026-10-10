@@ -278,6 +278,11 @@ class BreakGlassGrantRequest(BaseModel):
     )
 
 
+class CaseAccess(Enum):
+    read = "read"
+    write = "write"
+
+
 class CaseCreateRequest(BaseModel):
     description: constr(max_length=2000) | None = Field(
         "", description="Initial problem description", title="Description"
@@ -292,6 +297,27 @@ class CaseCreateRequest(BaseModel):
     )
     title: constr(max_length=200) | None = Field(
         None, description="Case title (optional, auto-generated if not provided)", title="Title"
+    )
+
+
+class CaseDriverCandidate(BaseModel):
+    display_name: str | None = Field(
+        None,
+        description="The account's display name; null when it cannot be resolved.",
+        title="Display Name",
+    )
+    user_id: str = Field(..., title="User Id")
+
+
+class CaseDriverCandidateList(BaseModel):
+    candidates: list[CaseDriverCandidate] = Field(..., title="Candidates")
+
+
+class CaseDriverUpdateRequest(BaseModel):
+    driver_id: constr(min_length=1, max_length=36) = Field(
+        ...,
+        description="The new driver: one of `GET /cases/{case_id}/driver-candidates`. Naming the creator hands the case back to them.",
+        title="Driver Id",
     )
 
 
@@ -518,7 +544,6 @@ class KnowledgeBaseDocument(BaseModel):
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
     owner_id: str | None = Field(None, title="Owner Id")
     scope: str = Field(..., title="Scope")
-    source_suggestion_id: str | None = Field(None, title="Source Suggestion Id")
     source_url: str | None = Field(None, title="Source Url")
     status: str | None = Field("processed", title="Status")
     tags: list[str] | None = Field(None, title="Tags")
@@ -1476,6 +1501,7 @@ class CaseDetail(BaseModel):
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
+    creator_display_name: str | None = Field(None, title="Creator Display Name")
     current_stage: InvestigationStage | None
     current_turn: int = Field(
         ...,
@@ -1483,6 +1509,8 @@ class CaseDetail(BaseModel):
         title="Current Turn",
     )
     description: str = Field(..., title="Description")
+    driver_display_name: str | None = Field(None, title="Driver Display Name")
+    driver_id: str | None = Field(None, title="Driver Id")
     enterprise_id: str = Field(..., title="Enterprise Id")
     escalated: bool = Field(..., title="Escalated")
     evidence_count: int = Field(..., title="Evidence Count")
@@ -1514,6 +1542,10 @@ class CaseDetail(BaseModel):
 
 
 class CaseSearchRequest(BaseModel):
+    access: CaseAccess | None = Field(
+        "read",
+        description="`read` (default): search every case the caller can read. `write`: only the cases the caller drives — whose effective `driver_id` is the caller (ADR-020 D8). Applied in the same query as the text search.",
+    )
     limit: conint(ge=1, le=100) | None = Field(20, description="Maximum results", title="Limit")
     query: constr(min_length=1, max_length=500) = Field(
         ..., description="Search query", title="Query"
@@ -1534,12 +1566,15 @@ class CaseSummary(BaseModel):
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
+    creator_display_name: str | None = Field(None, title="Creator Display Name")
     current_turn: int = Field(
         ...,
         description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
         title="Current Turn",
     )
     description: str = Field(..., title="Description")
+    driver_display_name: str | None = Field(None, title="Driver Display Name")
+    driver_id: str | None = Field(None, title="Driver Id")
     enterprise_id: str = Field(..., title="Enterprise Id")
     investigation_turn: int | None = Field(
         None,
@@ -1913,7 +1948,7 @@ class TurnResponse(BaseModel):
     )
     sources: list[Source] | None = Field(
         None,
-        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED) that the prompt the model answered from actually carried, after the section budget. A pre-fetch that fires while the turn's response is applied first reaches the NEXT turn's prompt, and is listed there. The context stands in every prompt until a pre-fetch replaces it, so it repeats turn to turn; `new_this_turn` marks the excerpts the previous turn's prompt did not carry. Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary.",
+        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED) that the prompt the model answered from actually carried, after the section budget. A pre-fetch that fires while the turn's response is applied first reaches the NEXT turn's prompt, and is listed there. The context stands in every prompt until a pre-fetch replaces it, so it repeats turn to turn; `new_this_turn` marks the excerpts the previous turn's prompt did not carry. Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary. The turn retrieves with the case driver's knowledge; each excerpt is checked against the requester when returned, and one of a runbook the requester cannot open (no longer shared with them, or never was), or one with no `metadata.document_id`, is returned redacted: `type` and `new_this_turn` kept, `content` empty, `confidence` null, and `metadata` of only `{\"access\": \"restricted\"}`.",
         title="Sources",
     )
     suggested_actions: list[SuggestedActionResponse] | None = Field(None, title="Suggested Actions")
@@ -2074,7 +2109,7 @@ class Message(BaseModel):
     role: Role = Field(..., title="Role")
     sources: list[Source] | None = Field(
         None,
-        description="On an assistant row: the knowledge-base runbooks that turn's prompt carried, exactly as the live `TurnResponse.sources` returned them, `new_this_turn` included. Null on a row whose prompt carried none (and on every user or system row).",
+        description='On an assistant row: the knowledge-base runbooks that turn\'s prompt carried, exactly as the live `TurnResponse.sources` returned them, `new_this_turn` included, and gated the same way for the reader making this request: an excerpt of a runbook the reader cannot open, or one with no `metadata.document_id`, is returned with empty `content`, null `confidence` and `metadata` of only `{"access": "restricted"}`. Null on a row whose prompt carried none (and on every user or system row).',
         title="Sources",
     )
     token_count: int | None = Field(
