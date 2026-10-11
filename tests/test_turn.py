@@ -133,6 +133,20 @@ def test_plain_5xx_advises_retry():
         )
 
 
+def test_coded_5xx_shows_the_apps_answer_and_advises_retry():
+    """#98: a coded 5xx is the app's own answer and nothing committed, so its
+    user-facing detail is shown (escaped: backend text is untrusted) with the
+    retry advice, and the buttons re-arm."""
+
+    exc = FaultMavenAPIError(
+        "x", status_code=502, detail="provider refused <!channel>", code="LLM_PROVIDER_ERROR"
+    )
+    text = turn_error_text(exc)
+    assert "provider refused" in text and "<!channel>" not in text
+    assert "Nothing was saved" in text and "please try again" in text
+    assert retry_may_help(exc) is True
+
+
 def test_indeterminate_failure_during_shutdown_still_warns_not_restart():
     """The shutdown override must NOT shadow a possibly-committed turn: a
     timeout (the single indeterminate class) during drain must still warn
@@ -250,6 +264,7 @@ def test_retry_may_help_agrees_with_turn_error_text():
         CaseNotFoundError,
         FaultMavenCredentialError,
         FaultMavenRateLimitError,
+        TurnCapExceededError,
     )
 
     for exc in (
@@ -261,6 +276,9 @@ def test_retry_may_help_agrees_with_turn_error_text():
         FaultMavenRateLimitError("slow", retry_after=30),
         FaultMavenAPIError("bad", status_code=422),
         FaultMavenAPIError("boom", status_code=503),
+        FaultMavenAPIError("boom", status_code=502, detail="no", code="LLM_PROVIDER_ERROR"),
+        TurnCapExceededError("cap", detail="All used.", retry_after=40000),
+        FaultMavenTimeoutError("x", turn_cap=TurnCapExceededError("cap", detail="All used.")),
         RuntimeError("socket reset"),
     ):
         text = turn_error_text(exc)
