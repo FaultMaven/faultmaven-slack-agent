@@ -111,6 +111,20 @@ Your message can carry both: a sentence saying what you see, and the snippet or
 file holding the output. FaultMaven says this once, on its first reply in each
 thread (in the Assistant panel, in its greeting).
 
+If output does end up in your message anyway, FaultMaven offers to take it as
+data. Its reply says so in a short note and leads with two buttons:
+
+- **Yes, save it as data** — the output, exactly as you typed it, is saved as
+  data and FaultMaven reads it on the same turn.
+- **Not exactly, let me re-submit** — opens a box holding that output, so you
+  can correct it (trim a line of your own, restore one you left out) and send
+  it as data.
+
+When you only *report* a state ("it's stable now"), the reply may carry
+**Submit the output**, which opens the same box empty, naming the output that
+would show it. Either way, posting a snippet in the thread works too. There is
+no "no" button: ignore the offer and your message stays what you said.
+
 When the root cause is found and the fix is verified, FaultMaven posts a
 **resolution summary**, and the case can be **captured as a runbook** — so the
 next time this happens, the investigation starts from what this one learned.
@@ -187,7 +201,7 @@ tokens or message payloads; the agent is the only bridge.
 | The **Ask FaultMaven** shortcut isn't in the ⋮ menu | The workspace admin may need to reinstall the app; confirm you're in a workspace where it's installed. |
 | A reply in a thread is ignored | FaultMaven only continues threads it was summoned into. `@mention` it (or use the shortcut) to open the case first. |
 | "Couldn't read that file" | The file is over 8 MiB or in a channel the bot can't access — put the key text in a text snippet instead. |
-| FaultMaven treats a log you pasted as a description, not data | Text in the message, code blocks included, is read as what you say. Re-send the log as a text snippet (**+** → **Create a text snippet**) or a file. |
+| FaultMaven treats a log you pasted as a description, not data | Text in the message, code blocks included, is read as what you say. Click **Yes, save it as data** under the reply if it offers one, or re-send the log as a text snippet (**+** → **Create a text snippet**) or a file. |
 | Your message got a ⏭️ reaction | It arrived while FaultMaven was answering someone else. Resend it after its reply lands. |
 | "I stopped waiting on the backend" | The turn may still have gone through. Check the case (Dashboard) before re-sending: a re-send runs as a new turn. |
 

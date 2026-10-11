@@ -240,3 +240,21 @@ def test_panel_opening_reply_does_not_repeat_the_greeting_data_note():
         for e in b.get("elements", [])
     ]
     assert turn_mod.DATA_CHANNEL_HINT not in contexts
+
+
+def test_panel_message_reaches_the_engine_as_displayed_not_in_slack_wire_form():
+    """#100: output typed into a panel message can be saved as data from the
+    offer, and the saved block is the query as the engine received it. Slack
+    sends ``&gt;`` / ``&amp;`` / entity markup; left raw, the record would hold
+    text the user never typed."""
+
+    fm, store, client = _FakeFM(), _FakeStore(), _FakeClient()
+
+    _run_message(
+        fm,
+        store,
+        client,
+        _message("curl -s a &amp;&amp; b &gt; out.log\n<http://x.example|dash> said 502"),
+    )
+
+    assert fm.turns[0][1]["query"] == "curl -s a && b > out.log\ndash said 502"

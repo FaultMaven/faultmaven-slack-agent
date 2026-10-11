@@ -37,7 +37,7 @@ done when its check conclusions are green, not when local tests pass.
 | `app.py` | Builds the Bolt `App`; runs the Socket Mode loop, or hands off to `web.run_http` |
 | `web.py` | FastAPI host for HTTP transport: `/slack/events`, `/slack/install`, `/slack/oauth_redirect`, `/faultmaven/callback` (bind return leg), `/health` |
 | `config.py` | `Settings` (pydantic-settings, reads `.env`) and per-transport fail-fast validation; `DEFAULT_BOT_SCOPES` |
-| `listeners/` | `assistant` (side panel), `events` (mention, thread replies, first plain DM), `shortcuts`, `actions` (buttons), `home`, `lifecycle` (`app_uninstalled`, `tokens_revoked`) |
+| `listeners/` | `assistant` (side panel), `events` (mention, thread replies, first plain DM), `shortcuts`, `actions` (buttons, and the data-box modal: `app.view`), `home`, `lifecycle` (`app_uninstalled`, `tokens_revoked`) |
 | `listeners/_turn.py` | Shared pipeline: find-or-create case → turn → post; per-thread busy gate |
 | `faultmaven/client.py` | Hand-written sync `httpx` client for the core API and its credential handling |
 | `faultmaven/api_generated.py` | Generated from the pinned OpenAPI contract — never hand-edit |
@@ -63,6 +63,10 @@ done when its check conclusions are green, not when local tests pass.
   per `events.is_dm_summons`) opens a case in an unmapped thread. A plain reply
   continues a thread only if the `store` maps it or `events.recover_lost_case`
   re-links it from the thread's own history; otherwise it is ignored.
+- A suggestion carrying `prefill` (contract 13.3.0's chat-data offer) is a
+  data-box button, not a turn: it opens a modal (`rendering.build_data_box_view`)
+  whose submission goes as `pasted_content` with no query. A DECIDE (the
+  `save_chat_data` intent included) is a turn button, forwarded as received.
 - One turn per thread: a message arriving mid-turn is skipped (⏭️), not queued.
   The gate is the in-memory `_busy` set in `listeners/_turn.py` — per process,
   no cross-replica lock.

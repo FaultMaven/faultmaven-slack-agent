@@ -1,4 +1,4 @@
-"""Interactive suggested-action buttons (P2).
+"""Interactive suggested-action buttons (P2), and the data box they can open.
 
 When a user clicks a DECIDE button rendered on a turn result (the only clickable
 suggestion type — RUN and FREE_SPEECH are text), Slack delivers a
@@ -8,6 +8,11 @@ result in-thread. Slack has no disabled state for message buttons, so the button
 are swapped for a "working…" note the moment the click lands (a long turn would
 otherwise leave them clickable for its whole duration), restored if the submit
 fails (retry stays one click away), and stripped for good once the turn commits.
+
+A data-box button (a choice carrying ``prefill``, #100) submits nothing itself:
+it opens a modal holding the prefill, and the modal's submission is the turn,
+sent as a paste. The paste is data; the message text the prefill came from was
+the user's claim.
 """
 
 from __future__ import annotations
@@ -19,19 +24,40 @@ from slack_bolt import Ack, App, BoltContext
 from slack_sdk import WebClient
 
 from faultmaven import CaseNotFoundError, FaultMavenClient, TurnResult
-from rendering import SUGGESTED_ACTION_PATTERN
+from rendering import (
+    DATA_BOX_BLOCK_ID,
+    DATA_BOX_CALLBACK_ID,
+    DATA_BOX_INPUT_ID,
+    DATA_BOX_PATTERN,
+    SUGGESTED_ACTION_PATTERN,
+    build_data_box_view,
+)
 from store import CaseStore
 
 from ._turn import (
+    SNIPPET_HOW_TO,
     case_gone_text,
     click_turn_key,
     deliver_turn_result,
     record_posted_turn,
     retry_may_help,
     run_gated,
+    run_turn_and_post,
     stripped_blocks,
     turn_error_text,
     unlink_stale_case,
+    view_turn_key,
+)
+
+#: The clicker's notice when the data box cannot open (an expired trigger_id, a
+#: Slack error): the snippet is the same data channel without the modal.
+DATA_BOX_UNAVAILABLE_TEXT = (
+    ":information_source: I couldn't open the data box. Post the output in "
+    f"this thread as a text snippet instead ({SNIPPET_HOW_TO})."
+)
+DATA_BOX_EMPTY_ERROR = "Paste the output to send."
+DATA_BOX_BUSY_ERROR = (
+    "I'm still working on this thread. Send this again once I've replied."
 )
 
 
@@ -140,6 +166,53 @@ def _restore_actions(client: WebClient, body: dict) -> None:
     )
 
 
+def _refuse_stale_click(
+    client: WebClient, store: CaseStore, body: dict, team_id: str, logger: Logger
+) -> bool:
+    """Refuse a click on a turn older than the thread's current one.
+
+    Stale-click guard: a click carries no proof of which turn rendered it, and
+    Slack delivers it even when the message has since been rewritten (a client
+    with a stale view, an offline queue), so taking the buttons down is not by
+    itself enough. Compare the clicked message against the thread's current
+    turn; for an older one, strip its buttons, tell the clicker, and return
+    True. Never raises: ``ack()`` has already gone out.
+    """
+
+    channel = body["channel"]["id"]
+    message = body["message"]
+    thread_ts = message.get("thread_ts") or message["ts"]
+    try:
+        current_turn_ts = store.get_last_turn_ts(team_id, channel, thread_ts)
+    except Exception as exc:  # noqa: BLE001
+        # An unguarded raise here would drop the click with nothing on screen.
+        # Fall back to the pre-guard behavior — act on the click — rather than
+        # swallowing it.
+        logger.warning("stale-click check failed in %s: %s", channel, exc)
+        current_turn_ts = None
+    if not current_turn_ts or message.get("ts") == current_turn_ts:
+        return False
+    user_id = (body.get("user") or {}).get("id")
+    try:
+        _disable_actions(client, body)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not disable stale actions in %s: %s", channel, exc)
+    if user_id:
+        try:
+            client.chat_postEphemeral(
+                channel=channel,
+                thread_ts=thread_ts,
+                user=user_id,
+                text=":information_source: That choice was from a previous turn and is no longer available.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "could not post stale action notice to %s in %s: %s",
+                user_id, channel, exc,
+            )
+    return True
+
+
 def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
     @app.action(SUGGESTED_ACTION_PATTERN)
     def on_suggested_action(
@@ -155,38 +228,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
         thread_ts = message.get("thread_ts") or message["ts"]
         team_id = context.team_id or ""
 
-        # Stale-click guard: a click carries no proof of which turn rendered
-        # it, and Slack delivers it even when the message has since been
-        # rewritten (a client with a stale view, an offline queue), so taking
-        # the buttons down is not by itself enough. Compare the clicked message
-        # against the thread's current turn and reject anything older.
-        try:
-            current_turn_ts = store.get_last_turn_ts(team_id, channel, thread_ts)
-        except Exception as exc:  # noqa: BLE001
-            # ack() has already gone out, so an unguarded raise here would drop
-            # the click with nothing on screen. Fall back to the pre-guard
-            # behavior — run the turn — rather than swallowing it.
-            logger.warning("stale-click check failed in %s: %s", channel, exc)
-            current_turn_ts = None
-        if current_turn_ts and message.get("ts") != current_turn_ts:
-            user_id = (body.get("user") or {}).get("id")
-            try:
-                _disable_actions(client, body)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("could not disable stale actions in %s: %s", channel, exc)
-            if user_id:
-                try:
-                    client.chat_postEphemeral(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        user=user_id,
-                        text=":information_source: That choice was from a previous turn and is no longer available.",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "could not post stale action notice to %s in %s: %s",
-                        user_id, channel, exc,
-                    )
+        if _refuse_stale_click(client, store, body, team_id, logger):
             return
 
         last_posted_ts: str | None = None
@@ -373,3 +415,134 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     "Couldn't post the busy notice to %s in %s (%s).",
                     user_id or "?", channel, exc,
                 )
+
+
+def register_data_box(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
+    """The data box (#100): a data-box button opens it, its submission is a paste."""
+
+    @app.action(DATA_BOX_PATTERN)
+    def on_data_box(
+        ack: Ack,
+        body: dict,
+        context: BoltContext,
+        client: WebClient,
+        logger: Logger,
+    ) -> None:
+        """Open the data box for a data-box button. Runs no turn.
+
+        The click's ``trigger_id`` lives three seconds, so the modal opens
+        before anything slow. The clicked message keeps its buttons: opening
+        the box commits nothing, and the user may cancel it.
+        """
+
+        ack()
+        team_id = context.team_id or ""
+        if _refuse_stale_click(client, store, body, team_id, logger):
+            return
+        channel = body["channel"]["id"]
+        message = body["message"]
+        thread_ts = message.get("thread_ts") or message["ts"]
+        try:
+            client.views_open(
+                trigger_id=body["trigger_id"],
+                view=build_data_box_view(
+                    body["actions"][0]["value"],
+                    private_metadata=json.dumps({"c": channel, "t": thread_ts}),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — the snippet is still open to the user
+            logger.warning("could not open the data box in %s: %s", channel, exc)
+            user_id = (body.get("user") or {}).get("id")
+            if user_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user=user_id,
+                        text=DATA_BOX_UNAVAILABLE_TEXT,
+                    )
+                except Exception as notice_exc:  # noqa: BLE001
+                    logger.warning(
+                        "could not post the data-box notice to %s in %s: %s",
+                        user_id, channel, notice_exc,
+                    )
+
+    @app.view(DATA_BOX_CALLBACK_ID)
+    def on_data_box_submit(
+        ack: Ack,
+        body: dict,
+        view: dict,
+        context: BoltContext,
+        client: WebClient,
+        logger: Logger,
+    ) -> None:
+        """Send what the user put in the data box to the thread's case, as a paste.
+
+        The turn carries the paste and no query (as the Copilot sends its data
+        box), so nothing in it reads as a claim. A refusal the user can act on
+        (an empty box, a thread mid-turn) answers in the modal, which stays open
+        holding their text; otherwise the modal closes and the thread shows the
+        submission and the reply.
+        """
+
+        state = (view.get("state") or {}).get("values") or {}
+        pasted = ((state.get(DATA_BOX_BLOCK_ID) or {}).get(DATA_BOX_INPUT_ID) or {}).get(
+            "value"
+        ) or ""
+        if not pasted.strip():
+            ack(response_action="errors", errors={DATA_BOX_BLOCK_ID: DATA_BOX_EMPTY_ERROR})
+            return
+        meta = json.loads(view.get("private_metadata") or "{}")
+        channel, thread_ts = meta.get("c"), meta.get("t")
+        if not channel or not thread_ts:
+            # Only this agent's own view carries the callback_id, so this is a
+            # bug, not user error; the modal cannot help with it.
+            logger.error("data box submitted with no thread in its metadata")
+            ack()
+            return
+        team_id = context.team_id or ""
+        user_id = (body.get("user") or {}).get("id")
+
+        def post(text: str) -> None:
+            try:
+                client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("post failed in %s: %s", channel, exc)
+
+        def work() -> None:
+            try:
+                case_id = store.get(team_id, channel, thread_ts)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("data box: store read failed in %s: %s", channel, exc)
+                post(turn_error_text(exc, channel))
+                return
+            if not case_id:
+                # The data was for the case this thread had; a fresh case
+                # opened around it would hold output with nothing it answers.
+                post(case_gone_text(channel))
+                return
+            if user_id:
+                lines = len(pasted.splitlines())
+                post(
+                    f"> <@{user_id}> submitted data "
+                    f"({lines} line{'s' if lines != 1 else ''})"
+                )
+            run_turn_and_post(
+                client,
+                fm,
+                store,
+                channel=channel,
+                thread_ts=thread_ts,
+                team_id=team_id,
+                text="",
+                pasted_content=pasted,
+                idempotency_key=view_turn_key(team_id, view.get("id")),
+            )
+
+        if not run_gated(
+            client, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            skip_ts=None, work=work,
+        ):
+            ack(response_action="errors", errors={DATA_BOX_BLOCK_ID: DATA_BOX_BUSY_ERROR})
+            return
+        ack()

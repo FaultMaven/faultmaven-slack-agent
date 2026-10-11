@@ -923,15 +923,22 @@ def shortcut_turn_key(team_id: str, trigger_id: str | None) -> str:
     return _turn_key("shortcut", trigger_id, team_id)
 
 
+def view_turn_key(team_id: str, view_id: str | None) -> str:
+    """The ``Idempotency-Key`` of a turn asked for by one modal submission."""
+
+    return _turn_key("view", view_id, team_id)
+
+
 def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     """The ``Idempotency-Key`` for one logical turn, from Slack's own identity.
 
     ``namespace:team:channel:ts`` for a message (``msg``), the same on the
-    click's ``action_ts`` (``click``), and ``shortcut:team:trigger_id``. The
+    click's ``action_ts`` (``click``), ``shortcut:team:trigger_id``, and
+    ``view:team:view_id`` for a data-box submission (one modal, one paste). The
     message ts and the trigger_id are what this agent already dedupes Slack's
     redeliveries on, so a redelivered event (even to a restarted process, whose
     in-memory dedup is empty) is the same turn to the backend too; an action_ts
-    names one click. The namespace keeps the three apart: a click's action_ts
+    names one click. The namespace keeps them apart: a click's action_ts
     and a message's ts are both Slack timestamps and could coincide.
 
     sha256 hex: deterministic, 64 characters, and inside the header's published
@@ -1057,7 +1064,9 @@ def run_turn(
             result = fm.submit_turn(
                 case_id,
                 idempotency_key=idempotency_key,
-                query=text,
+                # A paste with no text (the data box) is a paste-only turn,
+                # as the Copilot sends one: no query, rather than an empty one.
+                query=text or None,
                 pasted_content=pasted_content or None,
                 source_url=source_url,
                 observed_at=observed_at,

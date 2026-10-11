@@ -17,6 +17,7 @@ from slack_sdk import WebClient
 
 from faultmaven import FaultMavenClient
 from slack_files import download_message_content
+from slack_text import render_slack_text
 from store import CaseStore
 
 from ._turn import (
@@ -150,8 +151,14 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 if skipped:
                     post(skipped_files_note(skipped))
 
+                # Slack's wire form decoded, as on every other inbound path
+                # (``rendering.clean_mention``): output typed into the message
+                # reaches the engine as the user sees it, so a block the user
+                # saves as data from the offer (#100) is not stored as
+                # ``&gt;`` and ``<@U…>``. No mention strip: the panel has no
+                # @mention to remove, and a user's own mention is content.
                 query = resolve_query(
-                    payload.get("text"),
+                    render_slack_text(payload.get("text") or ""),
                     downloaded_files=bool(files or pasted_text),
                 )
                 if query is None:
