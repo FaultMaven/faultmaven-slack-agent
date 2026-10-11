@@ -9,7 +9,7 @@ from slack_bolt import App
 from faultmaven import FaultMavenClient
 from store import CaseStore
 
-from .actions import register_actions
+from .actions import register_actions, register_data_box
 from .assistant import build_assistant
 from .events import register_events
 from .home import register_home
@@ -36,6 +36,7 @@ def register_listeners(
     app.assistant(build_assistant(fm, store))
     register_events(app, fm, store)
     register_actions(app, fm, store)
+    register_data_box(app, fm, store)
     register_shortcuts(app, fm, store)
     register_home(app)
     if workspace_credentials is not None:

@@ -41,6 +41,19 @@ SUGGESTED_ACTION_ID = "fm_suggested_action"
 SUGGESTED_ACTION_PATTERN: Pattern[str] = re.compile(
     rf"^{re.escape(SUGGESTED_ACTION_ID)}:"
 )
+# action_id prefix for data-box buttons (#100): an EVIDENCE choice carrying
+# ``prefill`` (contract 13.3.0) opens a modal holding that text, and the modal's
+# submission goes as a paste. The button ``value`` is JSON:
+# {"p": prefill, "h": hint} — or {"h": hint, "long": true} when the prefill
+# would not fit in a button value, and the modal opens empty instead.
+DATA_BOX_ACTION_ID = "fm_data_box"
+DATA_BOX_PATTERN: Pattern[str] = re.compile(rf"^{re.escape(DATA_BOX_ACTION_ID)}:")
+# The modal (see build_data_box_view) and its single multi-line input.
+DATA_BOX_CALLBACK_ID = "fm_data_box_submit"
+DATA_BOX_BLOCK_ID = "fm_data"
+DATA_BOX_INPUT_ID = "fm_data_text"
+# Slack caps a plain_text_input at 3000 characters.
+_DATA_BOX_MAX_CHARS = 3000
 _MAX_BUTTONS = 10
 _BUTTON_VALUE_LIMIT = 1900  # Slack caps button value at 2000 chars
 # A RUN command rendered in a code span; a bullet must stay readable and one
@@ -199,6 +212,10 @@ def _format_action(action: dict[str, Any]) -> str:
         return f"• *Run:* `{command}`"  # command stays literal in the code span
     label = to_mrkdwn(_action_label(action))
     body = action.get("body")
+    if is_data_box(action):
+        if body:
+            return f"• :memo: *{label}* — {to_mrkdwn(str(body))}"
+        return f"• :memo: *{label}*"
     if a_type == "DECIDE":
         if body:
             return f"• :white_check_mark: *{label}* — {to_mrkdwn(str(body))}"
@@ -255,9 +272,105 @@ def _action_value(action: dict[str, Any]) -> str | None:
     return encoded if len(encoded) <= _BUTTON_VALUE_LIMIT else None
 
 
-def _make_button(action: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a Block Kit button for a submittable action, or None."""
+def is_data_box(action: dict[str, Any]) -> bool:
+    """True for a choice that opens the data box (#100, contract 13.3.0).
 
+    Recognised by ``prefill`` being present as a string, possibly empty: the
+    chat-data offer's "Not exactly, let me re-submit" (the blocks the user typed
+    into their message) and "Submit the output" (``""``, the output asked for
+    named in ``body``). Both are EVIDENCE on the wire, and an EVIDENCE without
+    ``prefill`` stays a line in the data request.
+    """
+
+    return isinstance(action.get("prefill"), str)
+
+
+def _data_box_value(action: dict[str, Any]) -> str:
+    """Encode a data-box button's value: the prefill and the modal's hint.
+
+    A prefill too long for a button value (or for the modal's input) is left
+    out rather than cut: a truncated block saved as data would be a record of
+    output the system never produced. The modal then opens empty and says why.
+    """
+
+    hint = str(action.get("body") or "")[:500]
+    prefill = action["prefill"]
+    if len(prefill) <= _DATA_BOX_MAX_CHARS:
+        encoded = json.dumps({"p": prefill, "h": hint})
+        if len(encoded) <= _BUTTON_VALUE_LIMIT:
+            return encoded
+    return json.dumps({"h": hint, "long": True})
+
+
+def build_data_box_view(value_json: str, *, private_metadata: str) -> dict[str, Any]:
+    """The data-box modal for a clicked data-box button (``views.open``).
+
+    One multi-line input, holding the button's prefill when it has one. What
+    the user sends from it goes to the case as a paste, which is data; the
+    hint and the snippet line are ``plain_text``, so the server's text cannot
+    format or link anything here.
+    """
+
+    value = json.loads(value_json)
+    prefill = value.get("p") or ""
+    notes = []
+    if value.get("h"):
+        notes.append(str(value["h"]))
+    if value.get("long"):
+        notes.append(
+            "That output is too long to load here. Paste the corrected output "
+            "below, or post it in the thread as a text snippet."
+        )
+    else:
+        notes.append("You can also post it in the thread as a text snippet.")
+    element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": DATA_BOX_INPUT_ID,
+        "multiline": True,
+        "max_length": _DATA_BOX_MAX_CHARS,
+    }
+    if prefill:
+        element["initial_value"] = prefill
+    return {
+        "type": "modal",
+        "callback_id": DATA_BOX_CALLBACK_ID,
+        "private_metadata": private_metadata,
+        "title": {"type": "plain_text", "text": "Submit as data"},
+        "submit": {"type": "plain_text", "text": "Send as data"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "plain_text", "text": " ".join(notes)[:3000]},
+            },
+            {
+                "type": "input",
+                "block_id": DATA_BOX_BLOCK_ID,
+                "label": {"type": "plain_text", "text": "Output"},
+                "element": element,
+            },
+        ],
+    }
+
+
+def _make_button(action: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a Block Kit button for a submittable action, or None.
+
+    A data-box choice is a button too, with its own action_id prefix: its click
+    opens a modal instead of submitting a turn.
+    """
+
+    if is_data_box(action):
+        return {
+            "type": "button",
+            "action_id": DATA_BOX_ACTION_ID,
+            "text": {
+                "type": "plain_text",
+                "text": _action_label(action)[:75],
+                "emoji": True,
+            },
+            "value": _data_box_value(action),
+        }
     encoded = _action_value(action)
     if encoded is None:
         return None
@@ -288,8 +401,9 @@ def build_turn_blocks(
     not mistaken for a verdict.
 
     DECIDE actions become interactive buttons (handled by
-    listeners/actions.py); RUN renders as a copyable code block; EVIDENCE asks
-    render as the prominent text section above.
+    listeners/actions.py); so do data-box choices (``prefill``, #100), whose
+    click opens a modal. RUN renders as a copyable code block; other EVIDENCE
+    asks render as the prominent text section above.
 
     ``case_id`` is passed **only on the case-opening reply** (thread = case, so
     once is enough). It renders as a quiet, selectable line in the context row
@@ -312,7 +426,7 @@ def build_turn_blocks(
     text_actions: list[dict[str, Any]] = []
     for action in result.suggested_actions:
         a_type = (action.get("type") or action.get("action_type") or "").upper()
-        if a_type == "EVIDENCE":
+        if a_type == "EVIDENCE" and not is_data_box(action):
             evidence.append(action)
             continue
         button = _make_button(action) if len(buttons) < _MAX_BUTTONS else None
@@ -344,9 +458,10 @@ def build_turn_blocks(
             blocks.append(_section(part))
 
     # action_id must be unique within a message; suffix each button by index.
-    # The handler matches the shared prefix (see SUGGESTED_ACTION_PATTERN).
+    # The handlers match their kind's prefix (SUGGESTED_ACTION_PATTERN,
+    # DATA_BOX_PATTERN); one index space keeps the ids unique across kinds.
     for index, button in enumerate(buttons):
-        button["action_id"] = f"{SUGGESTED_ACTION_ID}:{index}"
+        button["action_id"] = f"{button['action_id']}:{index}"
     # Slack allows at most 5 elements per actions block.
     for i in range(0, len(buttons), 5):
         blocks.append({"type": "actions", "elements": buttons[i : i + 5]})
