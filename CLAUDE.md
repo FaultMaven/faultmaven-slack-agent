@@ -93,7 +93,12 @@ done when its check conclusions are green, not when local tests pass.
   `FAULTMAVEN_REQUEST_TIMEOUT` / `FAULTMAVEN_TURN_RECOVERY_SECONDS`, fallback
   150 s / 660 s). A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
   after its `Retry-After`, at most twice) committed nothing and surfaces as
-  `FaultMavenNothingCommittedError`.
+  `FaultMavenNothingCommittedError`. Only an unlabelled 502/504 is a gateway;
+  any other coded non-2xx is the app's own answer and commits nothing (a coded
+  502 `LLM_PROVIDER_ERROR` is a `FaultMavenAPIError`, retry offered). While
+  recovering, a 429 is waited for its `Retry-After`, or ends the loop at once
+  when that outlasts the bound (`turn_cap` set for `TENANT_TURN_CAP_EXCEEDED`),
+  and a wait that would reach the bound is cut short for one last ask.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
   regenerated `faultmaven/api_generated.py` in the same PR.

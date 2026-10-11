@@ -40,6 +40,7 @@ from faultmaven import (
     FaultMavenWorkspaceUnlinkedError,
     IdempotencyKeyReuseError,
     IdempotencyReplayUnavailableError,
+    TurnCapExceededError,
     TurnResult,
 )
 from rendering import build_turn_blocks
@@ -273,6 +274,22 @@ def _rate_limited_text(retry_after: int | None) -> str:
     )
 
 
+def _turn_cap_text(cap: TurnCapExceededError) -> str:
+    """Why the daily turn cap stopped a turn: the backend's own message.
+
+    That message is written for the person who sent the turn (the limit, and
+    when it resets, in UTC), so it is quoted rather than reworded. Without one,
+    the reset is quoted from ``Retry-After``.
+    """
+
+    if cap.detail:
+        return escape_mrkdwn(cap.detail[:300])
+    text = "This workspace has used its FaultMaven turns for today."
+    if cap.retry_after is not None:
+        text += f" They reset in {_humanize_seconds(cap.retry_after)}."
+    return text
+
+
 def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     """The user-facing message for a failed turn, by failure class.
 
@@ -289,11 +306,21 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # BEFORE the shutdown override: a commit-then-fail during drain must still
     # warn against a blind re-send, not tell the user to resend in a minute. This
     # is a single class — the client already maps a client-side read timeout AND
-    # a gateway 502/504 to FaultMavenTimeoutError, so this layer never inspects a
-    # status code to recognize it. Everything else (a genuine 404, a 4xx, a
-    # teardown-induced error) prefers the shutdown message during drain, matching
-    # the original ordering.
+    # an unlabelled gateway 502/504 to FaultMavenTimeoutError, so this layer
+    # never inspects a status code to recognize it. Everything else (a genuine
+    # 404, a 4xx, a teardown-induced error) prefers the shutdown message during
+    # drain, matching the original ordering.
     if isinstance(exc, FaultMavenTimeoutError):
+        if exc.turn_cap is not None:
+            # Recovery gave up because the daily cap refused the re-check: the
+            # turn may still have gone through, AND a new message cannot run
+            # until the cap resets. Both are said.
+            return (
+                ":hourglass: I couldn't confirm whether that turn went through: "
+                f"FaultMaven refused my re-check. {_turn_cap_text(exc.turn_cap)} "
+                "Check the case before sending it again: a re-send runs as a new "
+                "turn, and would repeat it if it did."
+            )
         return TURN_TIMEOUT_TEXT
     # Above the shutdown override: the turn committed, which a restart does not
     # undo, so "resend it in a minute" would run it twice.
@@ -328,6 +355,15 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # what the user is left able to do, and each message says which.
     if isinstance(exc, CaseTerminalError):
         return CASE_CLOSED_TEXT
+    # Above the override too: the cap resets at a fixed time that our restart
+    # does not bring forward, so "resend it in a minute" would be refused. Above
+    # the rate-limit branch below, whose "rate-limiting right now" misnames a
+    # daily allowance.
+    if isinstance(exc, TurnCapExceededError):
+        return (
+            f":no_entry: I didn't run that turn. {_turn_cap_text(exc)} "
+            "Send it again once it has reset."
+        )
     if _shutting_down.is_set():
         return RESTARTING_TEXT
     # Transient — the turn never committed — so this one stays BELOW the
@@ -365,6 +401,17 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
             f":warning: FaultMaven rejected that turn "
             f"(HTTP {exc.status_code}){suffix} "
             "Re-sending the same input won't help."
+        )
+    # A coded 5xx is the app's own answer, and a turn commits only on a 2xx, so
+    # nothing was saved and a retry is safe. Its detail is a sentence written for
+    # the user ("The AI provider could not process this request."), so it is
+    # shown; an uncoded 5xx may be a proxy's page, and keeps the generic text.
+    if isinstance(exc, FaultMavenAPIError) and exc.status_code >= 500 and exc.code:
+        detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
+        suffix = f": _{detail}_" if detail else "."
+        return (
+            f":warning: FaultMaven couldn't complete that turn{suffix} "
+            "Nothing was saved, so please try again."
         )
     return TURN_ERROR_TEXT
 

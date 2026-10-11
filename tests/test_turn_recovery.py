@@ -342,7 +342,41 @@ def test_an_exhausted_bound_raises_the_timeout():
     with pytest.raises(FaultMavenTimeoutError):
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert clock.now - start <= 300.0
-    assert len(backend.requests) == 5  # at 0, 60, 120, 180, 240 s; none at 300
+    # At 0, 60, 120, 180, 240 s, then the last wait is cut short for one last
+    # ask at 290 s (#98); made once, and none at 300.
+    assert len(backend.requests) == 6
+    assert clock.waits == [60.0, 60.0, 60.0, 60.0, 50.0]
+
+
+def test_a_turn_that_commits_during_the_last_wait_is_replayed():
+    """#98: the last TURN_IN_PROGRESS wait used to run to the bound and raise
+    without asking again, so a turn that committed during it was reported as
+    unknown although a re-send under its key would have replayed it."""
+
+    backend = _Backend(
+        *([_conflict("TURN_IN_PROGRESS", **{"Retry-After": "60"})] * 5),
+        _ok(replayed=True),
+    )
+    client, clock = _client(backend, recovery=300.0)
+    start = clock.now
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert len(backend.requests) == 6
+    assert clock.now - start == 290.0  # the last ask fits inside the bound
+    # ...with what is left of the bound as its timeout.
+    assert backend.requests[-1].extensions["timeout"]["read"] == 10.0
+
+
+def test_the_last_ask_is_made_at_once_when_little_is_left():
+    """A wait that would reach the bound with less than the last ask's reserve
+    left is skipped, not taken: the ask is made now, with what remains."""
+
+    backend = _Backend(
+        _read_timeout, _conflict("TURN_IN_PROGRESS", **{"Retry-After": "60"}),
+        _ok(replayed=True),
+    )
+    client, clock = _client(backend, recovery=5.0)
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert clock.waits == [1.0]  # the backoff; the 60 s wait was skipped
 
 
 def test_an_exhausted_bound_tells_the_thread_once():
@@ -532,9 +566,11 @@ def test_an_overloaded_backend_mid_recovery_is_waited_out():
 
 
 def test_a_rate_limit_mid_recovery_ends_as_the_unknown_outcome():
-    """F1: a 429 while recovering is waited out too, and when the bound runs out
-    the thread is told the turn may have gone through — never "rate limited,
-    send it again", which would run a committed turn twice."""
+    """F1: a 429 while recovering ends with the thread told the turn may have
+    gone through — never "rate limited, send it again", which would run a
+    committed turn twice. #98: a Retry-After that outlasts the bound means no
+    ask can be admitted within it, so it ends at once instead of polling
+    refusals until the bound runs out."""
 
     backend = _Backend(
         _read_timeout,
@@ -543,10 +579,95 @@ def test_a_rate_limit_mid_recovery_ends_as_the_unknown_outcome():
     client, clock = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
-    assert len(backend.requests) > 2
-    assert all(w <= 60.0 for w in clock.waits)  # Retry-After clamped to a poll
+    assert len(backend.requests) == 2
+    assert clock.waits == [1.0]  # the backoff after the timeout; nothing after
+    assert err.value.turn_cap is None
     assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
     assert not _turn.retry_may_help(err.value)
+
+
+def test_a_rate_limit_mid_recovery_is_waited_as_stated():
+    """#98: a 429's Retry-After is when an ask is admitted, not a poll hint, so
+    it is not clamped to the TURN_IN_PROGRESS poll interval."""
+
+    backend = _Backend(
+        _read_timeout,
+        httpx.Response(429, json={"message": "slow down"}, headers={"Retry-After": "120"}),
+        _ok(replayed=True),
+    )
+    client, clock = _client(backend)
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert clock.waits == [1.0, 120.0]
+
+
+_CAP_DETAIL = (
+    "You have used all 50 investigation turns available to this workspace "
+    "today. Your allowance resets at 00:00 UTC on 12 Oct 2026. Reading cases, "
+    "transcripts and the knowledge base is unaffected."
+)
+
+
+def _turn_cap(retry_after: str = "40000") -> httpx.Response:
+    """The turn route's daily-cap refusal, as the core sends it."""
+
+    return httpx.Response(
+        429,
+        json={"detail": _CAP_DETAIL},
+        headers={"x-error-code": "TENANT_TURN_CAP_EXCEEDED", "Retry-After": retry_after},
+    )
+
+
+def test_the_turn_cap_mid_recovery_ends_at_once_with_the_cap_message():
+    """#98: a cap whose reset is past the bound used to be polled every 60 s
+    until the bound ran out. It ends at once: still the unknown outcome (the
+    first attempt may have committed), and the thread is told about the cap."""
+
+    from faultmaven.client import TurnCapExceededError
+
+    backend = _Backend(_read_timeout, _turn_cap())
+    client, clock = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == 2
+    assert clock.waits == [1.0]
+    assert isinstance(err.value.turn_cap, TurnCapExceededError)
+    assert err.value.turn_cap.retry_after == 40000
+    text = _turn.turn_error_text(err.value)
+    assert _CAP_DETAIL in text
+    assert "check the case" in text.lower()  # the turn may still have gone through
+    assert not _turn.retry_may_help(err.value)
+
+
+def test_the_turn_cap_on_a_first_attempt_says_so():
+    """Nothing can have committed: the cap is the answer, in its own words,
+    not "rate-limiting right now" for a daily allowance."""
+
+    from faultmaven.client import FaultMavenRateLimitError, TurnCapExceededError
+
+    backend = _Backend(_turn_cap())
+    client, clock = _client(backend)
+    with pytest.raises(TurnCapExceededError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert isinstance(err.value, FaultMavenRateLimitError)
+    assert len(backend.requests) == 1 and clock.waits == []
+    text = _turn.turn_error_text(err.value)
+    assert _CAP_DETAIL in text and "rate-limiting" not in text
+    assert _turn.retry_may_help(err.value)
+
+
+def test_the_turn_cap_mid_recovery_reaches_the_thread():
+    backend = _Backend(_read_timeout, _turn_cap())
+    client, _ = _client(backend)
+    slack = _Slack()
+
+    _turn.run_turn_and_post(
+        slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
+        team_id="T1", text="why", idempotency_key=_KEY,
+    )
+
+    texts = [u["text"] for u in slack.updates]
+    assert texts[0] == _turn.STILL_WORKING_TEXT
+    assert _CAP_DETAIL in texts[-1]
 
 
 @pytest.mark.parametrize(
@@ -596,23 +717,60 @@ def test_answers_about_the_turn_still_end_a_recovery(later, expected):
     assert len(backend.requests) == 2
 
 
-@pytest.mark.parametrize(
-    "coded",
-    [
-        httpx.Response(502, headers={"x-error-code": "LLM_PROVIDER_ERROR"}),
-    ],
-    ids=["LLM_PROVIDER_ERROR-502"],
-)
-def test_a_coded_502_or_504_does_not_enter_recovery(coded):
-    """F3a: only an UNCODED 502/504 is a gateway in front of an unknown turn. A
-    coded 502 is the app's own answer; it stays today's timeout class, once.
+_PROVIDER_DETAIL = "The AI provider could not process this request."
+
+
+def _provider_error() -> httpx.Response:
+    """The core's terminal provider refusal (``LLM_PROVIDER_ERROR``, no Retry-After)."""
+
+    return httpx.Response(
+        502, json={"detail": _PROVIDER_DETAIL}, headers={"x-error-code": "LLM_PROVIDER_ERROR"}
+    )
+
+
+def test_a_coded_502_is_the_apps_answer_not_a_gateway_timeout():
+    """F3a, #98: only an UNCODED 502/504 is a gateway in front of an unknown turn.
+    A coded 502 is the app's own answer, and the turn commits only on a 2xx, so
+    nothing committed: it surfaces as the provider error, retry offered. It used
+    to be raised as "gateway timeout; the turn may still complete".
     (Coded 504s commit nothing and are tested in test_turn_timing.py.)"""
 
-    backend = _Backend(coded, _ok())
+    backend = _Backend(_provider_error(), _ok())
     client, _ = _client(backend)
-    with pytest.raises(FaultMavenTimeoutError):
+    with pytest.raises(FaultMavenAPIError) as err:
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
-    assert len(backend.requests) == 1
+    assert not isinstance(err.value, FaultMavenTimeoutError)
+    assert (err.value.status_code, err.value.code) == (502, "LLM_PROVIDER_ERROR")
+    assert len(backend.requests) == 1  # no recovery: nothing to recover
+    text = _turn.turn_error_text(err.value)
+    assert _PROVIDER_DETAIL in text and "Nothing was saved" in text
+    assert text != _turn.TURN_TIMEOUT_TEXT
+    assert _turn.retry_may_help(err.value)
+
+
+def test_a_coded_502_while_recovering_is_still_the_unknown_outcome():
+    """F1 is unchanged: the re-send's own refusal says nothing about whether the
+    FIRST attempt committed."""
+
+    backend = _Backend(_read_timeout, _provider_error())
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert len(backend.requests) == 2
+    assert isinstance(err.value.__cause__, FaultMavenAPIError)
+
+
+def test_a_coded_502_on_a_click_re_arms_the_buttons():
+    """End to end through the real client: the clicker is shown the provider
+    error and the buttons come back, because a re-click is safe."""
+
+    from tests.test_actions import _has_buttons, _LifecycleStore, _run_click
+
+    backend = _Backend(_provider_error())
+    client, _ = _client(backend)
+    slack = _run_click(client, _LifecycleStore())
+    assert any(_PROVIDER_DETAIL in p.get("text", "") for p in slack.posts)
+    assert _has_buttons(slack.updates[-1])
 
 
 def _stop_on(response: httpx.Response, client_box: list):

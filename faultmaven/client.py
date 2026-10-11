@@ -166,6 +166,9 @@ _REQUEST_TIMEOUT_CODE = "REQUEST_TIMEOUT"
 #: commits nothing (contract 12.4.0); unlike it, it says "ask again" with a
 #: ``Retry-After`` (30 s), so the loop honours that within its bound.
 _LLM_TIMEOUT_CODE = "LLM_TIMEOUT"
+#: 429 from the turn route: the account's daily turn allowance is used up. Its
+#: ``Retry-After`` is the seconds until the allowance resets (UTC midnight).
+_TURN_CAP_CODE = "TENANT_TURN_CAP_EXCEEDED"
 #: Set ``true`` on a 200 that replays a committed turn.
 _REPLAYED_HEADER = "x-idempotency-replayed"
 
@@ -220,6 +223,11 @@ _IN_PROGRESS_POLL_MAX_SECONDS = 60.0
 # fails fast would be re-POSTed in a tight loop for the whole recovery bound.
 _RECOVERY_BACKOFF_FIRST_SECONDS = 1.0
 _RECOVERY_BACKOFF_MAX_SECONDS = 30.0
+# Kept back from a wait that would run to the recovery bound, for one last ask:
+# a turn that committed during the wait is then answered by its replay instead
+# of reported as unknown. A replay or a claim's answer needs only the case and
+# receipt lookups and the round trip.
+_LAST_ASK_SECONDS = 10.0
 
 
 def _next_backoff(seconds: float) -> float:
@@ -264,12 +272,23 @@ class FaultMavenAPIError(FaultMavenError):
     ``detail`` explaining *why* — so callers can log it and show a 4xx-specific
     message instead of a generic "try again" that would just reproduce the
     same rejection.
+
+    ``code`` is the response's ``x-error-code``, or ``None`` when it had none.
+    A coded response is the app's own answer; an uncoded 5xx may be a proxy's.
     """
 
-    def __init__(self, message: str, *, status_code: int, detail: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        detail: str = "",
+        code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.detail = detail
+        self.code = code
 
 
 class FaultMavenRateLimitError(FaultMavenAPIError):
@@ -299,9 +318,21 @@ class FaultMavenRateLimitError(FaultMavenAPIError):
         status_code: int = 429,
         detail: str = "",
         retry_after: int | None = None,
+        code: str | None = None,
     ) -> None:
-        super().__init__(message, status_code=status_code, detail=detail)
+        super().__init__(message, status_code=status_code, detail=detail, code=code)
         self.retry_after = retry_after
+
+
+class TurnCapExceededError(FaultMavenRateLimitError):
+    """The account has used its daily turn allowance (429
+    ``TENANT_TURN_CAP_EXCEEDED``, ADR-016 D5.3).
+
+    A 429, but not backpressure: it means "come back tomorrow", not "slow
+    down". ``detail`` is the backend's message for the person who sent the turn
+    (the limit, and when it resets, in UTC); ``retry_after`` is the seconds
+    until it resets, often hours.
+    """
 
 
 class CaseNotFoundError(FaultMavenAPIError):
@@ -447,7 +478,17 @@ class FaultMavenTimeoutError(FaultMavenError):
     already re-sent the turn under its own key for as long as it was allowed
     to, so "the agent gave up" is final for this message: a re-send is a NEW
     message, a new key, and a second turn if the first one committed.
+
+    ``turn_cap`` is set when the loop gave up because a re-send met the daily
+    turn cap until past its bound: the outcome is still unknown, and a new
+    message cannot run until the cap resets either.
     """
+
+    def __init__(
+        self, message: str, *, turn_cap: TurnCapExceededError | None = None
+    ) -> None:
+        super().__init__(message)
+        self.turn_cap = turn_cap
 
 
 class FaultMavenNothingCommittedError(FaultMavenError):
@@ -1797,10 +1838,11 @@ class FaultMavenClient:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = self._error_detail(resp)
+            code = resp.headers.get("x-error-code") or None
             message = f"{op} failed: HTTP {resp.status_code}: {detail}"
             if not_found_is_case and resp.status_code == 404:
                 raise CaseNotFoundError(
-                    message, status_code=404, detail=detail
+                    message, status_code=404, detail=detail, code=code
                 ) from exc
             if resp.status_code == 429:
                 raise FaultMavenRateLimitError(
@@ -1808,9 +1850,10 @@ class FaultMavenClient:
                     status_code=429,
                     detail=detail,
                     retry_after=self._retry_after(resp),
+                    code=code,
                 ) from exc
             raise FaultMavenAPIError(
-                message, status_code=resp.status_code, detail=detail
+                message, status_code=resp.status_code, detail=detail, code=code
             ) from exc
 
     @staticmethod
@@ -2117,9 +2160,9 @@ class FaultMavenClient:
         carries the key the turn committed under.
 
         **Recovery.** An attempt whose outcome is unknown — the client timed
-        out, a gateway answered 502/504, or the connection dropped after the
-        body was sent — usually means the turn is still running or has already
-        committed. Instead of giving up, the same request is re-sent under the
+        out, a gateway answered an unlabelled 502/504, or the connection dropped
+        after the body was sent — usually means the turn is still running or
+        has already committed. Instead of giving up, the same request is re-sent under the
         same key until the backend answers with the turn, for at most
         ``turn_recovery_seconds`` in all:
 
@@ -2139,9 +2182,14 @@ class FaultMavenClient:
           is a fresh, charged run, so it starts only if a whole attempt still
           fits in the bound. Any other labelled 504 is final. Whatever ends
           these is raised as :class:`FaultMavenNothingCommittedError`.
-        - an uncoded 5xx or a 429 while recovering: the backend is overloaded
-          or restarting, which says nothing about the turn. Keep asking, after
+        - an uncoded 5xx while recovering: the backend is overloaded or
+          restarting, which says nothing about the turn. Keep asking, after
           ``Retry-After`` (clamped) or the backoff.
+        - a 429 while recovering (the rate limiter, or the daily turn cap) says
+          nothing about the turn either. Its ``Retry-After`` is when an ask is
+          admitted, so it is waited as stated; one that outlasts the bound ends
+          the loop at once with the unknown outcome, carrying the cap
+          (``turn_cap``) when that was the refusal.
         - anything else is mapped as it always was on a first attempt. While an
           earlier attempt may have committed the turn (a transport loss, a
           client timeout, an unlabelled gateway 502/504, a claim still held),
@@ -2149,7 +2197,13 @@ class FaultMavenClient:
           (see :data:`_DEFINITIVE_WHILE_RECOVERING`); any other refusal raises
           the unknown outcome. When no earlier attempt can have committed (none
           yet, or a labelled 504 since), a refusal is the real answer and
-          surfaces as itself.
+          surfaces as itself: a coded non-2xx is the app's own answer and the
+          turn commits only on a 2xx, so a coded 502 (``LLM_PROVIDER_ERROR``)
+          is a :class:`FaultMavenAPIError`, not a gateway timeout.
+
+        A wait that would run to the bound is cut short to leave one last ask
+        (:data:`_LAST_ASK_SECONDS`), so a turn that committed during it is still
+        answered by its replay.
 
         The per-attempt cap and the bound come from :meth:`turn_timing` (the
         backend's published turn bound plus a margin, or the configured
@@ -2222,6 +2276,8 @@ class FaultMavenClient:
         # Set when this attempt was answered by a labelled 504: the next attempt
         # is a fresh, charged run, and starts only if a whole attempt fits.
         fresh_run_next = False
+        # Set once a wait was cut short at the bound for the last ask.
+        last_ask = False
         notified = False
 
         while True:
@@ -2342,12 +2398,31 @@ class FaultMavenClient:
                     # claim to stop it, and lost the case version to it: the
                     # next attempt is answered from that attempt's receipt.
                     version_conflicts += 1
-                elif maybe_committed and (
-                    resp.status_code == 429 or (resp.status_code >= 500 and not code)
-                ):
-                    # A backend that is overloaded, restarting or rate-limiting
-                    # says nothing about the attempt being recovered, which may
-                    # have committed: keep asking, at the pace it asks for.
+                elif maybe_committed and resp.status_code == 429:
+                    # Refused for now (the rate limiter, or the daily turn cap):
+                    # that says nothing about the attempt being recovered, which
+                    # may have committed. Its Retry-After is when an ask will be
+                    # admitted, not a poll hint, so it is waited as stated; one
+                    # that outlasts the bound means no ask can be admitted within
+                    # it, so the loop ends now rather than polling refusals.
+                    retry_after = self._retry_after(resp)
+                    if retry_after is None:
+                        wait, backoff = backoff, _next_backoff(backoff)
+                    elif retry_after >= deadline - self._clock():
+                        try:
+                            self._raise_turn_error(resp, polled=polled)
+                        except TurnCapExceededError as cap:
+                            raise FaultMavenTimeoutError(
+                                str(pending), turn_cap=cap
+                            ) from cap
+                        except FaultMavenError as error:
+                            raise pending from error
+                    else:
+                        wait = float(max(retry_after, _IN_PROGRESS_POLL_MIN_SECONDS))
+                elif maybe_committed and resp.status_code >= 500 and not code:
+                    # A backend that is overloaded or restarting says nothing
+                    # about the attempt being recovered, which may have
+                    # committed: keep asking, at the pace it asks for.
                     retry_after = self._retry_after(resp)
                     if retry_after is None:
                         wait, backoff = backoff, _next_backoff(backoff)
@@ -2372,14 +2447,23 @@ class FaultMavenClient:
                 # A re-send after a labelled 504 is a fresh, charged run. Do not
                 # launch one the bound will cut off: end with what the backend said.
                 raise pending
+            if wait >= remaining:
+                # The wait would run to the bound and leave no time to ask how
+                # it ended, so a turn that committed during it would be reported
+                # as unknown when a re-send under its key replays it. Cut it
+                # short for one last ask, made once.
+                if last_ask:
+                    raise pending
+                last_ask = True
+                wait = max(0.0, remaining - _LAST_ASK_SECONDS)
             if not notified and on_waiting is not None:
                 notified = True
                 _notify_waiting(on_waiting)
             logger.info(
                 "Re-sending turn on case %s under its key in %.0fs (%s)",
-                case_id, min(wait, remaining), pending,
+                case_id, wait, pending,
             )
-            if wait > 0 and self._wait(min(wait, remaining)):
+            if wait > 0 and self._wait(wait):
                 raise pending  # shutting down: stop between attempts
             if deadline - self._clock() <= 0:
                 raise pending
@@ -2438,14 +2522,19 @@ class FaultMavenClient:
                 resp, "submit_turn", not_found_is_case=not polled
             )
         except FaultMavenAPIError as exc:
-            if exc.status_code in (502, 504):
-                # A labelled 502/504 we do not model (REQUEST_TIMEOUT and
-                # LLM_TIMEOUT are answered in ``submit_turn``). Still the "may have
-                # committed" class, raised here in the client so the UI layer
-                # never re-derives it from a status code.
-                raise FaultMavenTimeoutError(
-                    f"submit_turn hit a gateway timeout (HTTP {exc.status_code}); "
-                    "the turn may still complete on the backend"
+            # No status-keyed "may have committed" arm here. The unlabelled
+            # gateway 502/504 is answered in ``submit_turn`` before this is
+            # called, and every 504 the app labels too; what is left with a 5xx
+            # is coded, so the app's own answer, and the turn commits only on a
+            # 2xx. A coded 502 (``LLM_PROVIDER_ERROR``: the AI provider refused
+            # the request) used to be raised here as a gateway timeout, which
+            # told the user the turn might still complete and offered no retry.
+            if isinstance(exc, FaultMavenRateLimitError) and exc.code == _TURN_CAP_CODE:
+                raise TurnCapExceededError(
+                    str(exc),
+                    detail=exc.detail,
+                    retry_after=exc.retry_after,
+                    code=exc.code,
                 ) from exc
             if exc.status_code == 409:
                 # Several unrelated conflicts share this status, and they need
@@ -2474,7 +2563,7 @@ class FaultMavenClient:
                 }.get(error_code or "")
                 if labelled is not None:
                     raise labelled(
-                        str(exc), status_code=409, detail=exc.detail
+                        str(exc), status_code=409, detail=exc.detail, code=exc.code
                     ) from exc
                 # An unlabelled 409 is not a terminal case (every terminal 409
                 # is labelled since 12.3.0): generic handling below.
