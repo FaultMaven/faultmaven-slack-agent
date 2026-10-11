@@ -16,6 +16,8 @@ from logging import Logger
 from slack_bolt import App
 from slack_sdk import WebClient
 
+from ._turn import SNIPPET_HOW_TO
+
 _HOME_BLOCKS = [
     {
         "type": "header",
@@ -42,8 +44,8 @@ _HOME_BLOCKS = [
             "type": "mrkdwn",
             "text": (
                 "*What I can do*\n"
-                "• :mag: *Share a file* — a log, an error, a config — ask me about "
-                'it, or "does this look right?"\n'
+                "• :mag: *Share data* — a log, an error, a config, as a snippet or "
+                'a file — ask me about it, or "does this look right?"\n'
                 "• :warning: *Hit a problem* — I'll investigate for the root cause\n"
                 "• :bulb: *Stuck on a fix* — I'll propose one\n"
                 "• :books: *Wrap up* — I'll write it up so it's reusable next time"
@@ -60,6 +62,19 @@ _HOME_BLOCKS = [
                 "You bring the data — logs, errors, whatever you've got, noise and "
                 "all. I pull out the *evidence* and tell you what's still missing. "
                 "You approve and execute — you're always in control."
+            ),
+        },
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                "*Where data goes*\n"
+                "Put logs, command output and config in a *text snippet* "
+                f"({SNIPPET_HOW_TO}) or attach the file. I read the text of a "
+                "message — code blocks included — as your description of the "
+                "problem; snippets and files are what I analyze as data."
             ),
         },
     },

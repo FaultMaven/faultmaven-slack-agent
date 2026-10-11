@@ -214,3 +214,29 @@ def test_a_declined_message_leaves_the_previous_buttons_alone():
     assert client.updates == [], "and must not take the previous buttons down"
     assert store.get_last_action_ts("T1", "C1", "TS1") == "PREV_ACTION_TS"
     assert any("Tell me what's going on" in p["text"] for p in say.posts)
+
+
+def test_greeting_says_where_data_goes():
+    """The panel's greeting is its "where data goes" note (#100): it lands before
+    the first message, and must not invite pasting data into the message."""
+
+    from listeners.assistant import _GREETING
+
+    assert "Create a text snippet" in _GREETING
+    assert "code blocks included" in _GREETING
+    assert "paste" not in _GREETING.lower()
+
+
+def test_panel_opening_reply_does_not_repeat_the_greeting_data_note():
+    fm, store, client = _FakeFM(), _FakeStore(), _FakeClient()
+
+    say = _run_message(fm, store, client, _message())
+
+    contexts = [
+        e.get("text", "")
+        for p in say.posts
+        for b in (p["blocks"] or [])
+        if b.get("type") == "context"
+        for e in b.get("elements", [])
+    ]
+    assert turn_mod.DATA_CHANNEL_HINT not in contexts

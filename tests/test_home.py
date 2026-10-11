@@ -31,3 +31,15 @@ def test_home_view_carries_the_positioning():
     assert "Chat" in body
     assert "@mention" in body
     assert "Ask FaultMaven" in body
+
+
+def test_home_view_says_where_data_goes():
+    """Message text — code blocks included — goes to the engine as a claim; only
+    a snippet or a file is data. Home is where that is said up front (#100)."""
+
+    body = _mrkdwn_text(build_home_view())
+    assert "Where data goes" in body
+    assert "Create a text snippet" in body
+    assert "code blocks included" in body
+    # Nothing on Home may tell the user to paste data into the message.
+    assert "paste" not in body.lower()

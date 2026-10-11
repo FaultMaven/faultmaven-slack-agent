@@ -98,7 +98,7 @@ NOTHING_COMMITTED_NARROW_TEXT = (
     ":hourglass: FaultMaven ran out of time on that turn, and nothing was "
     "saved. You can try again, but the same request may time out again, so "
     "try narrowing it first (a more specific question, or a smaller file or "
-    "paste)."
+    "snippet)."
 )
 #: What the thread shows, once, when a turn's first attempt went unanswered and
 #: the agent is waiting on it under its key. "Working", not "investigating", for
@@ -217,7 +217,27 @@ SUMMONS_TEXT = "Please investigate this thread."
 
 UNREADABLE_FILES_TEXT = (
     ":information_source: I couldn't read the attached file(s) (too large, or "
-    "I lack access). Paste the key text and I'll take it from there."
+    "I lack access). Put the key part in a text snippet and I'll take it from "
+    "there."
+)
+
+#: How to make a Slack text snippet, as the user does it. Slack's own help
+#: (slack.com/help/articles/204145658) documents the composer's *+* menu entry;
+#: it does not document a long paste converting on its own, so nothing here
+#: claims one does.
+SNIPPET_HOW_TO = "the *+* in the message box → *Create a text snippet*"
+
+#: Where data goes, said once per thread, on the reply that opens its case (see
+#: ``run_turn_and_post``). FaultMaven reads message text as the user's CLAIMS;
+#: only submitted data — a file, or a snippet, which ``slack_files`` forwards as
+#: ``pasted_content`` — is EVIDENCE. The message text goes as ``query``, code
+#: blocks included, so a log pasted there is a claim, and nothing on screen says
+#: so unless this does. Agent chrome: it rides in its own context block, never
+#: inside the engine's reply text.
+DATA_CHANNEL_HINT = (
+    ":page_facing_up: Share logs, command output or config as a *text snippet* "
+    f"({SNIPPET_HOW_TO}) or an attached file. I read the message text itself — "
+    "code blocks included — as your description of the problem, not as data."
 )
 
 
@@ -1082,6 +1102,12 @@ def post_placeholder(
     return resp["ts"]
 
 
+def _context_note(text: str) -> dict:
+    """A one-line agent note, set apart from the engine's reply as a context block."""
+
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+
 def _address(blocks: list[dict], user_id: str) -> None:
     """Prefix the reply's first section with an @mention of the addressed user."""
 
@@ -1123,7 +1149,12 @@ def run_turn_and_post(
     overlap here. ``mention_user`` addresses the reply to the person whose message
     it answers (channels), and the first reply in a thread carries a one-time
     etiquette note about the one-at-a-time behavior (``intro_note`` overrides that
-    note for surfaces with different etiquette, e.g. the plain DM).
+    note for surfaces with different etiquette, e.g. the plain DM). Every
+    surface's first reply also carries :data:`DATA_CHANNEL_HINT`. "First reply"
+    is the reply to the turn that OPENS the thread's case (no live case mapped
+    when the turn began), the same reply that carries the case pointer: a
+    continuing turn never repeats it, and a re-summoned thread whose case went
+    missing gets it again with its new case.
     ``placeholder_ts`` reuses a placeholder a caller already posted (e.g. before a
     slow file download). ``idempotency_key`` is the turn's key
     (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
@@ -1206,14 +1237,12 @@ def run_turn_and_post(
         if mention_user:
             _address(blocks, mention_user)
         if first_turn and (intro_note or mention_user):
-            blocks.append(
-                {
-                    "type": "context",
-                    "elements": [
-                        {"type": "mrkdwn", "text": intro_note or _INTRO_WARNING}
-                    ],
-                }
-            )
+            blocks.append(_context_note(intro_note or _INTRO_WARNING))
+        if first_turn:
+            # Owed once per case-opening reply on every surface that opens one
+            # here (mention, DM summons, shortcut); a continuing turn, whose
+            # thread already has a case, never repeats it.
+            blocks.append(_context_note(DATA_CHANNEL_HINT))
 
     # The conversation has genuinely advanced now, so the previous turn's
     # choice buttons can come down.
