@@ -516,6 +516,148 @@ def test_a_pending_write_is_retried_and_heals():
     assert client._default.unpersisted is False
 
 
+class GatedStore(FakeStore):
+    """A store whose write of one token parks until the test releases it."""
+
+    def __init__(self, token: str | None = None, fail_on_put: bool = False):
+        super().__init__(token, fail_on_put)
+        self.gated = ""
+        self.parked = threading.Event()
+        self.release = threading.Event()
+        self.on_put = lambda token: None
+
+    def put(self, refresh_token: str) -> None:
+        if refresh_token == self.gated and not self.fail_on_put:
+            self.parked.set()
+            assert self.release.wait(timeout=5), "the parked write was never released"
+        super().put(refresh_token)
+        self.on_put(refresh_token)
+
+
+class ObservedLock:
+    """A ``threading.Lock`` that says when someone has to wait for it.
+
+    Lets a test order threads on lock contention itself rather than on time:
+    a thread blocked on the lock is otherwise indistinguishable from one that
+    has not got there yet.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self._lock.acquire(blocking=False):
+            return True
+        if not blocking:
+            return False
+        self.contended.set()
+        return self._lock.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def _client_with_a_pending_write(store: GatedStore) -> FaultMavenClient:
+    """A client holding rt-1 that its store failed to take; renewals go on."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return token_response(access=f"at-{calls['n']}", refresh=f"rt-{calls['n']}")
+
+    client = make_client(handler, store=store)
+    store.fail_on_put = True
+    client._current_token(client._default)
+    assert client._default.refresh_token == "rt-1"
+    assert client._default.unpersisted is True
+    store.fail_on_put = False  # disk recovers
+    client._default.renew_lock = ObservedLock()
+    return client
+
+
+def test_a_pending_write_cannot_overwrite_a_newer_rotation():
+    """The retry's write of rt-1 is still in flight when a turn renews rt-1 to
+    rt-2 and persists it. If the stale write then lands, the store holds a
+    revoked token and the next restart is locked out (#96)."""
+    store = GatedStore(token="rt-0")
+    client = _client_with_a_pending_write(store)
+    cred = client._default
+    store.gated = "rt-1"
+    # The renewal has either finished its own write, or is waiting for the
+    # retry's — both are where the race is decided.
+    renewal_settled = threading.Event()
+    store.on_put = lambda token: token == "rt-2" and renewal_settled.set()
+    cred.renew_lock.contended = renewal_settled
+
+    retry = threading.Thread(target=client._retry_pending_persist, args=(cred,))
+    retry.start()
+    assert store.parked.wait(timeout=5), "the retry never started its write"
+    renewal = threading.Thread(target=lambda: client._renew(cred, force=True))
+    renewal.start()
+    assert renewal_settled.wait(timeout=5), "the renewal never got going"
+
+    store.release.set()
+    retry.join(timeout=5)
+    renewal.join(timeout=5)
+
+    assert cred.refresh_token == "rt-2"
+    assert store.token == cred.refresh_token
+    assert cred.unpersisted is False
+
+
+def test_a_pending_write_does_not_wait_behind_a_renewal():
+    """A renewal is a network round-trip. The keepalive walks every workspace's
+    credential, so a retry that queued behind one would stall all the others;
+    it leaves the write pending for the next tick instead."""
+    store = GatedStore(token="rt-0")
+    client = _client_with_a_pending_write(store)
+    cred = client._default
+
+    with cred.renew_lock:  # a renewal in flight
+        retry = threading.Thread(target=client._retry_pending_persist, args=(cred,))
+        retry.start()
+        retry.join(timeout=5)
+        assert not retry.is_alive(), "the retry waited for the renewal"
+    assert store.puts == []
+    assert cred.unpersisted is True
+
+    client._retry_pending_persist(cred)  # the next tick
+
+    assert store.puts == ["rt-1"]
+    assert cred.unpersisted is False
+
+
+def test_close_waits_for_a_pending_write_in_flight():
+    """Closing the store under the retry's write would fail it — leaving the
+    rotated token unwritten at the very restart it was written for."""
+    store = GatedStore(token="rt-0")
+    client = _client_with_a_pending_write(store)
+    cred = client._default
+    store.gated = "rt-1"
+
+    retry = threading.Thread(target=client._retry_pending_persist, args=(cred,))
+    retry.start()
+    assert store.parked.wait(timeout=5), "the retry never started its write"
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    assert cred.renew_lock.contended.wait(timeout=5), "close() did not wait"
+    assert store.closed is False
+
+    store.release.set()
+    retry.join(timeout=5)
+    closer.join(timeout=5)
+    assert store.puts == ["rt-1"]
+    assert cred.unpersisted is False
+    assert store.closed is True
+
+
 # -- out-of-band rotation -----------------------------------------------------
 def test_rejected_credential_falls_back_to_the_store():
     """Another process may have rotated it — preflight authenticates, which

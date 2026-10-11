@@ -547,7 +547,10 @@ class _Credential:
 
     * ``renew_lock`` is held ACROSS the refresh exchange. Presenting a refresh
       token consumes it, so two concurrent renewals of the SAME credential would
-      each revoke the other's and lock this workspace out.
+      each revoke the other's and lock this workspace out. It also owns
+      ``refresh_token`` and ``unpersisted``: both change only under it, and
+      every write of a rotated token to the store happens under it, so an
+      older token's write can never land after a newer rotation's.
     * ``token_lock`` guards only the read-modify-write of the cached access
       token, so a racing thread can never observe a transiently blank bearer.
     """
@@ -760,7 +763,8 @@ class FaultMavenClient:
             # chance to exit.
             keepalive.join(timeout=5.0)
 
-        # Wait out an in-flight renewal before tearing down what it is using.
+        # Wait out an in-flight renewal (or a pending write's retry, which takes
+        # the same lock) before tearing down what it is using.
         # Closing the http client or the SQLite connection underneath one would
         # lose the rotated token — the presented one is already revoked, so that
         # is a lockout. A renewal is one request, bounded by the request
@@ -1541,19 +1545,32 @@ class FaultMavenClient:
     def _retry_pending_persist(self, cred: _Credential) -> None:
         """Re-attempt a write that failed earlier, so the disk error can heal."""
 
-        if not cred.unpersisted:
+        # Under the renew lock, or a renewal can rotate the token and persist
+        # the new one while this write of the old one is in flight — which then
+        # lands over it, leaving a revoked token in the store (#96). Holding it
+        # also makes close() wait for the write before closing the store.
+        # Non-blocking: a renewal is a network round-trip, and the keepalive
+        # must not stall every other credential behind one. The write stays
+        # pending for the next tick.
+        if not cred.unpersisted or not cred.renew_lock.acquire(blocking=False):
             return
-        token = cred.refresh_token
         try:
-            self._persist(cred, token)
-        except Exception as exc:  # noqa: BLE001 — still broken; try again later
-            logger.warning(
-                "FaultMaven credential for %s still not persistable: %s",
-                cred.label,
-                exc,
-            )
-            return
-        cred.unpersisted = False
+            # Re-read under the lock: a renewal since may have persisted a newer
+            # token, and then there is nothing left to retry.
+            if not cred.unpersisted:
+                return
+            try:
+                self._persist(cred, cred.refresh_token)
+            except Exception as exc:  # noqa: BLE001 — still broken; try again later
+                logger.warning(
+                    "FaultMaven credential for %s still not persistable: %s",
+                    cred.label,
+                    exc,
+                )
+                return
+            cred.unpersisted = False
+        finally:
+            cred.renew_lock.release()
         logger.info(
             "Rotated FaultMaven refresh token for %s persisted after an "
             "earlier failure",
