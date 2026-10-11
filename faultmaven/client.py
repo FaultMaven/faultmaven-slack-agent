@@ -141,6 +141,20 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, list) else []
 
 
+def _as_turn(value: Any) -> int | None:
+    """A turn count from a tolerated field, or ``None``.
+
+    Only a non-negative ``int`` is a turn count. ``bool`` is excluded although
+    it subclasses ``int`` (``True`` is not turn 1); a string, a float or a
+    negative is schema drift, and degrades to "no count" rather than reaching
+    the rendered text.
+    """
+
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 # The backend's ``x-error-code`` marking a 409 as an optimistic-concurrency
 # version conflict, as opposed to the terminal-case rejection (``CASE_TERMINAL``)
 # that shares the status. Sent alongside x-expected-version / x-actual-version.
@@ -549,7 +563,14 @@ class TurnResult:
 
     agent_response: str
     case_state: str | None = None
+    #: The MESSAGE clock: every persisted exchange advances it, out-of-band
+    #: asides included (small talk, trivia, questions about FaultMaven itself).
+    #: Use it to ADDRESS a turn; prefer ``investigation_turn`` to DISPLAY one.
     turn_number: int | None = None
+    #: How many of the case's turns so far were investigation work: an aside
+    #: advances ``turn_number`` and leaves this alone. ``None`` when the server
+    #: predates the field, and a display then falls back to ``turn_number``.
+    investigation_turn: int | None = None
     progress_made: bool = False
     milestones_completed: list[str] = field(default_factory=list)
     suggested_actions: list[dict[str, Any]] = field(default_factory=list)
@@ -2680,7 +2701,8 @@ class FaultMavenClient:
         return TurnResult(
             agent_response=response,
             case_state=body.get("case_state"),
-            turn_number=body.get("turn_number"),
+            turn_number=_as_turn(body.get("turn_number")),
+            investigation_turn=_as_turn(body.get("investigation_turn")),
             progress_made=bool(body.get("progress_made", False)),
             milestones_completed=_as_list(body.get("milestones_completed")),
             suggested_actions=_as_list(body.get("suggested_actions")),

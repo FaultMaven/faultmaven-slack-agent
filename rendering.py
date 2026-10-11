@@ -48,6 +48,31 @@ _BUTTON_VALUE_LIMIT = 1900  # Slack caps button value at 2000 chars
 _COMMAND_LIMIT = 600
 
 
+def displayed_turn(result: TurnResult) -> int | None:
+    """The turn number to PRINT for ``result``, or ``None`` for no label.
+
+    ``turn_number`` is the message clock and advances on every exchange,
+    out-of-band asides included (small talk, trivia, questions about FaultMaven
+    itself), so printing it showed ``Turn 8`` after a haiku (#64). The contract
+    says to keep ``turn_number`` for ADDRESSING a turn and prefer
+    ``investigation_turn`` for DISPLAYING one; a server that predates the field
+    sends none, and the message clock is then the only count there is.
+
+    The rule matches the Copilot and the Dashboard, which render the same case:
+    ``investigation_turn ?? turn_number`` for what the turn IS, and no label at
+    0, which names a turn the investigation has not reached (an aside before any
+    investigation work).
+    """
+
+    turn = (
+        result.investigation_turn
+        if result.investigation_turn is not None
+        else result.turn_number
+    )
+    # Falsy on purpose, not ``is None``: 0 and "no count" both print nothing.
+    return turn if turn else None
+
+
 def clean_mention(text: str) -> str:
     """Strip ``<@U123>`` bot mentions, then render Slack's wire form.
 
@@ -344,8 +369,9 @@ def build_turn_blocks(
         if result.cause_overclaim:
             assurance_label += " ⚠ (stated more certainly than the evidence supports)"
         context.append({"type": "mrkdwn", "text": assurance_label})
-    if result.turn_number is not None:
-        context.append({"type": "mrkdwn", "text": f"Turn {result.turn_number}"})
+    turn = displayed_turn(result)
+    if turn is not None:
+        context.append({"type": "mrkdwn", "text": f"Turn {turn}"})
     if evidence and not terminal:
         context.append(
             {"type": "mrkdwn", "text": "Investigation in progress — awaiting the data above"}

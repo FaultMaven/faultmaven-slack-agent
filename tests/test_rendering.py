@@ -140,6 +140,55 @@ def test_context_shows_state_and_turn():
     assert any("Turn 3" in t for t in ctx)
 
 
+# -- displayed turn: the investigation count, not the message clock (#64) -----
+def _turn_labels(result: TurnResult) -> list[str]:
+    return [t for t in _context_texts(build_turn_blocks(result)) if t.startswith("Turn")]
+
+
+def test_out_of_band_aside_does_not_advance_the_displayed_turn():
+    # Seven investigation turns, then a haiku: the message clock moved to 8,
+    # the investigation count did not. "Turn 8" after a haiku was the symptom.
+    aside = TurnResult(
+        agent_response="Pods restart at dawn...",
+        case_state="investigating",
+        turn_number=8,
+        investigation_turn=7,
+    )
+    assert _turn_labels(aside) == ["Turn 7"]
+
+
+def test_investigation_turn_advances_the_displayed_turn():
+    after_aside = TurnResult(
+        agent_response="The pool is exhausted.",
+        case_state="investigating",
+        turn_number=9,
+        investigation_turn=8,
+    )
+    assert _turn_labels(after_aside) == ["Turn 8"]
+
+
+def test_older_server_without_investigation_turn_falls_back_to_turn_number():
+    result = TurnResult(agent_response="x", case_state="investigating", turn_number=5)
+    assert result.investigation_turn is None
+    assert _turn_labels(result) == ["Turn 5"]
+
+
+def test_aside_before_any_investigation_work_prints_no_turn():
+    # investigation_turn 0 is a real answer, so it does NOT fall back to the
+    # message clock; and "Turn 0" names a turn the investigation has not
+    # reached, so nothing is printed (same rule as the Copilot and Dashboard).
+    result = TurnResult(
+        agent_response="Hello!", case_state="inquiry", turn_number=1, investigation_turn=0
+    )
+    ctx = _context_texts(build_turn_blocks(result))
+    assert not any(t.startswith("Turn") for t in ctx)
+    assert any("inquiry" in t for t in ctx)  # the state line still renders
+
+
+def test_no_turn_count_at_all_prints_no_turn():
+    assert _turn_labels(TurnResult(agent_response="x", case_state="inquiry")) == []
+
+
 # -- DECIDE suggestions: clickable + legible ---------------------------------
 def test_payload_only_decide_becomes_button_carrying_payload():
     # Runbook / regenerate-summary DECIDEs carry a `payload` but NO `intent`

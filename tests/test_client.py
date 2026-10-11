@@ -600,3 +600,41 @@ def test_parse_turn_tolerates_non_scalar_cause_fields():
     )
     assert result.cause_assurance is None
     assert result.cause_overclaim is None
+
+
+def test_parse_turn_reads_investigation_turn_beside_the_message_clock():
+    # An out-of-band aside: the message clock advanced, the investigation count
+    # did not (#64). Both are carried; turn_number stays the addressing clock.
+    result = FaultMavenClient._parse_turn(
+        {"agent_response": "a haiku", "turn_number": 8, "investigation_turn": 7}
+    )
+    assert result.turn_number == 8
+    assert result.investigation_turn == 7
+
+
+def test_parse_turn_investigation_turn_absent_or_null_is_none():
+    # A server that predates the field omits it, or sends null.
+    assert FaultMavenClient._parse_turn({"turn_number": 3}).investigation_turn is None
+    assert (
+        FaultMavenClient._parse_turn(
+            {"turn_number": 3, "investigation_turn": None}
+        ).investigation_turn
+        is None
+    )
+
+
+def test_parse_turn_keeps_a_zero_investigation_turn():
+    # 0 is a real answer (an aside before any investigation work), not "absent".
+    result = FaultMavenClient._parse_turn({"turn_number": 1, "investigation_turn": 0})
+    assert result.investigation_turn == 0
+
+
+def test_parse_turn_tolerates_non_integer_turn_fields():
+    # Parsing a committed (2xx) turn must never raise, and drift must not reach
+    # the rendered "Turn N" text: a non-int, a bool or a negative degrades to None.
+    for bad in ("7", 7.5, True, -1, {"n": 7}, [7]):
+        result = FaultMavenClient._parse_turn(
+            {"agent_response": "a", "turn_number": bad, "investigation_turn": bad}
+        )
+        assert result.turn_number is None, bad
+        assert result.investigation_turn is None, bad
