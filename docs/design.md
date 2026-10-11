@@ -384,14 +384,15 @@ turn (§8.1):
 | Data | Slack mechanism | → backend |
 |---|---|---|
 | **File(s)** | native composer (drag/drop, paperclip) **or** the opening modal's `file_input`; **multiple per turn** | download via `url_private` (`files:read`) → multipart `files` |
-| **Pasted text / logs** | type/paste into the ping, or the modal text box | `pasted_content` (a *large* paste auto-becomes a Slack **snippet file** → handled on the file path) |
+| **Pasted text / logs** | a Slack **text snippet** on the ping (composer *+* → *Create a text snippet*) | `pasted_content`, `input_type=paste` (`slack_files._is_snippet`: a text-mimetype `mode: "snippet"` file is a paste, not an upload) |
+| **The ping's own text** (code blocks included) | typed into the composer | `query` — a **claim**, never evidence. A log pasted here is not data; the agent says so up front (App Home, the case-opening reply's context line, the Assistant greeting) |
 | **Screenshots** (dashboards, errors) | image upload | multipart `files` → backend **multimodal** (`MULTIMODAL_PROVIDER`) |
 | **Existing Slack content** (an alert, a teammate's log) | the **message shortcut** on it (§4.3) | `pasted_content` — the *page-capture analog*: capture what's already in the conversation |
 
 There is **no DOM page-capture** in Slack (no browser); its intent is covered by
 shortcutting the monitoring message or a screenshot. Data rides on a **ping**:
-attach/paste *with* an `@mention`, or in the side panel where every message is a
-turn, or via the opening modal. So a single turn can carry several files at once
+a file or snippet *with* an `@mention`, or in the side panel where every message
+is a turn, or via the opening modal. So a single turn can carry several files at once
 — richer than the Copilot's one-at-a-time. We extract readable text from a
 message's `blocks`/`attachments`, not just `.text` (§4.3 caveat).
 
@@ -612,7 +613,7 @@ all — while `is_unlinked` preserves the memory:
 | Suggested prompts | `assistant_thread_started` suggested prompts | static + FaultMaven hints |
 | File upload (logs/configs/metrics) | native composer or modal `file_input`; **multiple per turn**; `url_private` download (§5.4) | `/cases/{id}/turns` multipart `files[]` |
 | Page/DOM capture | *no DOM in Slack* → **message shortcut** captures existing content; **screenshots** → multimodal (§5.4) | `pasted_content` / multipart `files` |
-| Pasted content | message text, modal text box, or shortcut body | `pasted_content` |
+| Pasted content | text snippet, modal text box, or shortcut body (message text is the `query`, a claim — §5.4) | `pasted_content` |
 | Hypothesis tracker | Block Kit section + lifecycle rendered as `TaskUpdateChunk`s (pending→testing→validated/refuted) | `TurnResponse` hypotheses / `progress_transparency` |
 | Suggested actions (DECIDE/RUN/EVIDENCE/FREE_SPEECH) | Interactive Block Kit buttons / prompt chips (§9.2) | `suggested_actions[]` |
 | Knowledge/runbook lookup | Rendered inline with source links; deep-link to Dashboard KB | `/knowledge/...`, returned in turns |

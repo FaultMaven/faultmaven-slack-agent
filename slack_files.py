@@ -39,10 +39,15 @@ _STREAM_CHUNK = 64 * 1024
 
 
 def _is_snippet(meta: dict) -> bool:
-    """True for a Slack text snippet — text PASTED into the composer.
+    """True for a Slack text snippet — text the user PASTED as data.
 
-    Slack turns a large paste into a file with ``mode: "snippet"`` and a
-    synthetic name ("Untitled"). It is a paste, not a file the user picked:
+    A snippet is what the composer's *+* → *Create a text snippet* makes (or
+    its Cmd/Ctrl+Shift+Enter conversion of text already typed, per Slack's
+    help): a file with ``mode: "snippet"`` and, untitled, a synthetic name
+    ("Untitled"). Slack does not document a long paste converting to one on
+    its own, so the user is told how to make one (``listeners._turn``'s
+    ``DATA_CHANNEL_HINT``); text left in the message goes as ``query``, a
+    claim. A snippet is a paste, not a file the user picked:
     the name carries no extension signal, and the backend classifies pastes
     and file uploads differently (paste → content-only rules; upload →
     extension trust). The mimetype guard keeps any exotic non-text snippet

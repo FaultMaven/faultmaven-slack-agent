@@ -156,8 +156,8 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                         ts=placeholder_ts,
                         text=(
                             ":information_source: I couldn't read the attached "
-                            "file(s) (too large, or I lack access). Paste the key "
-                            "text and @mention me."
+                            "file(s) (too large, or I lack access). Put the key "
+                            "part in a text snippet and @mention me."
                         ),
                     )
                 except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder

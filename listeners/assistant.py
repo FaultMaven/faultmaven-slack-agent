@@ -20,6 +20,7 @@ from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
+    SNIPPET_HOW_TO,
     UNREADABLE_FILES_TEXT,
     case_gone_text,
     Dedup,
@@ -40,9 +41,17 @@ from ._turn import (
 # the Chat tab describing what FaultMaven does, so the greeting only needs to
 # invite the user to start — repeating the capability list here would say the
 # same thing twice in one view. Native Slack mrkdwn, posted verbatim via say().
+#
+# It is also this surface's "where data goes" note (DATA_CHANNEL_HINT on the
+# channel surfaces): the greeting lands before the first message, which is the
+# earliest the user can be told, so the case-opening reply here does not repeat
+# it. It used to say "paste an error", which put data into the message text —
+# where it is read as a claim, not as evidence.
 _GREETING = (
-    ":wave: Ready when you are — paste an error, share a file, or just tell me "
-    "what's wrong, and I'll take it from there."
+    ":wave: Ready when you are — tell me what's wrong. Share logs, command "
+    f"output or config as a *text snippet* ({SNIPPET_HOW_TO}) or a file; I read "
+    "the message text itself, code blocks included, as your description of the "
+    "problem, not as data."
 )
 
 
@@ -153,7 +162,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                         UNREADABLE_FILES_TEXT
                         if payload.get("files")
                         else "Tell me what's going on — describe a symptom, "
-                        "paste an error, or attach a log."
+                        "and share any error or log as a text snippet or a file."
                     )
                     return
 

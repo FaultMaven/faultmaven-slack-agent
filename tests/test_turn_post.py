@@ -312,3 +312,59 @@ def test_null_blocks_on_the_tracked_message_do_not_break_the_strip():
 
     assert all(u["ts"] != "PREV_ACTION_TS" for u in client.updates)
     assert store.get_last_action_ts("T", "C", "TS") is None
+
+
+# -- where data goes (#100): once per thread, on the case-opening reply ----------
+
+
+def test_case_opening_reply_says_where_data_goes_exactly_once():
+    _turn = _load_turn()
+    client, fm = FakeClient(), FakeFM()
+    _turn.run_turn_and_post(
+        client, fm, FakeStore(), text="hi", mention_user="U42", **_COMMON,
+        idempotency_key="test-turn-key",
+    )
+    hints = _context_texts(client.updates[0]).count(_turn.DATA_CHANNEL_HINT)
+    assert hints == 1
+    # Agent chrome, never folded into the engine's reply text.
+    assert _turn.DATA_CHANNEL_HINT not in _first_section_text(client.updates[0])
+
+
+def test_where_data_goes_rides_every_opening_surface():
+    """No mention_user (the DM summons passes only intro_note) still gets it:
+    the hint is owed to every surface that opens a case here."""
+
+    _turn = _load_turn()
+    client, fm = FakeClient(), FakeFM()
+    _turn.run_turn_and_post(
+        client, fm, FakeStore(), text="hi", intro_note="reply in thread",
+        **_COMMON, idempotency_key="test-turn-key",
+    )
+    texts = _context_texts(client.updates[0])
+    assert texts.count(_turn.DATA_CHANNEL_HINT) == 1
+    assert "reply in thread" in texts
+
+
+def test_where_data_goes_is_not_repeated_on_a_continuing_turn():
+    _turn = _load_turn()
+    client, fm, store = FakeClient(), FakeFM(), FakeStore()
+    _turn.run_turn_and_post(
+        client, fm, store, text="first", mention_user="U42", **_COMMON,
+        idempotency_key="key-1",
+    )
+    _turn.run_turn_and_post(
+        client, fm, store, text="second", mention_user="U42", **_COMMON,
+        idempotency_key="key-2",
+    )
+    assert len(client.updates) == 2
+    first, second = client.updates
+    assert _context_texts(first).count(_turn.DATA_CHANNEL_HINT) == 1
+    assert _turn.DATA_CHANNEL_HINT not in _context_texts(second)
+
+
+def test_where_data_goes_names_the_snippet_and_the_claim_rule():
+    from listeners._turn import DATA_CHANNEL_HINT
+
+    assert "Create a text snippet" in DATA_CHANNEL_HINT
+    assert "code blocks included" in DATA_CHANNEL_HINT
+    assert "paste" not in DATA_CHANNEL_HINT.lower()
