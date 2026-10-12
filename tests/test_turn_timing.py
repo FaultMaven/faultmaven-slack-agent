@@ -19,6 +19,7 @@ from faultmaven.client import (
     TURN_NETWORK_MARGIN_SECONDS,
     TURN_RECOVERY_ATTEMPTS,
     FaultMavenClient,
+    FaultMavenError,
     FaultMavenNothingCommittedError,
     FaultMavenTimeoutError,
 )
@@ -375,6 +376,114 @@ def test_a_failed_read_is_retried_after_a_short_interval_not_every_turn():
     assert caps.reads == 1
     clock.now += 31.0
     assert client.turn_timing()[0] == 100.0 + TURN_NETWORK_MARGIN_SECONDS
+
+
+def test_a_failed_read_keeps_the_last_good_bound(caplog):
+    """slack-agent#106: a probe failure is no news about the bound. Falling back
+    to 150 s under Cloud's published 258.5 s would time out every long turn and
+    re-send it, so the last bound read stays in force; the failure is still
+    re-read on the short interval, not the long one."""
+
+    client, clock, caps = _client(
+        _Backend(_ok()),
+        _caps(258.5), httpx.Response(503), _unreachable, _caps(100.0),
+        derive_attempt_timeout=True, derive_recovery_seconds=True,
+    )
+    live = (258.5 + TURN_NETWORK_MARGIN_SECONDS,
+            TURN_RECOVERY_ATTEMPTS * (258.5 + TURN_NETWORK_MARGIN_SECONDS))
+    assert client.turn_timing() == live
+    clock.now += 301.0  # the success expired: re-read, and it fails
+    with caplog.at_level(logging.WARNING, logger="faultmaven.client"):
+        assert client.turn_timing() == live
+    assert caps.reads == 2
+    assert any("keeping the last one read" in r.message for r in caplog.records)
+    assert client.turn_timing() == live  # within the retry interval: no read
+    assert caps.reads == 2
+    clock.now += 31.0  # retried after the short interval; a second failure
+    assert client.turn_timing() == live
+    assert caps.reads == 3
+    clock.now += 31.0  # and a later success replaces it
+    assert client.turn_timing()[0] == 100.0 + TURN_NETWORK_MARGIN_SECONDS
+    assert caps.reads == 4
+
+
+def test_a_turn_after_a_failed_read_is_sized_from_the_last_good_bound():
+    backend = _Backend(_ok())
+    client, clock, _ = _client(
+        backend, _caps(258.5), httpx.Response(503), derive_attempt_timeout=True
+    )
+    client.turn_timing()
+    clock.now += 301.0
+    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert _timeouts(backend) == [258.5 + TURN_NETWORK_MARGIN_SECONDS]
+
+
+# -- slack-agent#106: no turn starts once shutdown has begun ------------------------
+def _assert_not_started(err: pytest.ExceptionInfo) -> None:
+    """Refused before anything was sent: not the "may have gone through"
+    timeout and not a labelled 504, so the thread is told to resend."""
+
+    assert type(err.value) is FaultMavenError
+    assert not isinstance(err.value, (FaultMavenTimeoutError, FaultMavenNothingCommittedError))
+    _turn.begin_shutdown()  # the autouse fixture clears it again after
+    assert _turn.turn_error_text(err.value) == _turn.RESTARTING_TEXT
+    assert _turn.retry_may_help(err.value)
+
+
+def test_no_first_attempt_and_no_probe_once_shutdown_began():
+    backend = _Backend(_ok())
+    client, _, caps = _client(
+        backend, _caps(300.0), derive_attempt_timeout=True, derive_recovery_seconds=True
+    )
+    client.begin_shutdown()
+    with pytest.raises(FaultMavenError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert backend.requests == []
+    assert caps.reads == 0
+    # The drain was sized before this turn; it must not have grown under it.
+    assert client.longest_attempt_seconds == FALLBACK_ATTEMPT_SECONDS
+    _assert_not_started(err)
+
+
+def test_shutdown_during_the_probe_still_sends_nothing():
+    """The probe can take its own timeout; shutdown beginning inside it must not
+    let the first attempt out after it."""
+
+    backend = _Backend(_ok())
+    box: list = [None]
+
+    def probe_then_stop(request):
+        box[0].begin_shutdown()
+        return _caps(240.0)
+
+    client, _, caps = _client(backend, probe_then_stop, derive_attempt_timeout=True)
+    box[0] = client
+    with pytest.raises(FaultMavenError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert caps.reads == 1
+    assert backend.requests == []
+    _assert_not_started(err)
+
+
+def test_a_turn_refused_at_shutdown_tells_the_thread_to_resend():
+    """End to end: the shutdown path sets both flags, the turn sends nothing,
+    and the placeholder becomes the restart notice, not "Working…" stranded."""
+
+    from tests.test_turn_recovery import _Slack, _Store
+
+    backend = _Backend(_ok())
+    client, _, caps = _client(backend, _caps(240.0), derive_attempt_timeout=True)
+    _turn.begin_shutdown()
+    client.begin_shutdown()
+    slack = _Slack()
+    _turn.run_turn_and_post(
+        slack, client, _Store(case_id="c1"),
+        channel="C1", thread_ts="TS1", team_id="T1", text="why",
+        idempotency_key=_KEY,
+    )
+    assert backend.requests == []
+    assert caps.reads == 0
+    assert [u["text"] for u in slack.updates] == [_turn.RESTARTING_TEXT]
 
 
 # -- the app wires the knobs ----------------------------------------------------------

@@ -95,7 +95,9 @@ done when its check conclusions are green, not when local tests pass.
   recovery bound derive from `limits.turnResponseBoundSeconds` on
   `GET /api/v1/meta/capabilities` (`FaultMavenClient.turn_timing`; env pins
   `FAULTMAVEN_REQUEST_TIMEOUT` / `FAULTMAVEN_TURN_RECOVERY_SECONDS`, fallback
-  150 s / 660 s). A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
+  150 s / 660 s, used only until a read first succeeds: a failed read keeps
+  the last good bound). Once `begin_shutdown` runs, no turn sends its first
+  attempt; it is refused before the probe, and the thread is told to resend. A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
   after its `Retry-After`, at most twice) committed nothing and surfaces as
   `FaultMavenNothingCommittedError`. Only an unlabelled 502/504 is a gateway;
   any other coded non-2xx is the app's own answer and commits nothing (a coded
