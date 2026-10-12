@@ -738,10 +738,17 @@ class FaultMavenClient:
         self._turn_recovery_seconds = turn_recovery_seconds
         self._derive_attempt = derive_attempt_timeout
         self._derive_recovery = derive_recovery_seconds
-        # (published bound or None, when it was read on ``_clock``): the cache
-        # behind :meth:`turn_timing`. ``_longest_attempt`` is the largest
-        # attempt timeout handed out, which is what a shutdown drain must outlast.
-        self._timing: tuple[float | None, float] | None = None
+        # The cache behind :meth:`turn_timing`, in two parts. ``_bound`` is the
+        # last published bound read successfully (None until one is), and a
+        # failed read never clears it: a probe failure is no news about the
+        # bound, and the fallback can sit below the live one (150 s against
+        # Cloud's 258.5 s), so every long turn would time out and be re-sent.
+        # ``_timing`` is (did the last read succeed, when it was made on
+        # ``_clock``), which picks the re-read interval. ``_longest_attempt`` is
+        # the largest attempt timeout handed out, which is what a shutdown
+        # drain must outlast.
+        self._bound: float | None = None
+        self._timing: tuple[bool, float] | None = None
         self._timing_lock = threading.Lock()
         self._longest_attempt = timeout
         self._http = httpx.Client(base_url=base_url, timeout=timeout)
@@ -794,13 +801,16 @@ class FaultMavenClient:
             logger.warning("FaultMaven auth deferred: %s", exc)
 
     def begin_shutdown(self) -> None:
-        """Stop turns from starting new recovery attempts.
+        """Stop turns from starting new attempts, first ones included.
 
         Called at the start of the shutdown drain, BEFORE :meth:`close`: a turn
         mid-attempt still finishes that attempt (and posts its reply if it gets
         one), but none re-sends after it and a wait between attempts ends at
         once. The turn then reports the timeout, so its thread is told it may
-        have gone through rather than left at "Working…".
+        have gone through rather than left at "Working…". A turn that has not
+        sent its first attempt yet sends nothing and opens no case: it is
+        refused, and its thread is told to resend in a minute
+        (:meth:`_refuse_if_stopping`).
 
         It also stops the credential keepalive, so no renewal it would start
         can run into the drain: a rotation SIGKILLed after the grace period
@@ -903,22 +913,25 @@ class FaultMavenClient:
         return "no credential configured"
 
     def _published_bound(self) -> float | None:
-        """``limits.turnResponseBoundSeconds``, cached; ``None`` when unavailable.
+        """``limits.turnResponseBoundSeconds``, cached; ``None`` when no read
+        has ever succeeded.
 
-        Unavailable is any failure to read a usable number: the request fails,
+        A read fails on any failure to read a usable number: the request fails,
         the status is not 2xx, the body is not JSON (a same-origin proxy answers
         an SPA page), or the field is absent, non-numeric or outside
-        ``[30, 1200]`` s. The caller then keeps the configured fallback, and says
-        so once per probe.
+        ``[30, 1200]`` s. A failed read keeps the last good bound, if there is
+        one, and is retried after :data:`_TIMING_RETRY_SECONDS`; only with none
+        does the caller keep the configured fallback. Either way it says so
+        once per probe.
         """
 
         with self._timing_lock:
             now = self._clock()
             if self._timing is not None:
-                bound, read_at = self._timing
-                ttl = _TIMING_TTL_SECONDS if bound is not None else _TIMING_RETRY_SECONDS
+                read_ok, read_at = self._timing
+                ttl = _TIMING_TTL_SECONDS if read_ok else _TIMING_RETRY_SECONDS
                 if now - read_at < ttl:
-                    return bound
+                    return self._bound
             bound = None
             try:
                 resp = self._http.get(
@@ -936,21 +949,29 @@ class FaultMavenClient:
                     raise ValueError(f"unusable turnResponseBoundSeconds {value!r}")
                 bound = float(value)
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                logger.warning(
-                    "Could not read the backend's published turn bound from %s "
-                    "(%s); sizing turns from the fallback (attempt %.0fs, "
-                    "recovery %.0fs)",
-                    _CAPABILITIES_PATH, exc,
-                    self._timeout, self._turn_recovery_seconds,
-                )
+                if self._bound is not None:
+                    logger.warning(
+                        "Could not read the backend's published turn bound from "
+                        "%s (%s); keeping the last one read (%.1fs)",
+                        _CAPABILITIES_PATH, exc, self._bound,
+                    )
+                else:
+                    logger.warning(
+                        "Could not read the backend's published turn bound from "
+                        "%s (%s); sizing turns from the fallback (attempt %.0fs, "
+                        "recovery %.0fs)",
+                        _CAPABILITIES_PATH, exc,
+                        self._timeout, self._turn_recovery_seconds,
+                    )
             else:
-                if self._timing is None or self._timing[0] != bound:
+                if self._bound != bound:
                     logger.info(
                         "Backend turn bound is %.1fs (attempt timeout %.1fs)",
                         bound, bound + TURN_NETWORK_MARGIN_SECONDS,
                     )
-            self._timing = (bound, now)
-            return bound
+                self._bound = bound
+            self._timing = (bound is not None, now)
+            return self._bound
 
     def turn_timing(self) -> tuple[float, float]:
         """``(attempt timeout, recovery bound)`` for the next turn, in seconds.
@@ -2130,6 +2151,7 @@ class FaultMavenClient:
         passing the wrong one is a tenancy error, not a labelling one.
         """
 
+        self._refuse_if_stopping()
         cred = self._credential_for(team_id)
         body: dict[str, Any] = {"title": title}
         if initial_message is not None:
@@ -2240,7 +2262,9 @@ class FaultMavenClient:
         goes on. When the bound runs out (or the process starts shutting down)
         the last unknown outcome is raised as :class:`FaultMavenTimeoutError`
         (or, if the last answer was a labelled 504,
-        :class:`FaultMavenNothingCommittedError`).
+        :class:`FaultMavenNothingCommittedError`). A turn whose first attempt
+        has not been sent when shutdown begins is not sent at all: a plain
+        :class:`FaultMavenError`, since nothing can have committed.
         """
 
         form: dict[str, str] = {}
@@ -2279,8 +2303,20 @@ class FaultMavenClient:
 
         cred = self._credential_for(team_id)
         headers = {"Idempotency-Key": idempotency_key}
+        # Checked before the capabilities probe, and again after the probe and
+        # the token, either of which can take a request's timeout; see
+        # :meth:`_refuse_if_stopping`.
+        self._refuse_if_stopping()
         attempt_seconds, recovery_seconds = self.turn_timing()
         deadline = self._clock() + recovery_seconds
+        # The first attempt's token, fetched here rather than inside ``_post``
+        # so that a renewal or dev-login is behind the check below; ``_post``
+        # then finds it cached. It counts against the bound (``deadline`` is
+        # already set), and a failure surfaces as it did from the first
+        # attempt: token acquisition raises only FaultMavenError, which that
+        # attempt never caught.
+        self._current_token(cred)
+        self._refuse_if_stopping()
         # The last attempt whose outcome is unknown, raised if the loop ends
         # without an answer. None until the first such attempt: before it, a
         # failure that never reached the backend is safe to report as retryable.
@@ -2488,6 +2524,28 @@ class FaultMavenClient:
                 raise pending  # shutting down: stop between attempts
             if deadline - self._clock() <= 0:
                 raise pending
+
+    def _refuse_if_stopping(self) -> None:
+        """Refuse to START a turn once shutdown has begun.
+
+        :meth:`begin_shutdown` stops re-sends at an attempt boundary, but a turn
+        still doing its pre-attempt work at that moment would otherwise send its
+        first attempt into the drain, which outlasts only an attempt already in
+        flight: the kill would land mid-turn and strand the thread's
+        placeholder. So this runs at the top of :meth:`create_case` (no case
+        is opened for a turn that would be refused), and in
+        :meth:`submit_turn` before the capabilities probe and again after the
+        probe and the first attempt's token, just before that attempt is sent.
+        Nothing has been sent, so nothing can have committed, and this is a
+        plain :class:`FaultMavenError`, never the timeout's "may have gone
+        through": the surface answers it with "restarting, resend it in a
+        minute".
+        """
+
+        if self._stopping.is_set():
+            raise FaultMavenError(
+                "turn not started: the agent is shutting down"
+            )
 
     def _send_turn(
         self,
