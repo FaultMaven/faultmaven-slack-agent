@@ -201,10 +201,6 @@ class BatchVerifyRequest(BaseModel):
     draft_ids: list[BatchDraftRef] = Field(..., max_length=100, min_length=1, title="Draft Ids")
 
 
-class BodyCompleteSessionApiV1CasesCaseIdSessionsSessionIdCompletePost(BaseModel):
-    findings_summary: str = Field(..., title="Findings Summary")
-
-
 class BodyConvertDocumentApiV1KnowledgeConvertPost(BaseModel):
     file: str = Field(
         ..., json_schema_extra={"contentMediaType": "application/octet-stream"}, title="File"
@@ -404,7 +400,7 @@ class DocumentSnippetResponse(BaseModel):
 
 
 class DraftUpdateRequest(BaseModel):
-    content: constr(min_length=100) = Field(
+    content: constr(min_length=100, max_length=100000) = Field(
         ..., description="Full runbook markdown content including frontmatter", title="Content"
     )
 
@@ -1074,12 +1070,6 @@ class SearchRequest(BaseModel):
     tags: str | None = Field(None, description="Filter by tags (comma-separated)", title="Tags")
 
 
-class SessionCreateRequest(BaseModel):
-    metadata: dict[str, Any] | None = Field(None, title="Metadata")
-    session_goal: str | None = Field(None, title="Session Goal")
-    token_budget_limit: conint(ge=0) | None = Field(None, title="Token Budget Limit")
-
-
 class SessionResponse(BaseModel):
     client_id: str | None = Field(None, title="Client Id")
     created_at: str = Field(..., title="Created At")
@@ -1090,19 +1080,6 @@ class SessionResponse(BaseModel):
     session_resumed: bool | None = Field(None, title="Session Resumed")
     status: AuthSessionStatus | None = "active"
     user_id: str | None = Field(None, title="User Id")
-
-
-class SessionState(Enum):
-    active = "active"
-    paused = "paused"
-    completed = "completed"
-    abandoned = "abandoned"
-
-
-class SessionUpdateRequest(BaseModel):
-    metadata: dict[str, Any] | None = Field(None, title="Metadata")
-    session_goal: str | None = Field(None, title="Session Goal")
-    token_budget_limit: conint(ge=0) | None = Field(None, title="Token Budget Limit")
 
 
 class SolutionSummary(BaseModel):
@@ -1795,25 +1772,6 @@ class InvestigationProgressSummary(BaseModel):
         description="Consecutive turns without milestone, evidence, or hypothesis progress",
         title="Turns Without Progress",
     )
-
-
-class InvestigationSessionResponse(BaseModel):
-    case_id: str = Field(..., title="Case Id")
-    created_at: AwareDatetime = Field(..., title="Created At")
-    ended_at: AwareDatetime | None = Field(None, title="Ended At")
-    enterprise_id: str = Field(..., title="Enterprise Id")
-    findings_summary: str | None = Field(None, title="Findings Summary")
-    last_activity_at: AwareDatetime = Field(..., title="Last Activity At")
-    session_goal: str | None = Field(None, title="Session Goal")
-    session_id: str = Field(..., title="Session Id")
-    started_at: AwareDatetime = Field(..., title="Started At")
-    state: SessionState
-    token_budget_limit: int | None = Field(None, title="Token Budget Limit")
-    total_agent_executions: int = Field(..., title="Total Agent Executions")
-    total_duration_ms: int | None = Field(None, title="Total Duration Ms")
-    total_token_usage: int = Field(..., title="Total Token Usage")
-    updated_at: AwareDatetime = Field(..., title="Updated At")
-    user_id: str = Field(..., title="User Id")
 
 
 class LLMConfigResponse(BaseModel):
