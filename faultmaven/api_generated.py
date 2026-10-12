@@ -1420,6 +1420,7 @@ class AdminCaseMetadata(BaseModel):
     closure_reason: str | None = Field(..., title="Closure Reason")
     created_at: AwareDatetime = Field(..., title="Created At")
     current_turn: int = Field(..., title="Current Turn")
+    driver_id: str | None = Field(None, title="Driver Id")
     enterprise_id: str = Field(..., title="Enterprise Id")
     investigation_turn: int | None = Field(None, title="Investigation Turn")
     is_terminal: bool = Field(..., title="Is Terminal")
