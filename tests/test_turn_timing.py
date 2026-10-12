@@ -19,6 +19,7 @@ from faultmaven.client import (
     TURN_NETWORK_MARGIN_SECONDS,
     TURN_RECOVERY_ATTEMPTS,
     FaultMavenClient,
+    FaultMavenCredentialError,
     FaultMavenError,
     FaultMavenNothingCommittedError,
     FaultMavenTimeoutError,
@@ -555,6 +556,146 @@ def test_concurrent_turns_share_one_capabilities_read():
         t.join()
     assert len(reads) == 1
     assert set(results) == {(100.0 + TURN_NETWORK_MARGIN_SECONDS, FALLBACK_RECOVERY_SECONDS)}
+
+
+
+# The first attempt's token, and the case create, sit behind the check too.
+_TOKEN_PATH = "/api/v1/auth/oauth/token"
+
+
+def _refresh_client(on_token, *, stop_in_exchange: bool = False):
+    """A refresh-grant client with no access token yet: the turn's first
+    attempt has to renew. Records every request path."""
+
+    paths: list[str] = []
+    box: list = [None]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == _TOKEN_PATH:
+            if stop_in_exchange:
+                box[0].begin_shutdown()
+            return on_token(request) if callable(on_token) else on_token
+        if request.url.path == _CAPS:
+            return _caps(240.0)
+        return _ok()
+
+    client = FaultMavenClient(
+        "http://test", refresh_token="rt-1", derive_attempt_timeout=True
+    )
+    client._http = httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler))
+    FakeClock().install(client)
+    box[0] = client
+    return client, paths
+
+
+def _token_pair() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"access_token": "at-1", "refresh_token": "rt-2",
+              "token_type": "bearer", "expires_in": 900},
+    )
+
+
+def _turn_posts(paths: list[str]) -> list[str]:
+    return [p for p in paths if p.endswith("/turns")]
+
+
+def test_shutdown_during_the_token_exchange_sends_no_turn():
+    """The renewal holds its lock across a request; shutdown beginning inside it
+    must not let the first attempt out after it."""
+
+    client, paths = _refresh_client(_token_pair(), stop_in_exchange=True)
+    with pytest.raises(FaultMavenError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert paths == [_CAPS, _TOKEN_PATH]
+    assert _turn_posts(paths) == []
+    assert client._default.refresh_token == "rt-2"  # the rotation still landed
+    _assert_not_started(err)
+
+
+def test_shutdown_during_the_token_exchange_tells_the_thread_to_resend():
+    from tests.test_turn_recovery import _Slack, _Store
+
+    client, paths = _refresh_client(_token_pair(), stop_in_exchange=True)
+    _turn.begin_shutdown()  # the app's shutdown sets both; the client's lands mid-exchange
+    slack = _Slack()
+    _turn.run_turn_and_post(
+        slack, client, _Store(case_id="c1"),
+        channel="C1", thread_ts="TS1", team_id="T1", text="why",
+        idempotency_key=_KEY,
+    )
+    assert _turn_posts(paths) == []
+    assert [u["text"] for u in slack.updates] == [_turn.RESTARTING_TEXT]
+
+
+def _connect_refused(request):
+    raise httpx.ConnectError("refused", request=request)
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected", "message"),
+    [
+        (_connect_refused, FaultMavenError, "token refresh request failed"),
+        (httpx.Response(500), FaultMavenError, "token refresh failed"),
+        (httpx.Response(401, json={"detail": "invalid_grant"}),
+         FaultMavenCredentialError, "rejected the refresh credential"),
+    ],
+    ids=["unreachable", "server-error", "rejected"],
+)
+def test_a_failed_first_token_surfaces_as_it_did_from_the_first_attempt(
+    answer, expected, message
+):
+    """Fetching the first attempt's token before the loop changes when it is
+    fetched, not what a failure looks like: the same class and message, and no
+    turn POST, as when ``_post`` fetched it."""
+
+    client, paths = _refresh_client(answer)
+    with pytest.raises(FaultMavenError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert isinstance(err.value, expected)
+    assert isinstance(err.value, FaultMavenCredentialError) is (
+        expected is FaultMavenCredentialError
+    )
+    assert not isinstance(err.value, (FaultMavenTimeoutError, FaultMavenNothingCommittedError))
+    assert message in str(err.value)
+    assert _turn_posts(paths) == []
+
+
+def test_a_turn_after_a_token_fetch_reuses_it():
+    client, paths = _refresh_client(_token_pair())
+    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert paths == [_CAPS, _TOKEN_PATH, "/api/v1/cases/c1/turns"]  # one exchange
+
+
+def test_no_case_is_created_once_shutdown_began():
+    from tests.test_turn_recovery import _Slack, _Store
+
+    paths: list[str] = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"case_id": "case_1"})
+
+    client = FaultMavenClient("http://test", dev_login_username="svc")
+    client._http = httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler))
+    client.begin_shutdown()
+    with pytest.raises(FaultMavenError) as err:
+        client.create_case(title=None, team_id="T1")
+    assert paths == []  # not even the dev-login
+    _assert_not_started(err)
+
+    # End to end: no case, so no thread mapping to orphan, and the placeholder
+    # becomes the restart notice.
+    store, slack = _Store(), _Slack()
+    _turn.run_turn_and_post(
+        slack, client, store,
+        channel="C1", thread_ts="TS1", team_id="T1", text="why",
+        idempotency_key=_KEY,
+    )
+    assert paths == []
+    assert store.case_id is None
+    assert [u["text"] for u in slack.updates] == [_turn.RESTARTING_TEXT]
 
 
 # -- R5: the pins in Settings ----------------------------------------------------------

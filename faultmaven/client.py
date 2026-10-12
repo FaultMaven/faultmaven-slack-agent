@@ -808,8 +808,9 @@ class FaultMavenClient:
         one), but none re-sends after it and a wait between attempts ends at
         once. The turn then reports the timeout, so its thread is told it may
         have gone through rather than left at "Working…". A turn that has not
-        sent its first attempt yet sends nothing: it is refused, and its thread
-        is told to resend in a minute (:meth:`_refuse_if_stopping`).
+        sent its first attempt yet sends nothing and opens no case: it is
+        refused, and its thread is told to resend in a minute
+        (:meth:`_refuse_if_stopping`).
 
         It also stops the credential keepalive, so no renewal it would start
         can run into the drain: a rotation SIGKILLed after the grace period
@@ -2150,6 +2151,7 @@ class FaultMavenClient:
         passing the wrong one is a tenancy error, not a labelling one.
         """
 
+        self._refuse_if_stopping()
         cred = self._credential_for(team_id)
         body: dict[str, Any] = {"title": title}
         if initial_message is not None:
@@ -2301,12 +2303,20 @@ class FaultMavenClient:
 
         cred = self._credential_for(team_id)
         headers = {"Idempotency-Key": idempotency_key}
-        # Before the capabilities probe and again after it (the probe can take
-        # its own timeout): see :meth:`_refuse_if_stopping`.
+        # Checked before the capabilities probe, and again after the probe and
+        # the token, either of which can take a request's timeout; see
+        # :meth:`_refuse_if_stopping`.
         self._refuse_if_stopping()
         attempt_seconds, recovery_seconds = self.turn_timing()
-        self._refuse_if_stopping()
         deadline = self._clock() + recovery_seconds
+        # The first attempt's token, fetched here rather than inside ``_post``
+        # so that a renewal or dev-login is behind the check below; ``_post``
+        # then finds it cached. It counts against the bound (``deadline`` is
+        # already set), and a failure surfaces as it did from the first
+        # attempt: token acquisition raises only FaultMavenError, which that
+        # attempt never caught.
+        self._current_token(cred)
+        self._refuse_if_stopping()
         # The last attempt whose outcome is unknown, raised if the loop ends
         # without an answer. None until the first such attempt: before it, a
         # failure that never reached the backend is safe to report as retryable.
@@ -2519,13 +2529,17 @@ class FaultMavenClient:
         """Refuse to START a turn once shutdown has begun.
 
         :meth:`begin_shutdown` stops re-sends at an attempt boundary, but a turn
-        still doing its pre-attempt work at that moment (the case create, the
-        token, the capabilities probe) would otherwise send its first attempt
-        into the drain, which outlasts only an attempt already in flight: the
-        kill would land mid-turn and strand the thread's placeholder. Nothing
-        has been sent, so nothing can have committed, and this is a plain
-        :class:`FaultMavenError`, never the timeout's "may have gone through":
-        the surface answers it with "restarting, resend it in a minute".
+        still doing its pre-attempt work at that moment would otherwise send its
+        first attempt into the drain, which outlasts only an attempt already in
+        flight: the kill would land mid-turn and strand the thread's
+        placeholder. So this runs at the top of :meth:`create_case` (no case
+        is opened for a turn that would be refused), and in
+        :meth:`submit_turn` before the capabilities probe and again after the
+        probe and the first attempt's token, just before that attempt is sent.
+        Nothing has been sent, so nothing can have committed, and this is a
+        plain :class:`FaultMavenError`, never the timeout's "may have gone
+        through": the surface answers it with "restarting, resend it in a
+        minute".
         """
 
         if self._stopping.is_set():
