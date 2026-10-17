@@ -88,12 +88,15 @@ jobs:
         if: github.ref == 'refs/heads/main' && github.repository != 'FaultMaven/faultmaven-slack-agent'
         run: echo "::warning::Not the canonical repo — skipping enterprise-infra image queue update (expected on forks)."
 
+      # Checkout enterprise-infra's image-queue branch, which holds the image
+      # queue (infra#408): the queue lives on its own branch, which needs no
+      # ruleset bypass to push.
       - name: Checkout enterprise-infra
         if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
         uses: actions/checkout@v6
         with:
           repository: FaultMaven/faultmaven-enterprise-infra
-          ref: main
+          ref: image-queue
           token: ${{ steps.infra-token.outputs.token }}
           path: enterprise-infra
 
@@ -142,16 +145,16 @@ jobs:
           Workflow: ${{ github.workflow }}"
 
           # Push with rebase-retry: several service repos push queue commits to
-          # enterprise-infra main, so a concurrent publish can move the branch out
-          # from under us. Bare push would fail non-fast-forward and silently strand
-          # the tag. (Mirrors ci-snippets/update-image-queue.yaml.)
+          # enterprise-infra's image-queue branch, so a concurrent publish can move
+          # the branch out from under us. Bare push would fail non-fast-forward and
+          # silently strand the tag. (Mirrors ci-snippets/update-image-queue.yaml.)
           for attempt in 1 2 3 4; do
-            if git push origin main; then
+            if git push origin image-queue; then
               echo "✓ Updated image queue: ${TAG}"
               exit 0
             fi
-            echo "Push failed (attempt ${attempt}/4); rebasing on latest main and retrying…"
-            git pull --rebase origin main
+            echo "Push failed (attempt ${attempt}/4); rebasing on latest image-queue and retrying…"
+            git pull --rebase origin image-queue
             apply_update
             git diff --cached --quiet || git commit --amend --no-edit
             sleep $((attempt * 2))
