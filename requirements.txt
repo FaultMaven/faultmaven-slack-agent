@@ -20,7 +20,7 @@ sqlalchemy[asyncio]==2.1.4
 psycopg2-binary==2.9.13
 
 # Settings / validation
-pydantic==2.13.5
+pydantic==2.14.0
 pydantic-settings==2.15.0
 
 # Sync HTTP client for the FaultMaven core API (kept sync to match Bolt's
