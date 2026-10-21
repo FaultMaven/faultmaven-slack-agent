@@ -161,6 +161,7 @@ def complete_bind(
                 "not store its credential — so it cannot be used yet, and "
                 "re-installing will not fix it. Ask a FaultMaven administrator "
                 "to re-issue the workspace credential.",
+                browser_safe=True,
             ) from exc
 
         # The client caches a credential per workspace, and a re-bind replaces
@@ -198,25 +199,26 @@ def complete_bind(
             )
 
 
-#: Bind failures whose message is written for a browser. Every other
-#: ``WorkspaceBindError`` embeds up to 300 characters of the backend's raw
-#: response — useful in a log, wrong on a page, and capable of naming another
-#: tenant on the 409.
-_BROWSER_SAFE_BIND_STATUSES = frozenset({403, 503})
-
-
 def bind_failure_message(exc: Exception) -> str:
     """What to show the admin in the browser when a bind fails.
 
     Deliberately says what to do next rather than what went wrong internally:
     the reader is an administrator in a browser, not an operator with logs. The
     detail is not lost — the caller logs the exception itself.
+
+    A bind failure's own message is shown only when its raise site declared it
+    written for a browser (``page_message``). Every other one may carry library
+    or backend text, so it gets fixed text here. The exception's string is never
+    read: that would put whatever it carries back on the page.
     """
 
     if isinstance(exc, WorkspaceBindError):
-        if exc.status_code in _BROWSER_SAFE_BIND_STATUSES or exc.status_code == 0:
-            return str(exc)
+        if exc.page_message is not None:
+            return exc.page_message
         if exc.status_code == 409:
+            # Its message embeds up to 300 characters of the backend's raw
+            # response, which on a cross-tenant conflict can name another
+            # tenant: right for the log, wrong on a page.
             return (
                 "This Slack workspace is already connected to FaultMaven. If "
                 "that is not the connection you expect, a FaultMaven "

@@ -24,6 +24,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 
@@ -33,11 +34,12 @@ import app as app_module
 from binding import (
     InstallerAuthority,
     authorize_url,
+    bind_failure_message,
     code_challenge_for,
     complete_bind,
     installer_authority,
 )
-from faultmaven import WorkspaceBindError, WorkspaceBinding
+from faultmaven import FaultMavenClient, WorkspaceBindError, WorkspaceBinding
 from pending_binds import BIND_COOKIE_NAME, PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
 
@@ -485,6 +487,8 @@ def test_a_local_store_failure_after_the_server_bind_is_reported_as_final(tmp_pa
     message = str(caught.value)
     assert "re-installing will not fix it" in message
     assert "re-issue" in message
+    # Written for the admin, so the page shows it as raised.
+    assert bind_failure_message(caught.value) == message
     # And the borrowed admin authority is still given back.
     assert ("admin-refresh", "refresh_token") in fm.revoked
 
@@ -506,6 +510,108 @@ def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
     assert "ent-someone-else" not in message
     assert "Their Secret Project" not in message
     assert "already connected" in message
+
+
+#: Stands in for whatever a library or the backend puts in an error: a cluster
+#: hostname, a port, a response body. None of it is for a browser.
+SENTINEL = "SENTINEL-fm-internal.svc.cluster.local:8090"
+TOKEN_PATH = "/api/v1/auth/oauth/token"
+BIND_PATH = "/api/v1/admin/integrations/slack/workspaces"
+
+
+def _refused_connection(request):
+    raise httpx.ConnectError(f"{SENTINEL} refused", request=request)
+
+
+def _timed_out(request):
+    raise httpx.ReadTimeout(f"{SENTINEL} read timeout", request=request)
+
+
+def _tokens(request):
+    return httpx.Response(
+        200, json={"access_token": "admin-at", "refresh_token": "admin-rt"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("on_token", "on_bind", "failed_at"),
+    [
+        pytest.param(_refused_connection, None, TOKEN_PATH, id="exchange-unreachable"),
+        pytest.param(
+            lambda r: httpx.Response(200, text=f"<html>{SENTINEL}</html>"),
+            None,
+            TOKEN_PATH,
+            id="exchange-non-json",
+        ),
+        pytest.param(_tokens, _timed_out, BIND_PATH, id="bind-unreachable"),
+        pytest.param(
+            lambda r: httpx.Response(403, json={"detail": SENTINEL}),
+            None,
+            TOKEN_PATH,
+            id="exchange-403",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(503, json={"detail": SENTINEL}),
+            None,
+            TOKEN_PATH,
+            id="exchange-503",
+        ),
+    ],
+)
+def test_the_bind_page_shows_no_library_or_backend_text(
+    bind_client, tmp_path, monkeypatch, on_token, on_bind, failed_at
+):
+    """Each of these raise sites puts an ``httpx`` error, a JSON decode error or
+    the backend's body into its message. That belongs in the log. The page
+    shows fixed text, because none of these sites wrote its message for a
+    browser.
+
+    Driven through the real client and the real ``complete_bind``: a
+    hand-built exception would prove the formatter, not the raise sites."""
+    import web
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == TOKEN_PATH:
+            return on_token(request)
+        if request.url.path == BIND_PATH:
+            return on_bind(request)
+        return httpx.Response(200)  # the revokes in complete_bind's finally
+
+    def real_complete(*, fm, workspace_credentials, record, code, redirect_uri):
+        client = FaultMavenClient("http://test")
+        client._http = httpx.Client(
+            base_url="http://test", transport=httpx.MockTransport(handler)
+        )
+        return complete_bind(
+            fm=client, workspace_credentials=workspace_credentials,
+            record=record, code=code, redirect_uri=redirect_uri,
+        )
+
+    monkeypatch.setattr(web, "complete_bind", real_complete)
+    pending = PendingBindStore(create_engine(f"sqlite:///{tmp_path / 'oauth.db'}"))
+    record = open_bind(pending, team_id="T-LEAK")
+
+    bind_client.cookies.set(BIND_COOKIE_NAME, record.bind_id)
+    resp = bind_client.get(
+        "/faultmaven/callback", params={"code": "good-code", "state": record.state}
+    )
+
+    assert resp.status_code == 200
+    assert failed_at in seen, "the failure came from the real client"
+    assert SENTINEL not in resp.text
+    assert "Expecting value" not in resp.text  # json's decode error
+    assert "could not connect this workspace" in resp.text
+
+
+def test_a_bind_failure_whose_raise_site_vouched_for_nothing_shows_fixed_text():
+    """Fail closed: a raise site that declares nothing gets fixed text, whatever
+    its status. The default status 0 used to mean "show it verbatim"."""
+    page = bind_failure_message(WorkspaceBindError("internal detail"))
+
+    assert "internal detail" not in page
 
 
 def test_the_consent_scope_names_what_the_grant_actually_does():

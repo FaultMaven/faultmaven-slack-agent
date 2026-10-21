@@ -36,6 +36,7 @@ import httpx
 import pytest
 from sqlalchemy import create_engine
 
+from binding import bind_failure_message
 from faultmaven.client import (
     FaultMavenClient,
     FaultMavenCredentialError,
@@ -1099,16 +1100,20 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
 
 
 @pytest.mark.parametrize(
-    ("status", "fragment", "retryable"),
+    ("status", "fragment", "retryable", "page"),
     [
-        (403, "connect a workspace", False),
-        (409, "already bound", False),
-        (503, "not configured", True),
-        (500, "refused the bind", True),
-        (400, "refused the bind", False),
+        # ``page`` is what the bind page shows: None means the message itself,
+        # which only a raise site that wrote it for the admin may ask for.
+        (403, "connect a workspace", False, None),
+        (409, "already bound", False, "already connected"),
+        (503, "not configured", True, None),
+        (500, "refused the bind", True, "could not connect this workspace"),
+        (400, "refused the bind", False, "could not connect this workspace"),
     ],
 )
-def test_each_bind_refusal_is_typed_and_advises_correctly(status, fragment, retryable):
+def test_each_bind_refusal_is_typed_and_advises_correctly(
+    status, fragment, retryable, page
+):
     """`retryable` decides whether a person is told to try again — wrong on the
     403 (the likeliest failure) would send an admin round a loop forever."""
     client = bind_client_for(
@@ -1123,6 +1128,12 @@ def test_each_bind_refusal_is_typed_and_advises_correctly(status, fragment, retr
     assert fragment in str(caught.value)
     assert caught.value.status_code == status
     assert caught.value.retryable is retryable
+    shown = bind_failure_message(caught.value)
+    if page is None:
+        assert shown == str(caught.value)
+    else:
+        assert page in shown
+        assert "because" not in shown  # the backend's body stays in the log
 
 
 @pytest.mark.parametrize("missing", ["refresh_token", "team_id"])
