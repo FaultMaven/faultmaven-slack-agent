@@ -497,8 +497,6 @@ def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
     """`bind_workspace` embeds up to 300 chars of the backend's raw response,
     which on a cross-tenant conflict can name another tenant. That belongs in
     the log, not in a browser."""
-    from binding import bind_failure_message
-
     exc = WorkspaceBindError(
         "This Slack workspace is already bound elsewhere: enterprise "
         "ent-someone-else team 'Their Secret Project'",
@@ -545,6 +543,12 @@ def _tokens(request):
         ),
         pytest.param(_tokens, _timed_out, BIND_PATH, id="bind-unreachable"),
         pytest.param(
+            lambda r: httpx.Response(200, json={"refresh_token": "admin-rt"}),
+            None,
+            TOKEN_PATH,
+            id="exchange-no-access-token",
+        ),
+        pytest.param(
             lambda r: httpx.Response(403, json={"detail": SENTINEL}),
             None,
             TOKEN_PATH,
@@ -582,6 +586,7 @@ def test_the_bind_page_shows_no_library_or_backend_text(
 
     def real_complete(*, fm, workspace_credentials, record, code, redirect_uri):
         client = FaultMavenClient("http://test")
+        client._http.close()
         client._http = httpx.Client(
             base_url="http://test", transport=httpx.MockTransport(handler)
         )
@@ -603,6 +608,7 @@ def test_the_bind_page_shows_no_library_or_backend_text(
     assert failed_at in seen, "the failure came from the real client"
     assert SENTINEL not in resp.text
     assert "Expecting value" not in resp.text  # json's decode error
+    assert "access_token" not in resp.text  # the client's own wording
     assert "could not connect this workspace" in resp.text
 
 
