@@ -434,14 +434,26 @@ class WorkspaceBindError(FaultMavenError):
     ``ORG_MANAGE_SETTINGS`` (the second because it creates a Team), and an admin
     holding only the first completes the OAuth consent happily and is refused
     here. That path has to be told what is wrong, not offered a retry.
+
+    ``browser_safe`` is declared by the raise site, never inferred: True means
+    the message was written for the admin in a browser and carries no backend
+    or library text. Only then is it kept as ``page_message``, the text the bind
+    page may show; otherwise ``page_message`` is None and the page shows fixed
+    text. ``str()`` is the full message either way, for the log.
     """
 
     def __init__(
-        self, message: str, *, status_code: int = 0, retryable: bool = False
+        self,
+        message: str,
+        *,
+        status_code: int = 0,
+        retryable: bool = False,
+        browser_safe: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.page_message = message if browser_safe else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2025,6 +2037,7 @@ class FaultMavenClient:
                 "connect a workspace. Ask a FaultMaven administrator to do it, "
                 "or to grant you the permission.",
                 status_code=403,
+                browser_safe=True,
             )
         if resp.status_code == 409:
             raise WorkspaceBindError(
@@ -2038,6 +2051,7 @@ class FaultMavenClient:
                 "workspace cannot be bound yet.",
                 status_code=503,
                 retryable=True,
+                browser_safe=True,
             )
         if resp.status_code >= 400:
             raise WorkspaceBindError(
