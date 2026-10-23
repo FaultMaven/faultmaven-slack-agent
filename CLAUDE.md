@@ -26,8 +26,9 @@ python app.py                              # SLACK_TRANSPORT=socket (default) or
   a shared `SLACK_DATABASE_URL` or a copy of a running agent's credential store.
 
 CI (`ci.yml`) runs lint, contract drift and test; the no-push Docker build
-`needs: [lint, test]` only. `publish-docker.yml` publishes to GHCR after CI
-passes on `main`, and on a `v*.*.*` tag or manual dispatch without CI. A PR is
+`needs: [lint, test]` only. `publish-docker.yml` publishes to GHCR the commit
+CI passed on a push to `main`; a `v*.*.*` tag or a manual dispatch publishes
+only a commit with such a green push run. A PR is
 done when its check conclusions are green, not when local tests pass.
 
 ## Layout
