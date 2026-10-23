@@ -21,7 +21,7 @@ psycopg2-binary==2.9.13
 
 # Settings / validation
 pydantic==2.14.1
-pydantic-settings==2.15.0
+pydantic-settings==2.16.1
 
 # Sync HTTP client for the FaultMaven core API (kept sync to match Bolt's
 # synchronous listener model — no async/sync bridging in the hot path).
