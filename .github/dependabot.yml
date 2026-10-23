@@ -31,3 +31,27 @@ updates:
           - "*"
         update-types:
           - "patch"
+
+  # Every action in .github/workflows/ is pinned to a commit sha, as in
+  # FaultMaven/faultmaven#2185. Dependabot raises no security alert for an
+  # action pinned that way, so this entry is the only signal that one has a
+  # new release, fixes included. It updates the sha and the version comment
+  # together. At most two pull requests a week: majors are grouped apart, so a
+  # breaking major cannot hold back a patch.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      actions-major:
+        patterns: ["*"]
+        update-types: ["major"]
+    commit-message:
+      prefix: "chore(deps)"
+    # No `labels:`. A named label that does not exist in the repository is
+    # silently dropped, and this repository has no `dependencies` label;
+    # left unset, Dependabot creates and applies its defaults
+    # (`dependencies`, `github_actions`).
