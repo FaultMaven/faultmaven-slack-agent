@@ -115,10 +115,13 @@ def complete_bind(
     workspace consents successfully and is refused here).
     """
 
-    access, refresh = fm.exchange_authorization_code(
-        code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
-    )
+    access = refresh = ""
     try:
+        access, refresh = fm.exchange_authorization_code(
+            code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
+        )
+        if not access:
+            raise WorkspaceBindError("code exchange returned no access_token")
         binding = fm.bind_workspace(
             admin_access_token=access,
             slack_team_id=record.team_id,

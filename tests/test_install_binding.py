@@ -266,6 +266,44 @@ def test_the_admin_tokens_are_revoked_even_when_the_bind_is_refused(tmp_path):
     assert creds.get("T-ATTACKER") is None, "a refused bind stores no credential"
 
 
+def test_a_refresh_only_exchange_revokes_the_issued_refresh_token():
+    """A partial OAuth response still goes through the cleanup boundary."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v1/auth/oauth/token":
+            return httpx.Response(200, json={"refresh_token": "admin-refresh"})
+        if request.url.path == "/api/v1/auth/oauth/revoke":
+            assert b"admin-refresh" in request.content
+            assert b"refresh_token" in request.content
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    client = FaultMavenClient("http://test")
+    client._http.close()
+    client._http = httpx.Client(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    )
+    record = SimpleNamespace(
+        code_verifier="verifier", team_id="T1", team_name="Ops", enterprise_id=""
+    )
+
+    with pytest.raises(WorkspaceBindError, match="no access_token"):
+        complete_bind(
+            fm=client,
+            workspace_credentials=object(),
+            record=record,
+            code="code",
+            redirect_uri="https://slack.example/callback",
+        )
+
+    assert paths == [
+        "/api/v1/auth/oauth/token",
+        "/api/v1/auth/oauth/revoke",
+    ]
+
+
 def test_only_the_service_account_credential_is_persisted(tmp_path):
     """What lands in the store is the workspace account's own token — never the
     admin's."""
