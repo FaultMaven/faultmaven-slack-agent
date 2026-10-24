@@ -1946,6 +1946,9 @@ class FaultMavenClient:
     ) -> tuple[str, str]:
         """Exchange an admin's authorization code for ``(access, refresh)``.
 
+        The access token may be empty when a faulty token endpoint returns only
+        a refresh token; the binding flow validates it inside its cleanup scope.
+
         The verifier is held server-side and sent only here, which is what makes
         a code that leaks (an access log line, a ``Referer``) unredeemable by
         whoever it leaked to.
@@ -1987,8 +1990,6 @@ class FaultMavenClient:
                 f"code exchange returned a non-JSON body: {exc}"
             ) from exc
         access, refresh = body.get("access_token", ""), body.get("refresh_token", "")
-        if not access:
-            raise WorkspaceBindError("code exchange returned no access_token")
         return access, refresh
 
     def bind_workspace(
