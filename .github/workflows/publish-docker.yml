@@ -5,7 +5,8 @@ name: Publish Docker Image
 # commit that run tested. A version tag (v*.*.*) or a manual dispatch publishes
 # only a commit with a green "CI" push run: see "Resolve the commit to publish".
 # Mirrors the faultmaven repo's
-# publish-docker.yml so this app plugs into the same CI → Queue → Promote → CD
+# publish-docker.yml, except where latest and the branch tag move (#130),
+# so this app plugs into the same CI → Queue → Promote → CD
 # pipeline (no kubectl in this repo; the image is deployed by
 # faultmaven-enterprise-infra via promote-images + cd-pipeline).
 
@@ -57,8 +58,9 @@ jobs:
       # only a commit with a green "CI" run from a push.
       #
       # The moving tags (latest and the branch name) follow only the branch's
-      # current tip, because CI runs can finish out of order. The sha- tag and
-      # the image queue (which orders itself, below) take every green commit.
+      # current tip, because CI runs can finish out of order: see "Move latest
+      # and the branch tag". The sha- tag and the image queue (which orders
+      # itself, below) take every green commit.
       - name: Resolve the commit to publish
         id: target
         env:
@@ -75,21 +77,9 @@ jobs:
               exit 1
             fi
           fi
-          # A failed lookup leaves the moving tags where they are; it does not
-          # fail the publish.
-          moving=false
-          if [[ $GITHUB_REF == refs/heads/* ]]; then
-            tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)" || tip=""
-            if [ "$tip" = "$SHA" ]; then
-              moving=true
-            else
-              echo "::notice::${GITHUB_REF_NAME} is at '${tip}', not ${SHA}; publishing the sha- tag only"
-            fi
-          fi
           {
             echo "sha=${SHA}"
             echo "short=${SHA:0:7}"
-            echo "moving=${moving}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
@@ -113,20 +103,23 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-          # Not `type=sha`, and a revision label of our own: metadata-action
-          # reads both from github.sha, which is not the commit built on a
-          # workflow_run. A custom label replaces the generated one.
+          # Not `type=sha`, and a revision label and annotation of our own:
+          # metadata-action reads all three from github.sha, which is not the
+          # commit built on a workflow_run. A custom label or annotation
+          # replaces the generated one. (`context: git` would read the checkout
+          # instead, but finds no ref for it: one commit, fetched without tags,
+          # on a detached HEAD.)
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && steps.target.outputs.moving == 'true' }}
-            type=ref,event=branch,enable=${{ steps.target.outputs.moving == 'true' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=sha-${{ steps.target.outputs.short }}
           labels: |
             org.opencontainers.image.revision=${{ steps.target.outputs.sha }}
+          annotations: |
+            org.opencontainers.image.revision=${{ steps.target.outputs.sha }}
           # The default, latest=auto, adds `latest` to every non-prerelease
           # semver tag, so tagging an older green commit would move :latest
-          # back to it. `latest` comes only from the raw line above.
+          # back to it. `latest` moves only in "Move latest and the branch tag".
           flavor: |
             latest=false
 
@@ -175,3 +168,44 @@ jobs:
           service: faultmaven-slack-agent
           sha: ${{ steps.target.outputs.sha }}
           token: ${{ steps.infra-token.outputs.token }}
+
+      # Points latest and the branch tag at this build only if its commit is
+      # the branch tip now (#130). Checked at job start, the answer went stale
+      # while the image built: a newer commit's publish could finish in that
+      # time, and this run's push then moved both tags back to an older one.
+      # Checked here, a newer commit gets in between only if its CI run, over
+      # a minute, finishes while this step runs, which takes seconds unless
+      # the registry stalls it. Nothing closes that gap entirely: a registry
+      # offers no compare-and-set on a tag.
+      #
+      # Deploys pin sha- tags through the image queue, so these two tags are
+      # informational. This step runs whatever the queue steps did, and never
+      # fails the job: a red publish invites a re-run, which would push the
+      # sha- tag the queue already recorded again, under a new digest. A
+      # failed lookup leaves the tags where they are.
+      - name: Move latest and the branch tag
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && startsWith(github.ref, 'refs/heads/') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.target.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          BUILT_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)" || tip=""
+          if [ "$tip" != "$SHA" ]; then
+            echo "::notice::${GITHUB_REF_NAME} is at '${tip}', not ${SHA}; leaving latest and the branch tag where they are"
+            exit 0
+          fi
+          # The image name as metadata-action wrote it (lowercased), and the
+          # branch tag named the way its type=ref,event=branch names one.
+          image="$(head -n 1 <<< "$BUILT_TAGS")"
+          image="${image%:*}"
+          args=(--tag "${image}:$(sed -E 's/[^a-zA-Z0-9._-]+/-/g' <<< "$GITHUB_REF_NAME")")
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            args+=(--tag "${image}:latest")
+          fi
+          # Without --prefer-index=false, a single-manifest source (a build
+          # with no attestation) is wrapped in a new index under a new digest.
+          docker buildx imagetools create --prefer-index=false "${args[@]}" "${image}@${DIGEST}"
