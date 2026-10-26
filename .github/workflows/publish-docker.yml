@@ -57,8 +57,9 @@ jobs:
       # only a commit with a green "CI" run from a push.
       #
       # The moving tags (latest and the branch name) follow only the branch's
-      # current tip, because CI runs can finish out of order. The sha- tag and
-      # the image queue (which orders itself, below) take every green commit.
+      # current tip, because CI runs can finish out of order: see "Move latest
+      # and the branch tag". The sha- tag and the image queue (which orders
+      # itself, below) take every green commit.
       - name: Resolve the commit to publish
         id: target
         env:
@@ -75,21 +76,9 @@ jobs:
               exit 1
             fi
           fi
-          # A failed lookup leaves the moving tags where they are; it does not
-          # fail the publish.
-          moving=false
-          if [[ $GITHUB_REF == refs/heads/* ]]; then
-            tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)" || tip=""
-            if [ "$tip" = "$SHA" ]; then
-              moving=true
-            else
-              echo "::notice::${GITHUB_REF_NAME} is at '${tip}', not ${SHA}; publishing the sha- tag only"
-            fi
-          fi
           {
             echo "sha=${SHA}"
             echo "short=${SHA:0:7}"
-            echo "moving=${moving}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
@@ -113,20 +102,23 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-          # Not `type=sha`, and a revision label of our own: metadata-action
-          # reads both from github.sha, which is not the commit built on a
-          # workflow_run. A custom label replaces the generated one.
+          # Not `type=sha`, and a revision label and annotation of our own:
+          # metadata-action reads all three from github.sha, which is not the
+          # commit built on a workflow_run. A custom label or annotation
+          # replaces the generated one. (`context: git` would read the checkout
+          # instead, but finds no ref for it: one commit, fetched without tags,
+          # on a detached HEAD.)
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && steps.target.outputs.moving == 'true' }}
-            type=ref,event=branch,enable=${{ steps.target.outputs.moving == 'true' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=sha-${{ steps.target.outputs.short }}
           labels: |
             org.opencontainers.image.revision=${{ steps.target.outputs.sha }}
+          annotations: |
+            org.opencontainers.image.revision=${{ steps.target.outputs.sha }}
           # The default, latest=auto, adds `latest` to every non-prerelease
           # semver tag, so tagging an older green commit would move :latest
-          # back to it. `latest` comes only from the raw line above.
+          # back to it. `latest` moves only in "Move latest and the branch tag".
           flavor: |
             latest=false
 
@@ -175,3 +167,47 @@ jobs:
           service: faultmaven-slack-agent
           sha: ${{ steps.target.outputs.sha }}
           token: ${{ steps.infra-token.outputs.token }}
+
+      # Only `tags` is read from this step: the build pushes none of them.
+      - name: Name the moving tags
+        id: moving
+        if: startsWith(github.ref, 'refs/heads/')
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
+          flavor: |
+            latest=false
+
+      # Points latest and the branch tag at this build only if its commit is
+      # the branch tip now (#130). Checked at job start, the answer went stale
+      # while the image built: a newer commit's publish could finish in that
+      # time, and this run's push then moved both tags back to an older one.
+      # A commit pushed after this check needs its own CI run, over a minute,
+      # before its publish can move them; this step takes seconds. Last, so a
+      # failure here never holds back the image queue. A failed lookup leaves
+      # the tags where they are; it does not fail the publish.
+      - name: Move latest and the branch tag
+        if: startsWith(github.ref, 'refs/heads/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.target.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.moving.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)" || tip=""
+          if [ "$tip" != "$SHA" ]; then
+            echo "::notice::${GITHUB_REF_NAME} is at '${tip}', not ${SHA}; leaving latest and the branch tag where they are"
+            exit 0
+          fi
+          args=()
+          mapfile -t names <<< "$TAGS"
+          for name in "${names[@]}"; do
+            args+=(--tag "$name")
+          done
+          docker buildx imagetools create "${args[@]}" \
+            "${REGISTRY_GHCR}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}@${DIGEST}"
