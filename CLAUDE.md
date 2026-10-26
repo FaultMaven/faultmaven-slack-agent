@@ -28,7 +28,9 @@ python app.py                              # SLACK_TRANSPORT=socket (default) or
 CI (`ci.yml`) runs lint, contract drift and test; the no-push Docker build
 `needs: [lint, test]` only. `publish-docker.yml` publishes to GHCR the commit
 CI passed on a push to `main`; a `v*.*.*` tag or a manual dispatch publishes
-only a commit with such a green push run. A PR is
+only a commit with such a green push run. `workflow-lint.yml` runs actionlint
+(FaultMaven/ci-actions `lint-workflows`) on any change under
+`.github/workflows/`; keep it byte-identical to core's copy. A PR is
 done when its check conclusions are green, not when local tests pass.
 
 ## Layout

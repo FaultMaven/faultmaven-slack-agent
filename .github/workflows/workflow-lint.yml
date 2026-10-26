@@ -1,0 +1,56 @@
+name: Workflow Lint
+
+# =============================================================================
+# WORKFLOW SCHEMA + EXPRESSION + SHELL LINT
+# =============================================================================
+# YAML parsing proves a workflow is well-formed. It does not know that a
+# `needs:` target exists, that a context or an expression is valid, or that a
+# `run:` script is sound. actionlint does.
+#
+# It does NOT check a remote action's inputs or outputs here. actionlint knows
+# those only for a local action (`uses: ./...`, whose action.yml it reads) or
+# for a remote action pinned by a tag it has a record of. Every remote action
+# in this fleet is pinned by commit sha, so a misspelt `with:` key or a
+# `steps.<id>.outputs.<name>` that action never emits passes it. Check those
+# against the action's action.yml at the pinned sha.
+#
+# faultmaven-enterprise-infra has had this gate since infra#177; the service
+# repositories never did. Its first run, in faultmaven-dashboard while actions
+# were still pinned by tag, found `steps.meta.outputs.digest` — a provenance
+# log line that had printed an EMPTY digest for as long as it existed, because
+# docker/metadata-action does not emit `digest` at all. Nothing was wrong
+# enough to fail a build, which is exactly why nobody noticed.
+#
+# Blocking, not `continue-on-error`. An advisory lint whose green means nothing
+# is worse than no lint.
+#
+# The lint itself is FaultMaven/ci-actions `lint-workflows`: the actionlint
+# release, its checksum and the `-S warning` shellcheck threshold live there.
+# This file chooses when it runs, and on what runner: linux/amd64, the build
+# the action downloads. Keep the three service-repo copies of this file
+# byte-identical, as with the other fleet-wide lints.
+# =============================================================================
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: Lint workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run actionlint
+        uses: FaultMaven/ci-actions/lint-workflows@4b5989bc5f9e1fcd5eee69cf18cfa0854a6f2894 # v1.2.0
