@@ -5,7 +5,8 @@ name: Publish Docker Image
 # commit that run tested. A version tag (v*.*.*) or a manual dispatch publishes
 # only a commit with a green "CI" push run: see "Resolve the commit to publish".
 # Mirrors the faultmaven repo's
-# publish-docker.yml, except where latest and the branch tag move (#130),
+# publish-docker.yml; latest and the branch tag move only in the shared
+# FaultMaven/ci-actions/move-branch-tags step (FaultMaven/faultmaven#2347),
 # so this app plugs into the same CI → Queue → Promote → CD
 # pipeline (no kubectl in this repo; the image is deployed by
 # faultmaven-enterprise-infra via promote-images + cd-pipeline).
@@ -163,49 +164,33 @@ jobs:
       # never reaches the action.
       - name: Update image queue
         if: github.ref == 'refs/heads/main' && github.repository == 'FaultMaven/faultmaven-slack-agent'
-        uses: FaultMaven/ci-actions/update-image-queue@4bf2cb149a846580d86ec891504b255d49e07e2d # v1.0.0
+        uses: FaultMaven/ci-actions/update-image-queue@d01fb8619a0df2b2f71ef8e7e807b9373561b722 # v1.3.0
         with:
           service: faultmaven-slack-agent
           sha: ${{ steps.target.outputs.sha }}
           token: ${{ steps.infra-token.outputs.token }}
 
-      # Points latest and the branch tag at this build only if its commit is
-      # the branch tip now (#130). Checked at job start, the answer went stale
-      # while the image built: a newer commit's publish could finish in that
-      # time, and this run's push then moved both tags back to an older one.
-      # Checked here, a newer commit gets in between only if its CI run, over
-      # a minute, finishes while this step runs, which takes seconds unless
-      # the registry stalls it. Nothing closes that gap entirely: a registry
-      # offers no compare-and-set on a tag.
+      # Points latest and the branch tag at the pushed digest, only while this
+      # commit is still the branch's tip (#130). The shared step
+      # (FaultMaven/ci-actions/move-branch-tags, FaultMaven/faultmaven#2347)
+      # replaces the inline one this file carried: it re-reads the tip just
+      # before the move, retries a failed lookup or push, and bounds each with
+      # a timeout. Checked at job start instead, the answer went stale while
+      # the image built, and this run's push could move both tags back to an
+      # older commit.
       #
-      # Deploys pin sha- tags through the image queue, so these two tags are
-      # informational. This step runs whatever the queue steps did, and never
-      # fails the job: a red publish invites a re-run, which would push the
-      # sha- tag the queue already recorded again, under a new digest. A
-      # failed lookup leaves the tags where they are.
+      # CD deploys sha- tags through the image queue; these two tags are what
+      # a local pull of :latest or :main gets. This step runs whatever the
+      # queue steps did. A move that fails is retried, then left with a
+      # warning, not a red run: a red publish invites a re-run, which would
+      # push the sha- tag the queue already recorded again, under a new
+      # digest. An invalid input does fail the step: a wiring error, which no
+      # re-run fixes, so the step has no continue-on-error. A ref that is not
+      # a branch (a tag push) moves nothing.
       - name: Move latest and the branch tag
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && startsWith(github.ref, 'refs/heads/') }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.target.outputs.sha }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          BUILT_TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)" || tip=""
-          if [ "$tip" != "$SHA" ]; then
-            echo "::notice::${GITHUB_REF_NAME} is at '${tip}', not ${SHA}; leaving latest and the branch tag where they are"
-            exit 0
-          fi
-          # The image name as metadata-action wrote it (lowercased), and the
-          # branch tag named the way its type=ref,event=branch names one.
-          image="$(head -n 1 <<< "$BUILT_TAGS")"
-          image="${image%:*}"
-          args=(--tag "${image}:$(sed -E 's/[^a-zA-Z0-9._-]+/-/g' <<< "$GITHUB_REF_NAME")")
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            args+=(--tag "${image}:latest")
-          fi
-          # Without --prefer-index=false, a single-manifest source (a build
-          # with no attestation) is wrapped in a new index under a new digest.
-          docker buildx imagetools create --prefer-index=false "${args[@]}" "${image}@${DIGEST}"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: FaultMaven/ci-actions/move-branch-tags@d01fb8619a0df2b2f71ef8e7e807b9373561b722 # v1.3.0
+        with:
+          image: ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          digest: ${{ steps.build.outputs.digest }}
+          sha: ${{ steps.target.outputs.sha }}
