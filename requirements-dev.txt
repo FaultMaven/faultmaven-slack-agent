@@ -1,6 +1,6 @@
 # Dev/test dependencies (install alongside requirements.txt)
 -r requirements.txt
-pytest==9.1.1
+pytest==9.2.0
 # linter — single source of truth; CI's lint job installs this exact pin
 ruff==0.17.2
 # OpenAPI -> Pydantic models for the FaultMaven API contract
