@@ -3,7 +3,17 @@
 
 from __future__ import annotations
 from enum import Enum
-from pydantic import AwareDatetime, BaseModel, EmailStr, Field, RootModel, confloat, conint, constr
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    RootModel,
+    confloat,
+    conint,
+    constr,
+)
 from typing import Any, Literal
 
 
@@ -101,10 +111,9 @@ class AuthSessionCreateRequest(BaseModel):
     )
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
     session_type: constr(min_length=1) | None = Field("troubleshooting", title="Session Type")
-    timeout_minutes: conint(ge=60, le=480) | None = Field(
-        180,
-        description="Session timeout in minutes. Min: 60 (1 hour), Max: 480 (8 hours), Default: 180 (3 hours)",
-        examples=[180, 240, 360],
+    timeout_minutes: int | None = Field(
+        None,
+        description="Ignored. Every session lapses SESSION_TIMEOUT_MINUTES after its last write (the server's setting); the response's timeout_minutes and expires_at report it.",
         title="Timeout Minutes",
     )
 
@@ -168,6 +177,11 @@ class BackendCapabilityFeatures(BaseModel):
         ...,
         description="The org/team management console; same signal as teamSharing.",
         title="Managementconsole",
+    )
+    multiTenant: bool = Field(
+        ...,
+        description="True when this backend runs the multi-tenant provider (TENANT_PROVIDER=multi). Derived from the same setting the KB write policy reads; a client gates operator-only KB writes on it, and treats an absent field as true.",
+        title="Multitenant",
     )
     sso: bool = Field(..., title="Sso")
     teamSharing: bool = Field(
@@ -340,6 +354,51 @@ class CaseUpdateRequest(BaseModel):
     )
     state: CaseState | None = Field(None, description="Updated state (admin only)")
     title: constr(max_length=200) | None = Field(None, description="Updated title", title="Title")
+
+
+class CloseEligibility(Enum):
+    ready = "ready"
+    suggests_alternative = "suggests_alternative"
+    not_eligible = "not_eligible"
+
+
+class ClosureReason(Enum):
+    inquiry_only = "inquiry_only"
+    closed_false_alarm = "closed_false_alarm"
+    resolution_declined = "resolution_declined"
+    solution_deferred = "solution_deferred"
+    closed_rca_infeasible = "closed_rca_infeasible"
+    mitigation_sufficient = "mitigation_sufficient"
+    closed_restatement_held = "closed_restatement_held"
+    closed_insufficient_evidence = "closed_insufficient_evidence"
+
+
+class DatabaseTimeoutsStatus(BaseModel):
+    client_connection_check_interval_seconds: float | None = Field(
+        ...,
+        description="DATABASE_CLIENT_CONNECTION_CHECK_INTERVAL_SECONDS: the server's client_connection_check_interval, set per transaction (opt-in).",
+        title="Client Connection Check Interval Seconds",
+    )
+    command_timeout_seconds: float | None = Field(
+        ...,
+        description="DATABASE_COMMAND_TIMEOUT_SECONDS: how long one PostgreSQL command may take before the client aborts its connection.",
+        title="Command Timeout Seconds",
+    )
+    connect_timeout_seconds: float | None = Field(
+        ...,
+        description="DATABASE_CONNECT_TIMEOUT_SECONDS: how long a new PostgreSQL connection may take to open.",
+        title="Connect Timeout Seconds",
+    )
+    revocation_read_timeout_seconds: float | None = Field(
+        ...,
+        description="REVOCATION_READ_TIMEOUT_SECONDS: the deadline on the database token-revocation read every authenticated request makes; past it the request fails closed with 503 REVOCATION_STATE_UNKNOWN.",
+        title="Revocation Read Timeout Seconds",
+    )
+    statement_timeout_seconds: float | None = Field(
+        ...,
+        description="The server's statement_timeout, set per transaction: the command timeout less DATABASE_STATEMENT_TIMEOUT_MARGIN_SECONDS, so a slow server cancels its own statement before the client gives up.",
+        title="Statement Timeout Seconds",
+    )
 
 
 class DerivedEvidenceSummary(BaseModel):
@@ -552,6 +611,34 @@ class KnowledgeBaseDocument(BaseModel):
     )
 
 
+class KnowledgeIndexingStatus(BaseModel):
+    encoding_for_seconds: float | None = Field(
+        ...,
+        description="How long this process's running KB indexing encode has run; null when none runs.",
+        title="Encoding For Seconds",
+    )
+    host_lock_available: bool = Field(
+        ...,
+        description="False while this process's latest attempt to open or lock the host lock file failed: its KB encodes then run without serialising against the other worker processes of the container.",
+        title="Host Lock Available",
+    )
+    queued: int = Field(
+        ...,
+        description="KB indexing encodes held in this process: the running one and the ones waiting their turn.",
+        title="Queued",
+    )
+    waiting_for_host_lock: bool = Field(
+        ...,
+        description="True while this process's indexing slot is blocked on the host lock, behind another worker process's encode.",
+        title="Waiting For Host Lock",
+    )
+    window_seconds: int = Field(
+        ...,
+        description="INDEX_REQUEST_WINDOW_SECONDS: the seconds a KB upload, update or verify may spend indexing its document. A document that would not fit is refused before anything is written (413 alone, 503 behind other indexing); 0 refuses nothing up front.",
+        title="Window Seconds",
+    )
+
+
 class KnowledgeScope(Enum):
     global_ = "global"
     team = "team"
@@ -723,7 +810,9 @@ class MessageRetrievalDebugInfo(BaseModel):
         ..., description="Time taken for Redis operation", title="Redis Operation Time Ms"
     )
     storage_errors: list[str] | None = Field(
-        None, description="Any storage-related errors encountered", title="Storage Errors"
+        None,
+        description="One entry per failure, as a fixed code and the exception's class name (`CODE: ExceptionClass`, e.g. `MESSAGE_PARSE_FAILED: ValueError`). Codes: `STORAGE_READ_FAILED` (the page could not be read or loaded: a storage error, or a stored row that could not be loaded), `MESSAGE_PARSE_FAILED` (a loaded message could not be converted to the response format). The exception's text is in the server log.",
+        title="Storage Errors",
     )
 
 
@@ -969,6 +1058,12 @@ class ResolutionSummary(BaseModel):
     )
 
 
+class ResolveEligibility(Enum):
+    ready = "ready"
+    needs_info = "needs_info"
+    not_eligible = "not_eligible"
+
+
 class RevokeUserTokensResponse(BaseModel):
     message: str = Field(..., description="Revocation confirmation message", title="Message")
     revoked_before: str = Field(
@@ -1068,6 +1163,10 @@ class SearchRequest(BaseModel):
         title="Similarity Threshold",
     )
     tags: str | None = Field(None, description="Filter by tags (comma-separated)", title="Tags")
+
+
+class SelectableNextState(Enum):
+    closed = "closed"
 
 
 class SessionResponse(BaseModel):
@@ -1394,7 +1493,7 @@ class WorkingConclusionSummary(BaseModel):
 class AdminCaseMetadata(BaseModel):
     case_id: str = Field(..., title="Case Id")
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
-    closure_reason: str | None = Field(..., title="Closure Reason")
+    closure_reason: ClosureReason | None
     created_at: AwareDatetime = Field(..., title="Created At")
     current_turn: int = Field(..., title="Current Turn")
     driver_id: str | None = Field(None, title="Driver Id")
@@ -1478,7 +1577,7 @@ class BodyUploadDocumentApiV1KnowledgeDocumentsPost(BaseModel):
 class CaseDetail(BaseModel):
     case_id: str = Field(..., title="Case Id")
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
-    closure_reason: str | None = Field(..., title="Closure Reason")
+    closure_reason: ClosureReason | None
     created_at: AwareDatetime = Field(..., title="Created At")
     creator_display_name: str | None = Field(None, title="Creator Display Name")
     current_stage: InvestigationStage | None
@@ -1513,7 +1612,7 @@ class CaseDetail(BaseModel):
     turns_without_progress: int = Field(..., title="Turns Without Progress")
     updated_at: AwareDatetime = Field(..., title="Updated At")
     user_id: str = Field(..., title="User Id")
-    valid_next_states: list[str] | None = Field(
+    valid_next_states: list[SelectableNextState] | None = Field(
         None,
         description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
@@ -1543,7 +1642,7 @@ class CaseSearchRequest(BaseModel):
 class CaseSummary(BaseModel):
     case_id: str = Field(..., title="Case Id")
     closed_at: AwareDatetime | None = Field(..., title="Closed At")
-    closure_reason: str | None = Field(..., title="Closure Reason")
+    closure_reason: ClosureReason | None
     created_at: AwareDatetime = Field(..., title="Created At")
     creator_display_name: str | None = Field(None, title="Creator Display Name")
     current_turn: int = Field(
@@ -1572,109 +1671,27 @@ class CaseSummary(BaseModel):
     turns_without_progress: int = Field(..., title="Turns Without Progress")
     updated_at: AwareDatetime = Field(..., title="Updated At")
     user_id: str = Field(..., title="User Id")
-    valid_next_states: list[str] | None = Field(
+    valid_next_states: list[SelectableNextState] | None = Field(
         None,
         description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
 
 
-class CaseUIResponseInquiry(BaseModel):
-    case_id: str = Field(..., description="Case identifier", title="Case Id")
-    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
-    current_turn: conint(ge=0) = Field(
-        ...,
-        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
-        title="Current Turn",
+class DispositionEligibility(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
     )
-    disposition_eligibility: dict[str, str] | None = Field(
-        None,
-        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when the case confirms a resolution (a qualifying causal-absence row and a symptom-absence row at or after the fix), which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
-        title="Disposition Eligibility",
-    )
-    inquiry: InquiryResponseData = Field(..., description="Nested inquiry phase data")
-    investigation_turn: conint(ge=0) | None = Field(
-        None,
-        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
-        title="Investigation Turn",
-    )
-    state: Literal["inquiry"] = Field(
-        "inquiry", description="Always 'inquiry' for this response type", title="State"
-    )
-    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
-    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
-    uploaded_files_count: conint(ge=0) = Field(
-        ..., description="Total files uploaded", title="Uploaded Files Count"
-    )
-    valid_next_states: list[str] | None = Field(
-        None,
-        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
-        title="Valid Next States",
-    )
-
-
-class CaseUIResponseResolved(BaseModel):
-    case_id: str = Field(..., description="Case identifier", title="Case Id")
-    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
-    current_turn: conint(ge=0) = Field(
-        ...,
-        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
-        title="Current Turn",
-    )
-    disposition_eligibility: dict[str, str] | None = Field(
-        None,
-        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when the case confirms a resolution (a qualifying causal-absence row and a symptom-absence row at or after the fix), which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
-        title="Disposition Eligibility",
-    )
-    investigation_turn: conint(ge=0) | None = Field(
-        None,
-        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
-        title="Investigation Turn",
-    )
-    problem_statement: constr(max_length=1000) | None = Field(
-        None,
-        description="Confirmed problem statement carried over from INQUIRY (sourced from case.description).",
-        title="Problem Statement",
-    )
-    problem_verification: ProblemVerificationData | None = Field(
-        None,
-        description="Where the problem statement stood when the case ended, as on the INVESTIGATING response: a case closed as `closed_false_alarm` carries `invalidated` with its `invalidation_finding`, and a statement a revision or an edit changed carries `original_problem_statement`. Null for a case closed from INQUIRY, which confirmed no statement.",
-    )
-    reports_available: list[ReportAvailability] | None = Field(
-        None,
-        description="Available reports (incident report, post-mortem, runbook)",
-        title="Reports Available",
-    )
-    resolution_summary: ResolutionSummary = Field(
-        ..., description="Overall resolution metrics and insights"
-    )
-    resolved_at: AwareDatetime = Field(
-        ..., description="When case was resolved", title="Resolved At"
-    )
-    root_cause: RootCauseSummary = Field(..., description="What caused the problem")
-    solution_applied: SolutionSummary = Field(..., description="Solution that fixed the problem")
-    state: State = Field(
-        ...,
-        description="Case terminal state: 'resolved' (with solution) or 'closed' (without investigation)",
-        title="State",
-    )
-    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
-    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
-    uploaded_files_count: int | None = Field(
-        0, description="Number of uploaded files", title="Uploaded Files Count"
-    )
-    valid_next_states: list[str] | None = Field(
-        None,
-        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
-        title="Valid Next States",
-    )
-    verification_status: SolutionVerificationData = Field(
-        ..., description="How solution effectiveness was verified"
-    )
+    closed: CloseEligibility
+    resolved: ResolveEligibility
 
 
 class EnvConfigStatusResponse(BaseModel):
     auth_mode: str = Field(..., description="'local' or 'oauth'", title="Auth Mode")
+    database_timeouts: DatabaseTimeoutsStatus = Field(
+        ...,
+        description="The bounds in force on a database that stops answering: the PostgreSQL command, connect and statement timeouts the engine was built with, and the deadline on the token-revocation read.",
+    )
     db_backend: str = Field(
         ...,
         description="'sqlite' or 'postgresql' — the dialect of the database engine the running process built; 'not initialized' before it has built one",
@@ -1687,6 +1704,10 @@ class EnvConfigStatusResponse(BaseModel):
     )
     features: dict[str, FeatureStatus] | None = Field(
         None, description="Optional features and their configuration status", title="Features"
+    )
+    knowledge_indexing: KnowledgeIndexingStatus = Field(
+        ...,
+        description="The KB indexing request window, and this process's indexing slot: how many encodes it holds and how long the running one has run.",
     )
     llm_provider: str = Field(..., description="Primary LLM provider name", title="Llm Provider")
     personal_tenant_limits: PersonalTenantLimitsStatus = Field(
@@ -1703,6 +1724,11 @@ class EnvConfigStatusResponse(BaseModel):
         ...,
         description="'redis' or 'fakeredis (inmemory)' — the Redis client the session store actually uses, not the configured one; 'not initialized' before the composition root has set it",
         title="Session Storage",
+    )
+    session_ttl_seconds: int | None = Field(
+        ...,
+        description="The TTL the session store the process built sets on every session write: SESSION_TIMEOUT_MINUTES in seconds, read from the store rather than from settings. A session lapses this long after its last write (creation, resumption, a heartbeat, an update). Null before the composition root has built the store.",
+        title="Session Ttl Seconds",
     )
     timestamp: AwareDatetime = Field(..., title="Timestamp")
     turn_timing: TurnTimingStatus = Field(
@@ -1986,6 +2012,39 @@ class CaseReport(BaseModel):
     version: conint(ge=1, le=5) | None = Field(1, description="Version number", title="Version")
 
 
+class CaseUIResponseInquiry(BaseModel):
+    case_id: str = Field(..., description="Case identifier", title="Case Id")
+    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
+    current_turn: conint(ge=0) = Field(
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
+    )
+    disposition_eligibility: DispositionEligibility | None = Field(
+        None,
+        description="Per-disposition eligibility, ``{resolved, closed}``, both keys always present. ‼ The two keys answer for DIFFERENT audiences: ``closed`` (``CloseEligibility``) gates a user CONTROL — render Close only on ``ready``; ``resolved`` (``ResolveEligibility``) gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution. Each value's meaning is its enum's ``x-enum-descriptions``. ``closed`` reads ``suggests_alternative`` while a resolve proposal is pending, and on a resolvable case whose resolution the user has not declined (a close would become a resolve proposal). A decline stands until a new solution or a new confirmation that the fix held is recorded; nothing else lapses it. A request for what a resolution still needs is not a proposal: it carries no confirmation chips, and Close stays. The exception is a resolvable case on which a check the agent asked for after the fix is unanswered: ``resolved`` reads ``needs_info`` there, and ``closed`` follows the resolvable case's rule above: ``suggests_alternative`` (a close would become a resolve proposal), or ``ready`` while the user's decline of the resolution stands.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
+    )
+    inquiry: InquiryResponseData = Field(..., description="Nested inquiry phase data")
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
+    state: Literal["inquiry"] = Field(
+        "inquiry", description="Always 'inquiry' for this response type", title="State"
+    )
+    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
+    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
+    uploaded_files_count: conint(ge=0) = Field(
+        ..., description="Total files uploaded", title="Uploaded Files Count"
+    )
+    valid_next_states: list[SelectableNextState] | None = Field(
+        None,
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
+        title="Valid Next States",
+    )
+
+
 class CaseUIResponseInvestigating(BaseModel):
     active_hypotheses: list[HypothesisSummary] | None = Field(
         None, description="Hypotheses currently being tested", title="Active Hypotheses"
@@ -2000,10 +2059,9 @@ class CaseUIResponseInvestigating(BaseModel):
         description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
         title="Current Turn",
     )
-    disposition_eligibility: dict[str, str] | None = Field(
+    disposition_eligibility: DispositionEligibility | None = Field(
         None,
-        description="Per-disposition eligibility. ‼ The two keys answer for DIFFERENT audiences: ``closed`` gates a user CONTROL, ``resolved`` gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution handshake. Shape: ``{'resolved': str, 'closed': str}`` where each value is one of:\n- ``ready`` — case content supports this disposition with no follow-up. On the CLOSED side: render the control. On the RESOLVED side: the agent proposes the handshake; render nothing.\n- ``needs_info`` — content is partial; the user must supply more (root cause / solution / confirmation the problem is gone). Resolve side only, and no control either way — the agent asks in conversation.\n- ``suggests_alternative`` — Close side only, and it means DO NOT RENDER CLOSE. It is set exactly when the case confirms a resolution (a qualifying causal-absence row and a symptom-absence row at or after the fix), which is exactly when every close pivots back to a resolve proposal — so a Close control there could only ever produce 'shall I mark this resolved?'. The honest rendering is no status control at all: the case has one terminal destination and the agent is already offering it.\n- ``not_eligible`` — not available; render nothing.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
-        title="Disposition Eligibility",
+        description="Per-disposition eligibility, ``{resolved, closed}``, both keys always present. ‼ The two keys answer for DIFFERENT audiences: ``closed`` (``CloseEligibility``) gates a user CONTROL — render Close only on ``ready``; ``resolved`` (``ResolveEligibility``) gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution. Each value's meaning is its enum's ``x-enum-descriptions``. ``closed`` reads ``suggests_alternative`` while a resolve proposal is pending, and on a resolvable case whose resolution the user has not declined (a close would become a resolve proposal). A decline stands until a new solution or a new confirmation that the fix held is recorded; nothing else lapses it. A request for what a resolution still needs is not a proposal: it carries no confirmation chips, and Close stays. The exception is a resolvable case on which a check the agent asked for after the fix is unanswered: ``resolved`` reads ``needs_info`` there, and ``closed`` follows the resolvable case's rule above: ``suggests_alternative`` (a close would become a resolve proposal), or ``ready`` while the user's decline of the resolution stands.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
     )
     investigation_turn: conint(ge=0) | None = Field(
         None,
@@ -2039,13 +2097,72 @@ class CaseUIResponseInvestigating(BaseModel):
     uploaded_files_count: int | None = Field(
         0, description="Number of uploaded files", title="Uploaded Files Count"
     )
-    valid_next_states: list[str] | None = Field(
+    valid_next_states: list[SelectableNextState] | None = Field(
         None,
         description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
         title="Valid Next States",
     )
     working_conclusion: WorkingConclusionSummary | None = Field(
         None, description="Agent's current understanding of the problem"
+    )
+
+
+class CaseUIResponseResolved(BaseModel):
+    case_id: str = Field(..., description="Case identifier", title="Case Id")
+    created_at: AwareDatetime = Field(..., description="When case was created", title="Created At")
+    current_turn: conint(ge=0) = Field(
+        ...,
+        description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
+        title="Current Turn",
+    )
+    disposition_eligibility: DispositionEligibility | None = Field(
+        None,
+        description="Per-disposition eligibility, ``{resolved, closed}``, both keys always present. ‼ The two keys answer for DIFFERENT audiences: ``closed`` (``CloseEligibility``) gates a user CONTROL — render Close only on ``ready``; ``resolved`` (``ResolveEligibility``) gates nothing in the UI — it is the engine's own readiness verdict, and what it decides is whether the agent OFFERS the resolution. Each value's meaning is its enum's ``x-enum-descriptions``. ``closed`` reads ``suggests_alternative`` while a resolve proposal is pending, and on a resolvable case whose resolution the user has not declined (a close would become a resolve proposal). A decline stands until a new solution or a new confirmation that the fix held is recorded; nothing else lapses it. A request for what a resolution still needs is not a proposal: it carries no confirmation chips, and Close stays. The exception is a resolvable case on which a check the agent asked for after the fix is unanswered: ``resolved`` reads ``needs_info`` there, and ``closed`` follows the resolvable case's rule above: ``suggests_alternative`` (a close would become a resolve proposal), or ``ready`` while the user's decline of the resolution stands.\n\nDifferent from ``valid_next_states`` — that field is which actions the user may SELECT, this field is what the case CONTENT supports. The two no longer overlap on the resolve side: ``resolved`` here is the engine's own readiness verdict, which decides whether the agent offers the resolution handshake, not whether a control is rendered.",
+    )
+    investigation_turn: conint(ge=0) | None = Field(
+        None,
+        description="How many of this case's turns so far were investigation work (#1329/#1387) — the same quantity `TurnResponse.investigation_turn` reports, carried on the case read so a header or a resolution summary can show it without having just submitted a turn. Excludes out-of-band turns (small talk, trivia, questions about FaultMaven itself), which are answered outside the investigation: an aside advances `current_turn` and leaves this alone. Null when the server predates the field.",
+        title="Investigation Turn",
+    )
+    problem_statement: constr(max_length=1000) | None = Field(
+        None,
+        description="Confirmed problem statement carried over from INQUIRY (sourced from case.description).",
+        title="Problem Statement",
+    )
+    problem_verification: ProblemVerificationData | None = Field(
+        None,
+        description="Where the problem statement stood when the case ended, as on the INVESTIGATING response: a case closed as `closed_false_alarm` carries `invalidated` with its `invalidation_finding`, and a statement a revision or an edit changed carries `original_problem_statement`. Null for a case closed from INQUIRY, which confirmed no statement.",
+    )
+    reports_available: list[ReportAvailability] | None = Field(
+        None,
+        description="Available reports (incident report, post-mortem, runbook)",
+        title="Reports Available",
+    )
+    resolution_summary: ResolutionSummary = Field(
+        ..., description="Overall resolution metrics and insights"
+    )
+    resolved_at: AwareDatetime = Field(
+        ..., description="When case was resolved", title="Resolved At"
+    )
+    root_cause: RootCauseSummary = Field(..., description="What caused the problem")
+    solution_applied: SolutionSummary = Field(..., description="Solution that fixed the problem")
+    state: State = Field(
+        ...,
+        description="Case terminal state: 'resolved' (with solution) or 'closed' (without investigation)",
+        title="State",
+    )
+    title: constr(max_length=200) = Field(..., description="Case title", title="Title")
+    updated_at: AwareDatetime = Field(..., description="Last update timestamp", title="Updated At")
+    uploaded_files_count: int | None = Field(
+        0, description="Number of uploaded files", title="Uploaded Files Count"
+    )
+    valid_next_states: list[SelectableNextState] | None = Field(
+        None,
+        description="Case actions the USER may select from the status menu — selectability, not legality. Only CLOSED is ever listed, because closing is the one decision that needs no precondition. The two legal edges that never appear here are earned from case content and offered by the agent through a confirmation handshake: INQUIRY → INVESTIGATING by a confirmed problem statement (Gate 1), and INVESTIGATING → RESOLVED by a confirmed root-cause elimination. Requesting either is refused.",
+        title="Valid Next States",
+    )
+    verification_status: SolutionVerificationData = Field(
+        ..., description="How solution effectiveness was verified"
     )
 
 

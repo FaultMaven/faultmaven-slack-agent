@@ -163,6 +163,10 @@ _VERSION_CONFLICT_CODE = "CASE_VERSION_CONFLICT"
 # faultmaven#1908). It is the only signal: an unlabelled 409 is not a terminal
 # case.
 _CASE_TERMINAL_CODE = "CASE_TERMINAL"
+# A delete of the case is running, and nothing of the turn ran (contract
+# 14.14.0, faultmaven#2096). No ``Retry-After``: the case is gone once the
+# delete succeeds.
+_CASE_DELETE_IN_PROGRESS_CODE = "CASE_DELETE_IN_PROGRESS"
 
 # The turn receipt's answers (contract 12.2.0, faultmaven#1888). A turn sent with
 # an ``Idempotency-Key`` commits a receipt with it, so a retry under the same key
@@ -375,6 +379,17 @@ class CaseTerminalError(FaultMavenAPIError):
     """
 
 
+class CaseDeleteInProgressError(FaultMavenAPIError):
+    """A delete of the case is running and refused this turn (409
+    ``CASE_DELETE_IN_PROGRESS``, contract 14.14.0).
+
+    Nothing of the turn ran. Distinguished so the thread is told the case is
+    being deleted, not handed the generic "re-sending won't help", nor, during
+    a drain, a "resend in a minute" for a case about to be gone. The thread is
+    not unlinked: the delete can still fail and keep the case.
+    """
+
+
 class CaseVersionConflictError(FaultMavenAPIError):
     """Another writer advanced the case mid-turn (409, OCC).
 
@@ -543,13 +558,23 @@ def _unknown_outcome(message: str, cause: BaseException) -> FaultMavenTimeoutErr
 
 #: While a turn is being recovered, the answers that settle it. Each says
 #: something about the turn itself — it is this one (a reused key), it
-#: committed (an unreplayable receipt), the case refuses it (terminal, gone),
-#: or nothing of it committed (a second version conflict) — or that no attempt
-#: can be made at all (a refused credential, raised before this is consulted).
+#: committed (an unreplayable receipt), the case refuses it (terminal, gone,
+#: being deleted), or nothing of it committed (a second version conflict) — or
+#: that no attempt can be made at all (a refused credential, raised before this
+#: is consulted). A delete's refusal settles it because a committed turn's key
+#: is replayed before the case's lease is taken, and a running attempt holds
+#: that lease, so no delete can start under it, and a delete already running
+#: refuses the attempt at the attempt's own tombstone read. Three of core's
+#: accepted residuals let a delete and a running attempt overlap: a turn whose
+#: lease write or tombstone read failed runs unguarded, a holder stalled past
+#: the lease TTL loses its lease, and a member lost from Redis is missing until
+#: the holder's next successful renewal (10 s). Under any of them the refusal
+#: of a re-send is reported as definitive although attempt 1 may still commit.
 _DEFINITIVE_WHILE_RECOVERING = (
     IdempotencyKeyReuseError,
     IdempotencyReplayUnavailableError,
     CaseTerminalError,
+    CaseDeleteInProgressError,
     CaseNotFoundError,
     CaseVersionConflictError,
 )
@@ -2653,6 +2678,7 @@ class FaultMavenClient:
                     _KEY_REUSE_CODE: IdempotencyKeyReuseError,
                     _REPLAY_UNAVAILABLE_CODE: IdempotencyReplayUnavailableError,
                     _CASE_TERMINAL_CODE: CaseTerminalError,
+                    _CASE_DELETE_IN_PROGRESS_CODE: CaseDeleteInProgressError,
                 }.get(error_code or "")
                 if labelled is not None:
                     raise labelled(

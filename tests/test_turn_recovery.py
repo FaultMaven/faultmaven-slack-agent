@@ -29,6 +29,7 @@ import pytest
 
 import listeners._turn as _turn
 from faultmaven.client import (
+    CaseDeleteInProgressError,
     CaseTerminalError,
     CaseVersionConflictError,
     FaultMavenAPIError,
@@ -702,9 +703,10 @@ def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
             ),
             "CaseTerminalError",
         ),
+        (_conflict("CASE_DELETE_IN_PROGRESS"), "CaseDeleteInProgressError"),
         (httpx.Response(401, json={"detail": "bad token"}), "FaultMavenAPIError"),
     ],
-    ids=["404", "terminal", "401"],
+    ids=["404", "terminal", "deleting", "401"],
 )
 def test_answers_about_the_turn_still_end_a_recovery(later, expected):
     import faultmaven.client as fm_client
@@ -887,6 +889,19 @@ def test_an_unlabelled_409_is_not_a_terminal_case():
     assert err.value.status_code == 409
     assert _turn.turn_error_text(err.value) != _turn.CASE_CLOSED_TEXT
     assert not _turn.retry_may_help(err.value)
+    assert len(backend.requests) == 1
+
+
+def test_a_case_being_deleted_gets_its_own_reply():
+    """slack-agent#141 (contract 14.14.0): a delete of the case is running and
+    nothing of the turn ran. Answered once, with no re-send."""
+
+    backend = _Backend(_conflict("CASE_DELETE_IN_PROGRESS"))
+    client, _ = _client(backend)
+    with pytest.raises(CaseDeleteInProgressError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert err.value.status_code == 409
+    assert _turn.turn_error_text(err.value) == _turn.CASE_DELETING_TEXT
     assert len(backend.requests) == 1
 
 

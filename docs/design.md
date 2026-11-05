@@ -505,6 +505,7 @@ the next message and answering it clearly.
 |---|---|---|
 | **Terminal, still online** (`resolved`/`closed`) | `409` with `x-error-code: CASE_TERMINAL` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
 | **Missing** | `404` on the turn POST | Says it *couldn't find* the case — a 404 is the whole of what we know, and deletion, a DB reset and a restore that predates the case are indistinguishable from here. **Tombstones** the thread (§6.4a) and refuses the turn rather than answering it on a new case: the message was written into a conversation whose history is what has gone missing. Points at the deliberate restart that suits the surface — an `@mention` in a channel, a new chat in a 1:1. |
+| **Being deleted** | `409` with `x-error-code: CASE_DELETE_IN_PROGRESS` (contract 14.14.0) | Says the case is being deleted, that the message was not added, and to write here again in a moment. No restart hint, and it outranks the drain notice: a restart does not undo a delete that succeeds. The buttons stay armed: a re-click is refused again while the delete runs, meets the `404` path once the case is gone, and is applied if the delete failed (on a case the agent still drives). **Not** tombstoned: the delete can still fail and keep the case (`500 DELETE_CASE_ERROR`), and once it succeeds the next message meets the `404` above. `DELETE /cases/{id}` is creator-only, so this reaches a thread when the agent runs on an account a human also uses (the default credential with `FAULTMAVEN_DEV_LOGIN_USERNAME`, or a human's `FAULTMAVEN_API_TOKEN`: Slack cases are then created by that account, and that human can delete them), or for a case moved to a human owner (`fm-reassign-cases`) that the agent still reads through a team share (Cloud's workspace Team): there every turn outside a delete is answered `403`, so after a failed delete a message or a re-click gets the `403` reply. Without a share, every turn is a `404`, and this refusal never reaches the thread. |
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
 | **Rate limited** (*not* a lifecycle event) | `429` + `Retry-After` | Says FaultMaven is rate-limiting and quotes the wait ("send it again in 45 seconds" / "about an hour"). Not framed as an error — nothing is broken — and never "re-sending won't help", because a 429 *does* succeed later. |
 | **Archived** | — | Not implemented: the backend has no archive tier yet (**ADR-014**, Proposed). Lands with that ADR, alongside Copilot and the Dashboard. |
@@ -520,7 +521,8 @@ little while": a guessed number earns the user a second refusal.
 
 These `409`s are unrelated conflicts sharing one status and needing opposite
 advice, so the client separates them at the boundary by `x-error-code`, matched
-positively: `CASE_TERMINAL` is `CaseTerminalError`, `CASE_VERSION_CONFLICT` is
+positively: `CASE_TERMINAL` is `CaseTerminalError`, `CASE_DELETE_IN_PROGRESS` is
+`CaseDeleteInProgressError`, `CASE_VERSION_CONFLICT` is
 `CaseVersionConflictError`, and the idempotency and in-progress labels have
 their own classes. Since contract 12.3.0 the backend labels every terminal-case
 `409`, and its CI fails on any unlabelled, unclassified one. So an unlabelled or
@@ -697,7 +699,7 @@ all — while `is_unlinked` preserves the memory:
    going (the backend is overloaded or restarting, which says nothing about the
    turn). Only answers about the turn itself end it with their own meaning —
    `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal
-   case, a 404, a second version conflict, a 401; any other refusal while
+   case, a case being deleted, a 404, a second version conflict, a 401; any other refusal while
    recovering is reported as the unknown outcome it is. The loop is bounded by
    the recovery bound (3 attempts' worth, `FAULTMAVEN_TURN_RECOVERY_SECONDS` to
    pin; a policy bound) and ends at shutdown. The attempt timeout is the API's
