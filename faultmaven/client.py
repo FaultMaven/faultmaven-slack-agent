@@ -563,10 +563,11 @@ def _unknown_outcome(message: str, cause: BaseException) -> FaultMavenTimeoutErr
 #: that no attempt can be made at all (a refused credential, raised before this
 #: is consulted). A delete's refusal settles it because a committed turn's key
 #: is replayed before the case's lease is taken, and a running attempt holds
-#: that lease, so no delete can start under it. Core accepts three residuals:
-#: a turn whose lease write failed runs unguarded, a holder stalled past the
-#: lease TTL loses its lease, and a lost lease member is gone. Under any of
-#: them a delete can start beside a running attempt, and its refusal of a
+#: that lease, so no delete can start under it. Three of core's accepted
+#: residuals let a delete start beside a running attempt: a turn whose lease
+#: write or tombstone read failed runs unguarded, a holder stalled past the
+#: lease TTL loses its lease, and a member lost from Redis is missing until the
+#: holder's next successful renewal (10 s). Under any of them the refusal of a
 #: re-send is reported as definitive although attempt 1 may still commit.
 _DEFINITIVE_WHILE_RECOVERING = (
     IdempotencyKeyReuseError,

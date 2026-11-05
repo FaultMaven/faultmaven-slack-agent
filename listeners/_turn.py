@@ -470,8 +470,10 @@ def retry_may_help(exc: Exception) -> bool:
 
     True for a case being deleted, draining or not: a re-click is refused again
     while the delete runs, refused by the 404 path (which tombstones) once the
-    case is gone, and applied if the delete failed and kept it — safe in every
-    outcome, and what the reply's "write here again" asks for.
+    case is gone, and applied if the delete failed and kept it (on a case the
+    agent still drives) — safe in every outcome outside core's accepted lease
+    residuals (see ``_DEFINITIVE_WHILE_RECOVERING``), and what the reply's
+    "write here again" asks for.
     """
 
     if isinstance(
