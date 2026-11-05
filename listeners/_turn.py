@@ -463,12 +463,15 @@ def retry_may_help(exc: Exception) -> bool:
     a timeout's turn may have COMMITTED (a labelled 504's did not, and re-arms), an unreplayable one DID, and a reused
     key's may have (a re-click double-submits it against state the user never
     saw), a dead credential and
-    a concluded case reproduce identically forever, a case being deleted is
-    refused until the delete ends and is then gone or kept (the next message,
-    not a re-click, finds out which), a 4xx rejects the same input every time, and a missing
+    a concluded case reproduce identically forever, a 4xx rejects the same input every time, and a missing
     case has already been unlinked — its retry wouldn't repeat the failure, it
     would land the stale decision on whatever fresh case the thread opens next,
     which is worse than refusing it.
+
+    True for a case being deleted, draining or not: a re-click is refused again
+    while the delete runs, refused by the 404 path (which tombstones) once the
+    case is gone, and applied if the delete failed and kept it — safe in every
+    outcome, and what the reply's "write here again" asks for.
     """
 
     if isinstance(
@@ -480,7 +483,6 @@ def retry_may_help(exc: Exception) -> bool:
             FaultMavenCredentialError,
             FaultMavenWorkspaceUnlinkedError,
             CaseTerminalError,
-            CaseDeleteInProgressError,
             CaseNotFoundError,
         ),
     ):
@@ -491,6 +493,7 @@ def retry_may_help(exc: Exception) -> bool:
         exc,
         (
             CaseVersionConflictError,
+            CaseDeleteInProgressError,  # refused, tombstoned or applied: safe
             FaultMavenRateLimitError,
             FaultMavenNothingCommittedError,  # nothing committed: a re-click is safe
         ),
