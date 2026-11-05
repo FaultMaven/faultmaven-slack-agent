@@ -219,7 +219,7 @@ def test_a_case_being_deleted_gets_its_own_reply_and_keeps_its_buttons():
     """slack-agent#141: never the generic 4xx text, and never the drain notice,
     whose "resend in a minute" a delete that succeeds would not honour. The
     buttons stay armed: a re-click is refused again, meets the 404 path, or is
-    applied if the delete failed."""
+    applied if the delete failed (on a case the agent still drives)."""
 
     exc = CaseDeleteInProgressError("deleting", status_code=409)
     for draining in (False, True):

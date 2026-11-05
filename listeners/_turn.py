@@ -472,8 +472,8 @@ def retry_may_help(exc: Exception) -> bool:
     while the delete runs, refused by the 404 path (which tombstones) once the
     case is gone, and applied if the delete failed and kept it (on a case the
     agent still drives) — safe in every outcome outside core's accepted lease
-    residuals (see ``_DEFINITIVE_WHILE_RECOVERING``), and what the reply's
-    "write here again" asks for.
+    residuals (see ``faultmaven.client._DEFINITIVE_WHILE_RECOVERING``), and what
+    the reply's "write here again" asks for.
     """
 
     if isinstance(
