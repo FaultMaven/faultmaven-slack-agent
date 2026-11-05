@@ -28,6 +28,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from faultmaven import (
+    CaseDeleteInProgressError,
     CaseNotFoundError,
     CaseTerminalError,
     CaseVersionConflictError,
@@ -179,6 +180,15 @@ CASE_CLOSED_TEXT = (
     ":white_check_mark: This investigation is closed, so I can't take new "
     "data or change its status. I can still answer questions about what we "
     "found — for anything new, start a fresh thread and @mention me."
+)
+# A delete of the case is running; nothing of the turn ran. No restart hint: the
+# thread is not unlinked, so the next message here reaches the same case —
+# refused again while the delete runs, told the case is gone once it is, or
+# answered if the delete failed and kept it.
+CASE_DELETING_TEXT = (
+    ":wastebasket: This investigation's case is being deleted, so I didn't add "
+    "your message. Give it a moment and write here again: I'll pick it up if "
+    "the delete didn't go through, or tell you it's gone."
 )
 # The turn did NOT commit (another writer advanced the case first), so this is
 # the one 409 where re-sending is the right advice. Kept distinct from
@@ -375,6 +385,10 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # what the user is left able to do, and each message says which.
     if isinstance(exc, CaseTerminalError):
         return CASE_CLOSED_TEXT
+    # Above the override too: a restart does not undo a delete that succeeds, so
+    # "resend it in a minute" would be a promise about a case that may be gone.
+    if isinstance(exc, CaseDeleteInProgressError):
+        return CASE_DELETING_TEXT
     # Above the override too: the cap resets at a fixed time that our restart
     # does not bring forward, so "resend it in a minute" would be refused. Above
     # the rate-limit branch below, whose "rate-limiting right now" misnames a
@@ -449,7 +463,9 @@ def retry_may_help(exc: Exception) -> bool:
     a timeout's turn may have COMMITTED (a labelled 504's did not, and re-arms), an unreplayable one DID, and a reused
     key's may have (a re-click double-submits it against state the user never
     saw), a dead credential and
-    a concluded case reproduce identically forever, a 4xx rejects the same input every time, and a missing
+    a concluded case reproduce identically forever, a case being deleted is
+    refused until the delete ends and is then gone or kept (the next message,
+    not a re-click, finds out which), a 4xx rejects the same input every time, and a missing
     case has already been unlinked — its retry wouldn't repeat the failure, it
     would land the stale decision on whatever fresh case the thread opens next,
     which is worse than refusing it.
@@ -464,6 +480,7 @@ def retry_may_help(exc: Exception) -> bool:
             FaultMavenCredentialError,
             FaultMavenWorkspaceUnlinkedError,
             CaseTerminalError,
+            CaseDeleteInProgressError,
             CaseNotFoundError,
         ),
     ):

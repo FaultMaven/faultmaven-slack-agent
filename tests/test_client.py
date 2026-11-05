@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from faultmaven.client import (
+    CaseDeleteInProgressError,
     CaseNotFoundError,
     CaseTerminalError,
     CaseVersionConflictError,
@@ -317,6 +318,7 @@ def test_409_labelled_with_some_other_code_is_never_called_terminal():
         client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
     assert not isinstance(exc.value, CaseTerminalError)
     assert not isinstance(exc.value, CaseVersionConflictError)
+    assert not isinstance(exc.value, CaseDeleteInProgressError)
     assert exc.value.status_code == 409
 
 

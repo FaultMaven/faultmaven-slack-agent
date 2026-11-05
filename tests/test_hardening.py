@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from faultmaven.client import (
+    CaseDeleteInProgressError,
     CaseNotFoundError,
     FaultMavenAPIError,
     FaultMavenRateLimitError,
@@ -435,6 +436,22 @@ def test_stale_mapping_evicted_on_server_side_404():
         )
     assert store.unlinked == [("T", "C", "TS")]
     assert store.get("T", "C", "TS") is None  # nothing left to submit against
+
+
+def test_a_case_being_deleted_keeps_the_thread_linked():
+    """slack-agent#141: the delete can still fail and keep the case, so the
+    thread stays on it. Once the delete succeeds, the next turn meets the 404
+    above, which tombstones."""
+
+    store = _Store()
+    store.put("T", "C", "TS", "case_1")
+    fm = _FM(fail=CaseDeleteInProgressError("deleting", status_code=409))
+    with pytest.raises(CaseDeleteInProgressError):
+        _turn.run_turn(
+            fm, store, team_id="T", channel_id="C", thread_ts="TS", text="hi", idempotency_key="test-turn-key"
+        )
+    assert store.unlinked == []
+    assert store.get("T", "C", "TS") == "case_1"
 
 
 # -- run_turn_and_post: turn-vs-post failure separation ------------------------------

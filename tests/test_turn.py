@@ -6,6 +6,7 @@ import threading
 
 import listeners._turn as turn_mod
 from faultmaven import (
+    CaseDeleteInProgressError,
     CaseTerminalError,
     CaseVersionConflictError,
     FaultMavenAPIError,
@@ -15,6 +16,7 @@ from faultmaven.client import TurnResult
 from listeners._turn import (
     CASE_BUSY_TEXT,
     CASE_CLOSED_TEXT,
+    CASE_DELETING_TEXT,
     Dedup,
     RESTARTING_TEXT,
     retry_may_help,
@@ -213,6 +215,18 @@ def test_the_permanent_failures_outrank_the_shutdown_notice():
     ) == turn_mod.case_gone_text("C1")
 
 
+def test_a_case_being_deleted_gets_its_own_reply_and_no_retry():
+    """slack-agent#141: never the generic 4xx text, and never the drain notice,
+    whose "resend in a minute" a delete that succeeds would not honour."""
+
+    exc = CaseDeleteInProgressError("deleting", status_code=409)
+    for draining in (False, True):
+        if draining:
+            turn_mod.begin_shutdown()  # autouse fixture clears it again after
+        assert turn_error_text(exc, "C1") == CASE_DELETING_TEXT
+        assert retry_may_help(exc) is False
+
+
 def test_version_conflict_yields_to_the_shutdown_notice():
     """The transient one stays BELOW the override: the turn never committed and
     a restart doesn't change that, so during a drain "resend in a minute" is
@@ -272,6 +286,7 @@ def test_retry_may_help_agrees_with_turn_error_text():
         FaultMavenCredentialError("dead"),
         CaseTerminalError("closed", status_code=409),
         CaseNotFoundError("gone", status_code=404),
+        CaseDeleteInProgressError("deleting", status_code=409),
         CaseVersionConflictError("stale", status_code=409),
         FaultMavenRateLimitError("slow", retry_after=30),
         FaultMavenAPIError("bad", status_code=422),

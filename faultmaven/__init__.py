@@ -1,6 +1,7 @@
 """FaultMaven core API integration for the Slack agent."""
 
 from .client import (
+    CaseDeleteInProgressError,
     CaseNotFoundError,
     CaseTerminalError,
     CaseVersionConflictError,
@@ -21,6 +22,7 @@ from .client import (
 )
 
 __all__ = [
+    "CaseDeleteInProgressError",
     "CaseNotFoundError",
     "CaseTerminalError",
     "CaseVersionConflictError",
