@@ -113,12 +113,20 @@ def complete_bind(
     call on any path — including the one where the bind is refused, which is the
     path most likely to be reached (an admin whose account may not connect a
     workspace consents successfully and is refused here).
+
+    A missing access token is refused here, inside the ``try``, not in the
+    exchange, so a refresh token issued beside it is revoked too. The residual:
+    tokens in a body this process cannot read, meaning a 200 that is a proxy
+    page, or a 2xx other than 200, are not revoked; the exchange refuses those
+    before any token reaches this frame.
     """
 
     access, refresh = fm.exchange_authorization_code(
         code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
     )
     try:
+        if not access:
+            raise WorkspaceBindError("code exchange returned no access_token")
         binding = fm.bind_workspace(
             admin_access_token=access,
             slack_team_id=record.team_id,

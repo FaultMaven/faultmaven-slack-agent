@@ -20,6 +20,7 @@ obtained for.
 
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -565,10 +566,11 @@ def _tokens(request):
 def test_the_bind_page_shows_no_library_or_backend_text(
     bind_client, tmp_path, monkeypatch, on_token, on_bind, failed_at
 ):
-    """Each of these raise sites puts an ``httpx`` error, a JSON decode error or
-    the backend's body into its message. That belongs in the log. The page
-    shows fixed text, because none of these sites wrote its message for a
-    browser.
+    """Each client raise site here puts an ``httpx`` error, a JSON decode error
+    or the backend's body into its message. That belongs in the log. The
+    missing access token is refused in ``complete_bind`` instead, in internal
+    wording. The page shows fixed text, because none of these sites wrote its
+    message for a browser.
 
     Driven through the real client and the real ``complete_bind``: a
     hand-built exception would prove the formatter, not the raise sites."""
@@ -608,8 +610,44 @@ def test_the_bind_page_shows_no_library_or_backend_text(
     assert failed_at in seen, "the failure came from the real client"
     assert SENTINEL not in resp.text
     assert "Expecting value" not in resp.text  # json's decode error
-    assert "access_token" not in resp.text  # the client's own wording
+    assert "access_token" not in resp.text  # complete_bind's own wording
     assert "could not connect this workspace" in resp.text
+
+
+def test_a_refresh_only_exchange_still_revokes_the_admin_refresh_token(tmp_path):
+    """A 200 with a refresh token and no access token is refused, but that
+    refresh token is a standing org-admin credential. It must reach the
+    revoking ``finally``, not be dropped by the exchange (faultmaven#2128)."""
+    seen: list[str] = []
+    revokes: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == TOKEN_PATH:
+            return httpx.Response(200, json={"refresh_token": "admin-rt"})
+        if request.url.path == "/api/v1/auth/oauth/revoke":
+            body = json.loads(request.content)
+            revokes.append((body["token"], body["token_type_hint"]))
+        return httpx.Response(200)
+
+    client = FaultMavenClient("http://test")
+    client._http.close()
+    client._http = httpx.Client(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    )
+    pending, creds = make_stores(tmp_path)
+    r = open_bind(pending)
+    record = pending.consume(state=r.state, bind_id=r.bind_id)
+
+    with pytest.raises(WorkspaceBindError, match="no access_token"):
+        complete_bind(
+            fm=client, workspace_credentials=creds, record=record,
+            code="c", redirect_uri="https://x/cb",
+        )
+
+    # The refresh token is revoked; the empty access token costs no request.
+    assert revokes == [("admin-rt", "refresh_token")]
+    assert BIND_PATH not in seen, "nothing runs with an empty access token"
 
 
 def test_a_bind_failure_whose_raise_site_vouched_for_nothing_shows_fixed_text():

@@ -959,6 +959,25 @@ def test_a_non_json_exchange_body_is_a_typed_failure():
         )
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param({"refresh_token": "admin-rt"}, ("", "admin-rt"), id="refresh-only"),
+        pytest.param({"access_token": "at"}, ("at", ""), id="access-only"),
+    ],
+)
+def test_the_code_exchange_returns_the_tokens_as_parsed(body, expected):
+    """A missing token is the caller's to refuse. Refused here, a refresh token
+    issued beside it would be dropped unrevoked (faultmaven#2128)."""
+    client = bind_client_for(lambda r: httpx.Response(200, json=body))
+
+    tokens = client.exchange_authorization_code(
+        code="c", code_verifier="v", redirect_uri="https://x/cb"
+    )
+
+    assert tokens == expected
+
+
 def test_the_bind_carries_the_admin_bearer_and_names_no_tenant():
     """The enterprise is taken from the admin token's own claim server-side.
     Naming one in the request would be a way to bind into a tenant the admin

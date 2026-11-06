@@ -1978,6 +1978,11 @@ class FaultMavenClient:
         ``redirect_uri`` must be byte-identical to the one sent to ``/authorize``
         — the server compares the two strings directly, so a trailing slash that
         differs is an ``invalid_grant``, not a near miss.
+
+        Either token may come back empty. A body with a refresh token and no
+        access token is returned as parsed, not refused here: refusing it here
+        would drop a live admin refresh token unrevoked. ``complete_bind``
+        refuses it inside the ``try`` whose ``finally`` revokes both.
         """
 
         try:
@@ -2011,10 +2016,7 @@ class FaultMavenClient:
             raise WorkspaceBindError(
                 f"code exchange returned a non-JSON body: {exc}"
             ) from exc
-        access, refresh = body.get("access_token", ""), body.get("refresh_token", "")
-        if not access:
-            raise WorkspaceBindError("code exchange returned no access_token")
-        return access, refresh
+        return body.get("access_token", ""), body.get("refresh_token", "")
 
     def bind_workspace(
         self,
