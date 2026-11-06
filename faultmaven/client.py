@@ -1979,10 +1979,11 @@ class FaultMavenClient:
         — the server compares the two strings directly, so a trailing slash that
         differs is an ``invalid_grant``, not a near miss.
 
-        Either token may come back empty. A body with a refresh token and no
-        access token is returned as parsed, not refused here: refusing it here
-        would drop a live admin refresh token unrevoked. ``complete_bind``
-        refuses it inside the ``try`` whose ``finally`` revokes both.
+        Either token may come back empty: a missing value, or one that is not a
+        string, reads as ``""``. A body with a refresh token and no access token
+        is returned, not refused here: refusing it here would drop a live admin
+        refresh token unrevoked. ``complete_bind`` refuses it inside the ``try``
+        whose ``finally`` revokes both.
         """
 
         try:
@@ -2016,7 +2017,16 @@ class FaultMavenClient:
             raise WorkspaceBindError(
                 f"code exchange returned a non-JSON body: {exc}"
             ) from exc
-        return body.get("access_token", ""), body.get("refresh_token", "")
+        if not isinstance(body, dict):
+            # Valid JSON, but not a token response: a list, a string, a null.
+            raise WorkspaceBindError(
+                "code exchange returned a JSON body that is not an object"
+            )
+        access, refresh = body.get("access_token"), body.get("refresh_token")
+        return (
+            access if isinstance(access, str) else "",
+            refresh if isinstance(refresh, str) else "",
+        )
 
     def bind_workspace(
         self,

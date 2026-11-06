@@ -21,6 +21,7 @@ obtained for.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -516,6 +517,7 @@ def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
 SENTINEL = "SENTINEL-fm-internal.svc.cluster.local:8090"
 TOKEN_PATH = "/api/v1/auth/oauth/token"
 BIND_PATH = "/api/v1/admin/integrations/slack/workspaces"
+REVOKE_PATH = "/api/v1/auth/oauth/revoke"
 
 
 def _refused_connection(request):
@@ -533,38 +535,44 @@ def _tokens(request):
 
 
 @pytest.mark.parametrize(
-    ("on_token", "on_bind", "failed_at"),
+    ("on_token", "on_bind", "failed_at", "revoked"),
     [
-        pytest.param(_refused_connection, None, TOKEN_PATH, id="exchange-unreachable"),
+        pytest.param(
+            _refused_connection, None, TOKEN_PATH, False, id="exchange-unreachable"
+        ),
         pytest.param(
             lambda r: httpx.Response(200, text=f"<html>{SENTINEL}</html>"),
             None,
             TOKEN_PATH,
+            False,
             id="exchange-non-json",
         ),
-        pytest.param(_tokens, _timed_out, BIND_PATH, id="bind-unreachable"),
+        pytest.param(_tokens, _timed_out, BIND_PATH, True, id="bind-unreachable"),
         pytest.param(
             lambda r: httpx.Response(200, json={"refresh_token": "admin-rt"}),
             None,
             TOKEN_PATH,
+            True,
             id="exchange-no-access-token",
         ),
         pytest.param(
             lambda r: httpx.Response(403, json={"detail": SENTINEL}),
             None,
             TOKEN_PATH,
+            False,
             id="exchange-403",
         ),
         pytest.param(
             lambda r: httpx.Response(503, json={"detail": SENTINEL}),
             None,
             TOKEN_PATH,
+            False,
             id="exchange-503",
         ),
     ],
 )
 def test_the_bind_page_shows_no_library_or_backend_text(
-    bind_client, tmp_path, monkeypatch, on_token, on_bind, failed_at
+    bind_client, tmp_path, monkeypatch, on_token, on_bind, failed_at, revoked
 ):
     """Each client raise site here puts an ``httpx`` error, a JSON decode error
     or the backend's body into its message. That belongs in the log. The
@@ -607,25 +615,28 @@ def test_the_bind_page_shows_no_library_or_backend_text(
     )
 
     assert resp.status_code == 200
-    assert failed_at in seen, "the failure came from the real client"
+    assert failed_at in seen, "the request the bind failed on went through the real client"
+    assert (REVOKE_PATH in seen) is revoked, "a token the exchange returned is revoked"
     assert SENTINEL not in resp.text
     assert "Expecting value" not in resp.text  # json's decode error
     assert "access_token" not in resp.text  # complete_bind's own wording
     assert "could not connect this workspace" in resp.text
 
 
-def test_a_refresh_only_exchange_still_revokes_the_admin_refresh_token(tmp_path):
-    """A 200 with a refresh token and no access token is refused, but that
-    refresh token is a standing org-admin credential. It must reach the
-    revoking ``finally``, not be dropped by the exchange (faultmaven#2128)."""
+def _refused_through_real_client(tmp_path, token_response, bind_response=None):
+    """Run the real ``complete_bind`` over the real client and a mock FaultMaven,
+    expecting a refusal. Returns it, the paths requested, and each revoke's
+    ``(token, token_type_hint)``."""
     seen: list[str] = []
     revokes: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
         if request.url.path == TOKEN_PATH:
-            return httpx.Response(200, json={"refresh_token": "admin-rt"})
-        if request.url.path == "/api/v1/auth/oauth/revoke":
+            return token_response
+        if request.url.path == BIND_PATH:
+            return bind_response
+        if request.url.path == REVOKE_PATH:
             body = json.loads(request.content)
             revokes.append((body["token"], body["token_type_hint"]))
         return httpx.Response(200)
@@ -638,16 +649,74 @@ def test_a_refresh_only_exchange_still_revokes_the_admin_refresh_token(tmp_path)
     pending, creds = make_stores(tmp_path)
     r = open_bind(pending)
     record = pending.consume(state=r.state, bind_id=r.bind_id)
-
-    with pytest.raises(WorkspaceBindError, match="no access_token"):
+    with pytest.raises(WorkspaceBindError) as refused:
         complete_bind(
             fm=client, workspace_credentials=creds, record=record,
             code="c", redirect_uri="https://x/cb",
         )
+    client._http.close()
+    return refused.value, seen, revokes
 
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"refresh_token": "admin-rt"}, id="refresh-only"),
+        pytest.param({"access_token": None, "refresh_token": "admin-rt"}, id="null-access"),
+    ],
+)
+def test_a_refresh_only_exchange_still_revokes_the_admin_refresh_token(
+    tmp_path, caplog, body
+):
+    """A 200 with a refresh token and no access token is refused, but that
+    refresh token is a standing org-admin credential. It must reach the
+    revoking ``finally``, not be dropped by the exchange (faultmaven#2128)."""
+    caplog.set_level(logging.DEBUG)
+
+    refused, seen, revokes = _refused_through_real_client(
+        tmp_path, httpx.Response(200, json=body)
+    )
+
+    assert "no access_token" in str(refused)
     # The refresh token is revoked; the empty access token costs no request.
     assert revokes == [("admin-rt", "refresh_token")]
     assert BIND_PATH not in seen, "nothing runs with an empty access token"
+    assert "admin-rt" not in caplog.text, "no log line names the token"
+
+
+def test_a_200_with_neither_token_is_refused_with_no_revoke_and_no_error(
+    tmp_path, caplog
+):
+    """Nothing was issued, so nothing is revoked and no operator is alerted."""
+    refused, seen, _ = _refused_through_real_client(tmp_path, httpx.Response(200, json={}))
+
+    assert "no access_token" in str(refused)
+    assert REVOKE_PATH not in seen and BIND_PATH not in seen
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize(
+    ("refresh", "refresh_unrevoked"),
+    [pytest.param("NaN", False, id="nan"), pytest.param('"\\ud800"', True, id="lone-surrogate")],
+)
+def test_a_refresh_token_httpx_cannot_send_still_lets_the_access_token_be_revoked(
+    tmp_path, caplog, refresh, refresh_unrevoked
+):
+    """JSON admits ``NaN`` and a lone surrogate, and httpx refuses to encode
+    either, outside ``httpx.HTTPError``. Raised in the ``finally``, that skipped
+    the access token's revoke and replaced the bind's own refusal. A NaN reads
+    as no token; a surrogate string is a token whose revoke raises."""
+    refused, _, revokes = _refused_through_real_client(
+        tmp_path,
+        httpx.Response(200, text=f'{{"access_token": "admin-at", "refresh_token": {refresh}}}'),
+        httpx.Response(403, json={"detail": "needs manage settings"}),
+    )
+
+    assert refused.status_code == 403, "the bind's own refusal is what surfaces"
+    assert revokes == [("admin-at", "access_token")]
+    errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
+    assert bool(errors) is refresh_unrevoked  # a revoke that raised is reported
+    assert "admin-at" not in caplog.text and "ud800" not in caplog.text
 
 
 def test_a_bind_failure_whose_raise_site_vouched_for_nothing_shows_fixed_text():

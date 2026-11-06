@@ -962,20 +962,42 @@ def test_a_non_json_exchange_body_is_a_typed_failure():
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        pytest.param({"refresh_token": "admin-rt"}, ("", "admin-rt"), id="refresh-only"),
-        pytest.param({"access_token": "at"}, ("at", ""), id="access-only"),
+        pytest.param('{"refresh_token": "admin-rt"}', ("", "admin-rt"), id="refresh-only"),
+        pytest.param('{"access_token": "at"}', ("at", ""), id="access-only"),
+        pytest.param('{"access_token": null, "refresh_token": 7}', ("", ""), id="null-number"),
+        pytest.param('{"access_token": ["at"], "refresh_token": NaN}', ("", ""), id="list-nan"),
+        pytest.param('{"access_token": {"t": 1}, "refresh_token": true}', ("", ""), id="dict-bool"),
     ],
 )
-def test_the_code_exchange_returns_the_tokens_as_parsed(body, expected):
+def test_the_code_exchange_returns_each_token_as_a_string(body, expected):
     """A missing token is the caller's to refuse. Refused here, a refresh token
-    issued beside it would be dropped unrevoked (faultmaven#2128)."""
-    client = bind_client_for(lambda r: httpx.Response(200, json=body))
+    issued beside it would be dropped unrevoked (faultmaven#2128). A value that
+    is not a string reads as no token, so ``tuple[str, str]`` holds."""
+    client = bind_client_for(lambda r: httpx.Response(200, text=body))
 
     tokens = client.exchange_authorization_code(
         code="c", code_verifier="v", redirect_uri="https://x/cb"
     )
 
     assert tokens == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [pytest.param('[{"access_token": "admin-at"}]', id="list"), pytest.param("null", id="null")],
+)
+def test_a_json_exchange_body_that_is_not_an_object_is_a_typed_failure(body):
+    """Typed like the non-JSON arm, not a bare ``AttributeError``; not
+    browser-safe, and the body stays out of the message."""
+    client = bind_client_for(lambda r: httpx.Response(200, text=body))
+
+    with pytest.raises(WorkspaceBindError, match="not an object") as refused:
+        client.exchange_authorization_code(
+            code="c", code_verifier="v", redirect_uri="https://x/cb"
+        )
+
+    assert refused.value.page_message is None
+    assert "admin-at" not in str(refused.value)
 
 
 def test_the_bind_carries_the_admin_bearer_and_names_no_tenant():
