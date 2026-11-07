@@ -113,12 +113,21 @@ def complete_bind(
     call on any path — including the one where the bind is refused, which is the
     path most likely to be reached (an admin whose account may not connect a
     workspace consents successfully and is refused here).
+
+    A missing access token is refused here, inside the ``try``, not in the
+    exchange, so a refresh token issued beside it is revoked too. The residual,
+    not revoked because no token reaches this frame: a 2xx other than 200, whose
+    JSON body is read into the error message but whose tokens the exchange drops
+    (faultmaven#2591); a 200 that is a proxy page, whose body cannot be read;
+    and a 200 whose JSON is not an object, or whose token is not a string.
     """
 
     access, refresh = fm.exchange_authorization_code(
         code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
     )
     try:
+        if not access:
+            raise WorkspaceBindError("code exchange returned no access_token")
         binding = fm.bind_workspace(
             admin_access_token=access,
             slack_team_id=record.team_id,
@@ -183,20 +192,37 @@ def complete_bind(
     finally:
         # A live refresh token is a standing org-admin credential, so its
         # revocation failing is worth an operator's attention; an access token
-        # expires on its own in minutes.
-        if not fm.revoke_token(refresh, token_type_hint="refresh_token"):
+        # expires on its own in minutes. Each revoke is guarded on its own.
+        if not _revoke(fm, refresh, hint="refresh_token"):
             logger.error(
                 "Could not revoke the admin refresh token issued for the bind of "
                 "workspace %s. It remains valid until it expires — revoke it "
                 "from FaultMaven if this matters.",
                 record.team_id,
             )
-        if not fm.revoke_token(access, token_type_hint="access_token"):
+        if not _revoke(fm, access, hint="access_token"):
             logger.warning(
                 "Could not revoke the admin access token for workspace %s "
                 "(expires on its own shortly)",
                 record.team_id,
             )
+
+
+def _revoke(fm: FaultMavenClient, token: str, *, hint: str) -> bool:
+    """``fm.revoke_token``, with a raise read as a failure to revoke.
+
+    Guarded as ``listeners/lifecycle.py`` guards the same call. A token httpx
+    cannot encode (a lone surrogate) raises outside ``httpx.HTTPError``, and
+    that must neither skip ``complete_bind``'s other revoke nor replace its
+    result or exception. Only the exception's type is logged: an encode error's
+    message quotes a character of the token.
+    """
+
+    try:
+        return fm.revoke_token(token, token_type_hint=hint)
+    except Exception as exc:  # noqa: BLE001 — the other revoke must still run
+        logger.warning("Revoking the admin %s raised %s", hint, type(exc).__name__)
+        return False
 
 
 def bind_failure_message(exc: Exception) -> str:
