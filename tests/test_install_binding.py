@@ -678,6 +678,7 @@ def test_a_refresh_only_exchange_still_revokes_the_admin_refresh_token(
     )
 
     assert "no access_token" in str(refused)
+    assert "admin-rt" not in str(refused), "web.py logs the refusal's message"
     # The refresh token is revoked; the empty access token costs no request.
     assert revokes == [("admin-rt", "refresh_token")]
     assert BIND_PATH not in seen, "nothing runs with an empty access token"
@@ -706,6 +707,8 @@ def test_a_refresh_token_httpx_cannot_send_still_lets_the_access_token_be_revoke
     either, outside ``httpx.HTTPError``. Raised in the ``finally``, that skipped
     the access token's revoke and replaced the bind's own refusal. A NaN reads
     as no token; a surrogate string is a token whose revoke raises."""
+    caplog.set_level(logging.DEBUG)
+
     refused, _, revokes = _refused_through_real_client(
         tmp_path,
         httpx.Response(200, text=f'{{"access_token": "admin-at", "refresh_token": {refresh}}}'),
