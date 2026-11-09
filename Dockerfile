@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.6@sha256:ac85f380a63b13dfcefa89046420e1781752bab202122f8f50032edf31be0021
 # FaultMaven Slack Agent — HTTP/OAuth transport container.
 #
 # Runs the FastAPI server (web.py) that hosts the Slack request handler
@@ -32,8 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # pip (24.2+) verifies through truststore, whose context loads the OS store, pip's own
 # vendored certifi bundle (an old one, holding both roots the check below bans) and
-# PIP_CERT. So the vendored bundle is linked to the OS store, and PIP_CERT names it,
-# before the first pip.
+# PIP_CERT. So the vendored bundle is linked to the OS store and PIP_CERT is set to it,
+# before the first pip; the check below asserts the pip on PATH still reads it.
 RUN cacert="$(python -c 'import pip._vendor.certifi as c; print(c.where())')" \
     && ln -sf /etc/ssl/certs/ca-certificates.crt "$cacert"
 ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
@@ -55,11 +55,17 @@ RUN useradd --create-home --uid 10001 faultmaven \
 # Fail the build if "emSign ECC Root CA - G3" (GHSA-6q48-6c7w-9gw2: compromised
 # intermediate keys) or "AAA Certificate Services" is in OpenSSL's default cafile or
 # capath, which slack-sdk reads through urllib, or in certifi, which httpx (the
-# FaultMaven API client) reads. pip's vendored bundle and PIP_CERT are that cafile
-# (linked above); the check does not read pip's bundle. The last root step, to see
-# the stores the image ships.
+# FaultMaven API client) reads. The script does not read pip's bundle, so the step
+# then asserts that the pip on PATH, run by its own interpreter (a venv included),
+# reads the file PIP_CERT names. It runs at the last root step, and
+# tests/test_dockerfile_trust_store.py keeps everything after it inert, so it sees the
+# stores the image ships.
 RUN --mount=type=bind,from=trust-check,source=/check_image_trust_store.py,target=/tmp/check_image_trust_store.py \
-    python /tmp/check_image_trust_store.py
+    python /tmp/check_image_trust_store.py \
+    && pip_python="$(sed -n '1s/^#!//p' "$(command -v pip)")" \
+    && "$pip_python" -c 'import os, sys, pip._vendor.certifi as c; \
+bundle, cert = (os.path.realpath(p) for p in (c.where(), os.environ["PIP_CERT"])); \
+bundle == cert or sys.exit(f"the pip on PATH reads {bundle}, not PIP_CERT ({cert})")'
 USER faultmaven
 
 EXPOSE 3000
