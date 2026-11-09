@@ -202,12 +202,13 @@ def test_submit_turn_4xx_message_fallback_does_not_shadow_detail():
     assert err.value.detail == "file type not allowed"
 
 
-def test_submit_turn_422_list_detail_still_falls_back_to_raw_text():
+def test_submit_turn_422_list_detail_reads_loc_and_msg():
     """A 422 puts a *list* in ``detail``; that is not a message.
 
-    It must keep falling through to ``resp.text`` rather than being replaced by
-    ``message`` — pinned because ``detail or message`` makes an empty/absent
-    ``detail`` reach for ``message``, and a list is neither.
+    It is read from each item's ``loc`` and ``msg`` (faultmaven#2591), never
+    quoted as ``resp.text``, whose ``input`` can echo the request, and never
+    replaced by ``message`` — pinned because ``detail or message`` makes an
+    empty/absent ``detail`` reach for ``message``, and a list is neither.
     """
 
     def handler(req):
