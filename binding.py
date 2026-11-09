@@ -130,7 +130,10 @@ def complete_bind(
                 code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
             )
         except WorkspaceBindError as exc:
+            # Cleared once read: the exception travels on to a log, the tokens
+            # only to the revocation below.
             access, refresh = exc.issued
+            exc.issued = ("", "")
             raise
         if not access:
             raise WorkspaceBindError("code exchange returned no access_token")

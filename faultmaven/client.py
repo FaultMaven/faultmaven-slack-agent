@@ -457,8 +457,8 @@ class WorkspaceBindError(FaultMavenError):
     text. ``str()`` is the full message either way, for the log.
 
     ``issued`` is the ``(access, refresh)`` a refused code exchange parsed, for
-    ``complete_bind`` to revoke. It is kept out of ``args``, so neither
-    ``str()`` nor ``repr()`` shows it.
+    ``complete_bind`` to revoke; it clears them once read. It is kept out of
+    ``args``, so neither ``str()`` nor ``repr()`` shows it.
     """
 
     def __init__(
@@ -1872,26 +1872,42 @@ class FaultMavenClient:
     def _error_detail(resp: httpx.Response) -> str:
         """The backend's error explanation, truncated — for logs and messages.
 
-        A JSON object naming none of the keys ``_explanation`` reads is shown by
-        its key names alone, at any status: it may be a token response, or a
-        gateway echoing the request, and its values are credentials
-        (faultmaven#2591). Other bodies stay text: one that is not JSON (a
-        gateway's page), or whose explanation key holds no string (a 422's list
-        ``detail``).
+        A JSON object is never quoted whole: at any status, it may be a token
+        response or a gateway echoing the request, and its values, even its keys,
+        can be credentials (faultmaven#2591). Without an explanation it reads as a
+        fixed phrase; a list ``detail`` (FastAPI's 422) reads from each item's
+        ``loc`` and ``msg`` only, since its ``input`` echoes the request. A body
+        that is not a JSON object (a gateway's page) stays text.
         """
 
         try:
             body = resp.json()
         except ValueError:
             body = None
-        text = resp.text
-        if isinstance(body, dict):
-            detail = FaultMavenClient._explanation(body)
-            if detail is not None:
-                text = detail
-            elif not body.keys() & {"detail", "message", "error", "error_description"}:
-                text = f"JSON body with no error explanation; keys: {', '.join(sorted(body))}"
+        if not isinstance(body, dict):
+            text = resp.text
+        else:
+            text = (
+                FaultMavenClient._explanation(body)
+                or FaultMavenClient._validation_errors(body.get("detail"))
+                or "a JSON body with no error explanation"
+            )
         return " ".join((text or "").split())[:300]
+
+    @staticmethod
+    def _validation_errors(detail: Any) -> str:
+        """A list ``detail`` as ``loc: msg`` per item, nothing else of it read."""
+
+        if not isinstance(detail, list):
+            return ""
+        parts = []
+        for item in detail:
+            loc = item.get("loc") if isinstance(item, dict) else None
+            msg = item.get("msg") if isinstance(item, dict) else None
+            if isinstance(msg, str) and isinstance(loc, list):
+                path = ".".join(str(p) for p in loc if isinstance(p, (str, int)))
+                parts.append(f"{path}: {msg}")
+        return "; ".join(parts)
 
     @staticmethod
     def _explanation(body: dict[str, Any]) -> str | None:
