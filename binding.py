@@ -115,17 +115,23 @@ def complete_bind(
     workspace consents successfully and is refused here).
 
     A missing access token is refused here, inside the ``try``, not in the
-    exchange, so a refresh token issued beside it is revoked too. The residual,
-    not revoked because no token reaches this frame: a 2xx other than 200, whose
-    JSON body is read into the error message but whose tokens the exchange drops
-    (faultmaven#2591); a 200 that is a proxy page, whose body cannot be read;
-    and a 200 whose JSON is not an object, or whose token is not a string.
+    exchange, so a refresh token issued beside it is revoked too. A refused
+    exchange hands back the tokens its body carried (``exc.issued``), so a
+    status other than 200 that issued them is revoked as well (faultmaven#2591).
+    The residual, not revoked because no token reaches this frame: a body that
+    is not JSON (a proxy page), and JSON that is not an object, or whose token
+    is not a string.
     """
 
-    access, refresh = fm.exchange_authorization_code(
-        code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
-    )
+    access = refresh = ""
     try:
+        try:
+            access, refresh = fm.exchange_authorization_code(
+                code=code, code_verifier=record.code_verifier, redirect_uri=redirect_uri
+            )
+        except WorkspaceBindError as exc:
+            access, refresh = exc.issued
+            raise
         if not access:
             raise WorkspaceBindError("code exchange returned no access_token")
         binding = fm.bind_workspace(

@@ -455,6 +455,10 @@ class WorkspaceBindError(FaultMavenError):
     or library text. Only then is it kept as ``page_message``, the text the bind
     page may show; otherwise ``page_message`` is None and the page shows fixed
     text. ``str()`` is the full message either way, for the log.
+
+    ``issued`` is the ``(access, refresh)`` a refused code exchange parsed, for
+    ``complete_bind`` to revoke. It is kept out of ``args``, so neither
+    ``str()`` nor ``repr()`` shows it.
     """
 
     def __init__(
@@ -464,11 +468,13 @@ class WorkspaceBindError(FaultMavenError):
         status_code: int = 0,
         retryable: bool = False,
         browser_safe: bool = False,
+        issued: tuple[str, str] = ("", ""),
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
         self.page_message = message if browser_safe else None
+        self.issued = issued
 
 
 @dataclass(frozen=True, slots=True)
@@ -1864,16 +1870,27 @@ class FaultMavenClient:
 
     @staticmethod
     def _error_detail(resp: httpx.Response) -> str:
-        """The backend's error explanation, truncated — for logs and messages."""
+        """The backend's error explanation, truncated — for logs and messages.
+
+        A JSON object naming none of the keys ``_explanation`` reads is shown by
+        its key names alone, at any status: it may be a token response, or a
+        gateway echoing the request, and its values are credentials
+        (faultmaven#2591). Other bodies stay text: one that is not JSON (a
+        gateway's page), or whose explanation key holds no string (a 422's list
+        ``detail``).
+        """
 
         try:
             body = resp.json()
-            detail = (
-                FaultMavenClient._explanation(body) if isinstance(body, dict) else None
-            )
-            text = detail if isinstance(detail, str) else resp.text
         except ValueError:
-            text = resp.text
+            body = None
+        text = resp.text
+        if isinstance(body, dict):
+            detail = FaultMavenClient._explanation(body)
+            if detail is not None:
+                text = detail
+            elif not body.keys() & {"detail", "message", "error", "error_description"}:
+                text = f"JSON body with no error explanation; keys: {', '.join(sorted(body))}"
         return " ".join((text or "").split())[:300]
 
     @staticmethod
@@ -1983,7 +2000,8 @@ class FaultMavenClient:
         string, reads as ``""``. A body with a refresh token and no access token
         is returned, not refused here: refusing it here would drop a live admin
         refresh token unrevoked. ``complete_bind`` refuses it inside the ``try``
-        whose ``finally`` revokes both.
+        whose ``finally`` revokes both. For the same reason a refused status
+        hands back the tokens its body carries, as ``WorkspaceBindError.issued``.
         """
 
         try:
@@ -2003,10 +2021,15 @@ class FaultMavenClient:
                 retryable=True,
             ) from exc
         if resp.status_code != 200:
+            try:
+                issued = self._issued_tokens(resp.json())
+            except ValueError:
+                issued = ("", "")
             raise WorkspaceBindError(
                 f"FaultMaven refused the authorization code "
                 f"({resp.status_code}): {self._error_detail(resp)}",
                 status_code=resp.status_code,
+                issued=issued,
             )
         try:
             body = resp.json()
@@ -2022,6 +2045,15 @@ class FaultMavenClient:
             raise WorkspaceBindError(
                 "code exchange returned a JSON body that is not an object"
             )
+        return self._issued_tokens(body)
+
+    @staticmethod
+    def _issued_tokens(body: Any) -> tuple[str, str]:
+        """A token body's ``(access, refresh)``; ``""`` for each one absent or
+        not a string, and for a body that is not an object."""
+
+        if not isinstance(body, dict):
+            return "", ""
         access, refresh = body.get("access_token"), body.get("refresh_token")
         return (
             access if isinstance(access, str) else "",
