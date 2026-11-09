@@ -455,6 +455,10 @@ class WorkspaceBindError(FaultMavenError):
     or library text. Only then is it kept as ``page_message``, the text the bind
     page may show; otherwise ``page_message`` is None and the page shows fixed
     text. ``str()`` is the full message either way, for the log.
+
+    ``issued`` is the ``(access, refresh)`` a refused code exchange parsed, for
+    ``complete_bind`` to revoke; it clears them once read. It is kept out of
+    ``args``, so neither ``str()`` nor ``repr()`` shows it.
     """
 
     def __init__(
@@ -464,11 +468,13 @@ class WorkspaceBindError(FaultMavenError):
         status_code: int = 0,
         retryable: bool = False,
         browser_safe: bool = False,
+        issued: tuple[str, str] = ("", ""),
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
         self.page_message = message if browser_safe else None
+        self.issued = issued
 
 
 @dataclass(frozen=True, slots=True)
@@ -1864,17 +1870,44 @@ class FaultMavenClient:
 
     @staticmethod
     def _error_detail(resp: httpx.Response) -> str:
-        """The backend's error explanation, truncated — for logs and messages."""
+        """The backend's error explanation, truncated — for logs and messages.
+
+        A JSON object is never quoted whole: at any status, it may be a token
+        response or a gateway echoing the request, and its values, even its keys,
+        can be credentials (faultmaven#2591). Without an explanation it reads as a
+        fixed phrase; a list ``detail`` (FastAPI's 422) reads from each item's
+        ``loc`` and ``msg`` only, since its ``input`` echoes the request. A body
+        that is not a JSON object (a gateway's page) stays text.
+        """
 
         try:
             body = resp.json()
-            detail = (
-                FaultMavenClient._explanation(body) if isinstance(body, dict) else None
-            )
-            text = detail if isinstance(detail, str) else resp.text
         except ValueError:
+            body = None
+        if not isinstance(body, dict):
             text = resp.text
+        else:
+            text = (
+                FaultMavenClient._explanation(body)
+                or FaultMavenClient._validation_errors(body.get("detail"))
+                or "a JSON body with no error explanation"
+            )
         return " ".join((text or "").split())[:300]
+
+    @staticmethod
+    def _validation_errors(detail: Any) -> str:
+        """A list ``detail`` as ``loc: msg`` per item, nothing else of it read."""
+
+        if not isinstance(detail, list):
+            return ""
+        parts = []
+        for item in detail:
+            loc = item.get("loc") if isinstance(item, dict) else None
+            msg = item.get("msg") if isinstance(item, dict) else None
+            if isinstance(msg, str) and isinstance(loc, list):
+                path = ".".join(str(p) for p in loc if isinstance(p, (str, int)))
+                parts.append(f"{path}: {msg}")
+        return "; ".join(parts)
 
     @staticmethod
     def _explanation(body: dict[str, Any]) -> str | None:
@@ -1983,7 +2016,8 @@ class FaultMavenClient:
         string, reads as ``""``. A body with a refresh token and no access token
         is returned, not refused here: refusing it here would drop a live admin
         refresh token unrevoked. ``complete_bind`` refuses it inside the ``try``
-        whose ``finally`` revokes both.
+        whose ``finally`` revokes both. For the same reason a refused status
+        hands back the tokens its body carries, as ``WorkspaceBindError.issued``.
         """
 
         try:
@@ -2003,10 +2037,15 @@ class FaultMavenClient:
                 retryable=True,
             ) from exc
         if resp.status_code != 200:
+            try:
+                issued = self._issued_tokens(resp.json())
+            except ValueError:
+                issued = ("", "")
             raise WorkspaceBindError(
                 f"FaultMaven refused the authorization code "
                 f"({resp.status_code}): {self._error_detail(resp)}",
                 status_code=resp.status_code,
+                issued=issued,
             )
         try:
             body = resp.json()
@@ -2022,6 +2061,15 @@ class FaultMavenClient:
             raise WorkspaceBindError(
                 "code exchange returned a JSON body that is not an object"
             )
+        return self._issued_tokens(body)
+
+    @staticmethod
+    def _issued_tokens(body: Any) -> tuple[str, str]:
+        """A token body's ``(access, refresh)``; ``""`` for each one absent or
+        not a string, and for a body that is not an object."""
+
+        if not isinstance(body, dict):
+            return "", ""
         access, refresh = body.get("access_token"), body.get("refresh_token")
         return (
             access if isinstance(access, str) else "",
