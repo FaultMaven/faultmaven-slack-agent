@@ -120,23 +120,25 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
 
 
 def _engine_url(database_url: str) -> URL:
-    """Parse ``database_url``, naming ``_POSTGRES_DRIVERNAME`` for bare Postgres,
-    and ``sslmode=require`` for a Postgres URL that names no ``sslmode``.
+    """Parse ``database_url``, naming ``_POSTGRES_DRIVERNAME`` for bare Postgres.
 
     ``create_engine`` imports the DBAPI eagerly, so a URL that resolves to an
     uninstalled driver fails at boot. An explicit ``postgresql+<driver>://`` is
     the operator's choice and is left alone.
 
-    ``require`` fails closed (ruled 2026-11-13, FaultMaven #2733): libpq
-    verifies it against ``PGSSLROOTCERT``, the root set ``tls_root_set``
-    exports, and refuses a server outside it, where libpq's default ``prefer``
-    would fall back to plaintext. An explicit ``sslmode``, ``disable``
-    included, is kept.
+    The ``sslmode`` default is not set here: ``tls_root_set`` sets
+    ``PGSSLMODE=verify-full``, which libpq applies only when neither the URL nor
+    a service file names one. A URL naming ``sslrootcert`` refuses the start:
+    libpq would verify against that file instead of the root set.
     """
 
     url = make_url(database_url)
+    if "sslrootcert" in url.query:
+        raise SystemExit(
+            f"TLS root set: SLACK_DATABASE_URL names sslrootcert="
+            f"{url.query['sslrootcert']!r}. The agent names the set in PGSSLROOTCERT "
+            "itself: remove sslrootcert, or put its CA certificates in TLS_EXTRA_CA_FILE."
+        )
     if url.drivername == "postgresql":
         url = url.set(drivername=_POSTGRES_DRIVERNAME)
-    if url.get_backend_name() == "postgresql" and "sslmode" not in url.query:
-        url = url.update_query_dict({"sslmode": "require"})
     return url

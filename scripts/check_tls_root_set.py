@@ -8,7 +8,8 @@ Modelled on core's ``scripts/check_tls_root_set.py``. Two steps, as CI runs them
 
 ``--make-certs`` writes two throwaway CAs, each with a leaf for ``127.0.0.1``:
 ``set``, given to the agent as ``TLS_EXTRA_CA_FILE``, and ``outside``, in no
-set. ``--certs`` serves them from loopback responders that count completed TLS
+set; the set CA also signs a ``wronghost`` leaf for ``wrong.example`` only.
+``--certs`` serves them from loopback responders that count completed TLS
 handshakes, and runs each client, built through its product constructor, in a
 fresh process (retries off), in three arms:
 
@@ -18,10 +19,14 @@ fresh process (retries off), in three arms:
 
 An HTTPS row passes when **set** succeeds after a handshake and **unset** and
 **bare** fail with a certificate verification error. The Postgres rows go
-through ``build_oauth_stores``: ``verify-full`` against the set's leaf; a URL
-naming no ``sslmode`` (so ``require``, ruled 2026-11-13) against the outside
-leaf, which only the set refuses; and ``sslmode=disable``, which attempts no
-TLS. One row reads ``TLS_EXTRA_CA_FILE`` from a ``.env`` through ``Settings``.
+through ``build_oauth_stores``. A URL naming no ``sslmode`` gets the agent's
+default, ``verify-full`` (``PGSSLMODE``, ruled 2026-11-13); **bare** gets
+libpq's ``prefer``, which verifies nothing without a root file. Against the
+set's leaf it connects under **set**; against the outside leaf it is refused
+under **set**; against the wrong-host leaf **set** refuses the host name. An
+explicit ``verify-full`` and ``sslmode=disable`` (no TLS attempted) are rows
+too. One row reads ``TLS_EXTRA_CA_FILE`` only from a ``.env`` through
+``Settings``.
 
 Socket Mode's builtin client wraps TLS only on port 443, so its responder
 listens on ``127.0.0.1:443`` (unprivileged in a container). Every row connects
@@ -167,7 +172,11 @@ ROWS = {
     "shortcut response_url (httpx)": ("https", _respond_ephemeral, "https"),
     "Socket Mode websocket": ("wss", _socket_mode, "https"),
     "postgres verify-full": ("pg", _oauth_stores("pg", "&sslmode=verify-full"), "pg"),
-    "postgres no sslmode, outside CA": ("outside", _oauth_stores("outside", ""), "require"),
+    "postgres no sslmode, set CA": ("pg", _oauth_stores("pg", ""), "default"),
+    "postgres no sslmode, outside CA": ("outside", _oauth_stores("outside", ""), "outside"),
+    "postgres no sslmode, wrong host": (
+        "wronghost", _oauth_stores("wronghost", ""), "wronghost",
+    ),  # fmt: skip
     "postgres sslmode=disable": ("pg", _oauth_stores("pg", "&sslmode=disable"), "plain"),
 }
 
@@ -308,8 +317,12 @@ def _verdict(kind: str, arm: str, code: int, said: str, tls: int, plain: int) ->
     refused_unverified = code != 0 and any(text in said for text in VERIFY_FAILED)
     if kind == "plain":  # sslmode=disable: through in plaintext, in every arm
         return code == 0 and tls == 0 and plain >= 1
-    if kind == "require":  # only the set verifies require; bare completes TLS
-        return tls >= 1 if arm == "bare" else refused_unverified
+    if kind in ("default", "outside", "wronghost") and arm == "bare":
+        return tls >= 1  # libpq's prefer: TLS, verified against nothing
+    if kind == "outside":  # outside the set: refused with or without the setting
+        return refused_unverified
+    if kind == "wronghost" and arm == "set":  # verify-full checks the host name
+        return code != 0 and "does not match host name" in said
     if arm == "set":
         return code == 0 and tls >= 1
     if kind == "pg" and arm == "bare":  # libpq has no root file: no handshake
@@ -323,8 +336,8 @@ def _run(name: str, arm: str, ports: dict, counts: dict, env: dict, scratch: Pat
     env = dict(env)
     cwd = scratch / "cwd"
     if arm == "set" and kind == "dotenv":
-        cwd = scratch / "dotenv"
-    elif arm != "set":
+        cwd = scratch / "dotenv"  # the setting arrives only through .env
+    if arm != "set" or kind == "dotenv":
         env.pop("TLS_EXTRA_CA_FILE")
     command = [sys.executable, __file__, "--child", name, "--arm", arm]
     try:
@@ -383,6 +396,7 @@ def check(certs: Path) -> int:
             "wss": (inside, False, SOCKET_MODE_PORT),
             "pg": (inside, True, 0),
             "outside": (outside, True, 0),
+            "wronghost": (_server_context(certs, "wronghost"), True, 0),
         }
         unavailable = {}
         for server, (context, postgres, port) in servers.items():
@@ -424,16 +438,23 @@ subjectKeyIdentifier = hash
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,digitalSignature
 extendedKeyUsage = serverAuth
-subjectAltName = IP:127.0.0.1,DNS:localhost
+subjectAltName = {san}
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid
 """
 
 
+#: CA: its leaves, each (name, subjectAltName).
+_LEAVES = {
+    "set": (("set", "IP:127.0.0.1,DNS:localhost"), ("wronghost", "DNS:wrong.example")),
+    "outside": (("outside", "IP:127.0.0.1,DNS:localhost"),),
+}
+
+
 def make_certs(directory: Path) -> None:
-    """``<name>-ca.pem``, ``<name>-chain.pem`` and ``<name>-key.pem`` for ``set``
-    and ``outside``, world-readable (throwaway) so the image's user reads them
-    through a bind mount. The CA keys are discarded."""
+    """``<ca>-ca.pem`` for ``set`` and ``outside``, and ``<leaf>-chain.pem`` and
+    ``<leaf>-key.pem`` for each of ``_LEAVES``, world-readable (throwaway) so the
+    image's user reads them through a bind mount. The CA keys are discarded."""
 
     def openssl(*args) -> None:
         subprocess.run(["openssl", *map(str, args)], check=True, capture_output=True)
@@ -442,20 +463,20 @@ def make_certs(directory: Path) -> None:
     ec = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
     with tempfile.TemporaryDirectory() as name:
         work = Path(name)
-        for set_name in ("set", "outside"):
-            ca, ca_key = directory / f"{set_name}-ca.pem", work / "ca-key.pem"
-            ca_config, leaf_config = work / "ca.cnf", work / "leaf.cnf"
-            ca_config.write_text(_CONFIG.format(cn=f"{set_name} probe CA"))
-            leaf_config.write_text(_CONFIG.format(cn="localhost"))
-            openssl("req", "-x509", "-config", ca_config, "-extensions", "ca", *ec,
+        for ca_name, leaves in _LEAVES.items():
+            ca, ca_key, config = directory / f"{ca_name}-ca.pem", work / "ca-key", work / "cnf"
+            config.write_text(_CONFIG.format(cn=f"{ca_name} probe CA", san=""))
+            openssl("req", "-x509", "-config", config, "-extensions", "ca", *ec,
                     "-keyout", ca_key, "-out", ca, "-days", "2")  # fmt: skip
-            key, csr, leaf = directory / f"{set_name}-key.pem", work / "csr", work / "leaf"
-            openssl("req", "-new", "-config", leaf_config, *ec, "-keyout", key, "-out", csr)
-            openssl("x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key,
-                    "-set_serial", secrets.randbits(63), "-days", "2", "-sha256",
-                    "-extfile", leaf_config, "-extensions", "leaf", "-out", leaf)  # fmt: skip
-            chain = leaf.read_bytes() + ca.read_bytes()
-            (directory / f"{set_name}-chain.pem").write_bytes(chain)
+            for leaf_name, san in leaves:
+                config.write_text(_CONFIG.format(cn=san.split(":")[-1], san=san))
+                key, csr, leaf = directory / f"{leaf_name}-key.pem", work / "csr", work / "leaf"
+                openssl("req", "-new", "-config", config, *ec, "-keyout", key, "-out", csr)
+                openssl("x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key,
+                        "-set_serial", secrets.randbits(63), "-days", "2", "-sha256",
+                        "-extfile", config, "-extensions", "leaf", "-out", leaf)  # fmt: skip
+                chain = leaf.read_bytes() + ca.read_bytes()
+                (directory / f"{leaf_name}-chain.pem").write_bytes(chain)
     directory.chmod(0o755)
     for file in directory.iterdir():
         file.chmod(0o644)

@@ -84,7 +84,7 @@ def _isolated(tmp_path, monkeypatch):
     tmp_path; ``os.environ`` and the settings cache restored after."""
 
     saved = dict(os.environ)
-    for name in (*OWNED_VARIABLES, EXTRA_CA_FILE_SETTING):
+    for name in (*OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE"):
         os.environ.pop(name, None)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config.get_settings.cache_clear()
@@ -369,6 +369,25 @@ def test_an_inherited_device_or_fifo_refuses_without_reading_it(tmp_path, kind):
     assert f"SSL_CERT_FILE={target!r} is neither the set's file" in child.stderr
 
 
+def test_a_hashed_entry_in_the_shipped_empty_capath_refuses(os_bundle, tmp_path, monkeypatch):
+    capath = tmp_path / "shipped-capath"
+    capath.mkdir()
+    (capath / "README").write_text("holds no certificate")
+    monkeypatch.setattr(tls_root_set, "EMPTY_CAPATH", str(capath))
+    apply_root_set(None)
+    (capath / "0badc0de.0").write_bytes(_ca_pem("planted root"))
+    with pytest.raises(SystemExit, match="shipped-capath must hold no certificate"):
+        apply_root_set(None)
+
+
+def test_a_platform_without_getuid_refuses_the_start(os_bundle, monkeypatch):
+    """Windows: no certificate store support, and no owner check."""
+
+    monkeypatch.delattr(os, "getuid")
+    with pytest.raises(SystemExit, match="this platform is not supported"):
+        apply_root_set(None)
+
+
 # --- the OS bundle's resolution ----------------------------------------------
 
 
@@ -513,6 +532,20 @@ def test_a_missing_or_altered_set_file_is_rewritten_and_the_start_goes_ahead(
     assert _loaded(first.path) == {_digest(pem) for pem in (*_roots(), _extra())}
 
 
+@pytest.mark.parametrize("inherited", [None, "disable", "prefer"])
+def test_pgsslmode_defaults_to_verify_full_and_an_inherited_one_is_kept(
+    os_bundle, inherited
+):
+    """Ruled 2026-11-13: a database URL naming no sslmode verifies the chain
+    and the host name. libpq applies PGSSLMODE only when neither the URL nor a
+    service file names one, so an explicit choice is never lowered."""
+
+    if inherited:
+        os.environ["PGSSLMODE"] = inherited
+    apply_root_set(None)
+    assert os.environ["PGSSLMODE"] == (inherited or "verify-full")
+
+
 # --- the setting and the launchers -------------------------------------------
 
 
@@ -560,3 +593,52 @@ def test_app_main_applies_the_root_set_before_building_any_client(
         app.main()
     client = "run_http" if transport == "http" else "build_app"
     assert calls == ["set /etc/private-ca.pem", client]
+
+
+def _preflight():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_preflight", "scripts/preflight.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_preflight_applies_the_root_set_after_config_and_before_any_client(
+    monkeypatch, capsys, refused
+):
+    """A refusal is a failed check and a non-zero exit, not a bare SystemExit."""
+
+    preflight = _preflight()
+    calls: list[str] = []
+    settings = type(
+        "S", (), {"slack_transport": "socket", "tls_extra_ca_file": "/etc/private-ca.pem"}
+    )()
+
+    def apply(extra):
+        calls.append(f"set {extra}")
+        if refused:
+            raise SystemExit("TLS root set: SSL_CERT_FILE='/x' is neither the set's file")
+        return tls_root_set.RootSet("/the/set.pem", (), extra, 3)
+
+    def client_check(name, result=True):
+        return lambda *args, **kwargs: calls.append(name) or result
+
+    monkeypatch.setattr("sys.argv", ["preflight.py"])
+    monkeypatch.setattr(preflight, "check_config", lambda: (calls.append("config"), (True, settings))[1])
+    monkeypatch.setattr(preflight, "apply_root_set", apply)
+    for name in ("check_slack_bot", "check_slack_app", "check_backend", "check_backend_auth"):
+        monkeypatch.setattr(preflight, name, client_check(name))
+    fm = type("FM", (), {"close": lambda self: None})()
+    monkeypatch.setattr(preflight, "make_fault_client", lambda *a: calls.append("client") or fm)
+
+    code = preflight.main()
+    out = capsys.readouterr().out
+    if refused:
+        assert code == 1 and calls == ["config", "set /etc/private-ca.pem"]
+        assert "✗" in out and "neither the set's file" in out
+    else:
+        assert code == 0
+        assert calls[:3] == ["config", "set /etc/private-ca.pem", "check_slack_bot"]
+        assert "/the/set.pem" in out

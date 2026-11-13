@@ -56,7 +56,7 @@ the infra repo.
 | `SLACK_TRANSPORT=http` | config | selects the HTTP/OAuth runtime |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | secret | Basic Information → App Credentials |
 | `SLACK_SIGNING_SECRET` | secret | verifies inbound requests |
-| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. |
+| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. Naming no `sslmode`, it connects with `verify-full` ([TLS roots](#tls-roots-and-postgres)) |
 | `SLACK_OAUTH_REDIRECT_URI` | config | pinned to `https://slack.faultmaven.ai/slack/oauth_redirect` |
 | `FAULTMAVEN_API_URL=https://api.faultmaven.ai` | config | cluster backend |
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
@@ -77,19 +77,27 @@ error on the first Slack event.
 Every TLS client the agent builds verifies against one root set: the OS CA
 bundle, plus the certificates in `TLS_EXTRA_CA_FILE` (`tls_root_set.py`). At
 start the agent names the set in `SSL_CERT_FILE`, `PGSSLROOTCERT` and the other
-variables its clients read, so do not set those yourself: any other value
-refuses the start.
+variables its clients read, so do not set those in its environment: any other
+value refuses the start. A `SLACK_DATABASE_URL` naming `sslrootcert` refuses it
+too.
 
-A `SLACK_DATABASE_URL` that names no `sslmode` connects with `sslmode=require`,
-verified against that set (ruled 2026-11-13, FaultMaven #2733). So, **before
-this image rolls out**:
+A `SLACK_DATABASE_URL` that names no `sslmode` connects with `verify-full`:
+the server's certificate must chain to the set and name the URL's host (ruled
+2026-11-13, FaultMaven #2733). The agent sets it as `PGSSLMODE` unless its
+environment names one, so a URL or service-file `sslmode`, or an inherited
+`PGSSLMODE`, is kept. So, **before this image is promoted**, the deployment's
+database URL must either:
 
-- put the deployment's Postgres CA in `TLS_EXTRA_CA_FILE` (a Postgres served
-  with a certificate from a public CA needs nothing);
-- or, for a Postgres without TLS, add `?sslmode=disable` to the URL.
+- reach a Postgres serving TLS with a certificate that names the URL's host
+  and chains to the set: a private CA goes in `TLS_EXTRA_CA_FILE`, and a
+  public CA's certificate still has to name that host;
+- or name an `sslmode` explicitly: `?sslmode=disable` for a Postgres without
+  TLS.
 
-With neither, the agent refuses the connection; it never falls back to
-plaintext. An explicit `sslmode` in the URL is kept.
+With neither, the agent refuses the connection. An explicit `prefer` or
+`allow` is kept too, and against a server whose certificate is outside the set
+it falls back to plaintext: use `verify-full`, or `disable` for a server with
+no TLS.
 
 With `TLS_EXTRA_CA_FILE` set, the agent writes the set to a file under `TMPDIR`
 (default `/tmp`), which must then be writable.

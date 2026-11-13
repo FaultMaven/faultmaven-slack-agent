@@ -60,9 +60,12 @@ RUN find / -xdev \( -path '*/pip/_vendor/certifi/cacert.pem' \
 
 # Non-root: the runtime needs no privileged access. Owns /app/data so a SQLite
 # fallback (dev only — the cluster uses Postgres) can be written if configured.
+# The empty capath SSL_CERT_DIR names (tls_root_set.py) stays root's, so the
+# runtime user cannot add a root to it.
 RUN useradd --create-home --uid 10001 faultmaven \
     && mkdir -p /app/data \
-    && chown -R faultmaven:faultmaven /app
+    && chown -R faultmaven:faultmaven /app \
+    && chown -R root:root /app/tls_empty_capath
 
 # Fail the build if "emSign ECC Root CA - G3" (GHSA-6q48-6c7w-9gw2: compromised
 # intermediate keys) or "AAA Certificate Services" is in OpenSSL's default cafile or

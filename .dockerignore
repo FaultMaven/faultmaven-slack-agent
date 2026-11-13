@@ -1,5 +1,13 @@
-# Kept out of the build context: a checkout's virtualenv, git metadata and
-# local secrets (.env) must never reach an image layer.
+# Kept out of the build context: a checkout's virtualenvs, git metadata, local
+# secrets (.env files), runtime state (data/, which can hold a live refresh
+# credential) and agent worktrees must never reach an image layer.
 .venv
+**/.venv
+venv/
+env/
 .git
 .env
+.env.*
+!.env.example
+data/
+.claude/

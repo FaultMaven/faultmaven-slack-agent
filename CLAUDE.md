@@ -18,9 +18,11 @@ python app.py                              # SLACK_TRANSPORT=socket (default) or
 - Run from the repo root: `.env` is read from the cwd, while relative
   `CASE_STORE_PATH` / `CREDENTIAL_STORE_PATH` resolve against the repo.
 - The OAuth-store round-trip also runs on Postgres when `TEST_POSTGRES_URL`
-  is set (CI sets it to a `postgres:16` service); unset, that case skips.
-- `generate_api_models.py` needs `datamodel-codegen` and `ruff` on `PATH` and
-  network access to fetch the pinned spec.
+  is set (CI sets it to a `postgres:16` service); unset, that case skips. A
+  Postgres without TLS needs `?sslmode=disable` in that URL.
+- `generate_api_models.py` needs `datamodel-codegen` and `ruff` on `PATH`,
+  `pydantic-settings` (it applies the TLS root set first) and network access
+  to fetch the pinned spec.
 - **Preflight rotates credentials** under the refresh grant: the default run
   renews the default one, `--full` every bound workspace's. Never run it against
   a shared `SLACK_DATABASE_URL` or a copy of a running agent's credential store.

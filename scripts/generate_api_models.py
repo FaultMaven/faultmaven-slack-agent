@@ -123,6 +123,29 @@ def check_pinned_version(document: dict) -> None:
         )
 
 
+def apply_root_set_from_env() -> None:
+    """The agent's TLS root set, with TLS_EXTRA_CA_FILE read as push_manifest
+    reads its settings: the environment, then this repo's own .env."""
+
+    from pydantic import Field
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from tls_root_set import apply_root_set
+
+    class _TlsSetting(BaseSettings):
+        model_config = SettingsConfigDict(
+            env_file=str(REPO_ROOT / ".env"),
+            env_file_encoding="utf-8",
+            case_sensitive=False,
+            extra="ignore",
+        )
+
+        tls_extra_ca_file: str | None = Field(default=None, validation_alias="TLS_EXTRA_CA_FILE")
+
+    apply_root_set(_TlsSetting().tls_extra_ca_file)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -130,6 +153,7 @@ def main() -> int:
         help="path or URL of the contract to generate from (default: the pin)",
     )
     args = parser.parse_args()
+    apply_root_set_from_env()  # before the contract's urlopen
 
     override = args.spec or os.environ.get("FM_OPENAPI_SPEC")
     spec = override or pinned_spec_url()

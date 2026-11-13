@@ -5,18 +5,32 @@ set. The agent's clients read roots from places of their own: slack-sdk and
 Socket Mode through OpenSSL's default paths, httpx through certifi unless
 ``SSL_CERT_FILE`` is set, libpq through ``PGSSLROOTCERT``. So ``apply_root_set``
 names the set in every variable one reads (``OWNED_VARIABLES``) before any client
-is built: it is called first in ``app.main()``, and in ``scripts/preflight.py``
-and ``scripts/push_manifest.py``.
+is built: it is called first in ``app.main()``, and in ``scripts/preflight.py``,
+``scripts/push_manifest.py`` and ``scripts/generate_api_models.py``.
+
+It also sets ``PGSSLMODE=verify-full`` unless the environment names a mode
+(ruled 2026-11-13, FaultMaven #2733): libpq applies it only when neither the
+URL nor a service file names ``sslmode``, so a database URL that names none
+verifies the chain against the set and the host name, and an explicit choice is
+never lowered.
 
 A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
 (the agent does not depend on core). Deliberate differences:
 
-- no Windows certificate store;
+- no Windows certificate store: a platform without ``os.getuid`` (Windows)
+  refuses the start;
 - no status surface (core's ``root_set_status``): ``apply_root_set`` logs the
   set's file and certificate count once at start instead;
-- the setting is a parameter (``Settings.tls_extra_ca_file``), and a relative
-  path resolves against this repository, as ``config.py`` anchors its store
-  paths;
+- the setting is a parameter (``Settings.tls_extra_ca_file``), ``expanduser``
+  is applied to it, and a relative path resolves against this repository, as
+  ``config.py`` anchors its store paths;
+- the resolved setting is exported by plain assignment to
+  ``TLS_EXTRA_CA_FILE`` (core replaces every letter-case spelling);
+- owned variables are read from the process environment only: one written in
+  ``.env`` is neither seen nor refused (core loads ``.env`` into the
+  environment first), and no client reads it either;
+- ``PGSSLMODE`` defaults to ``verify-full`` (core keeps libpq's ``prefer``);
+- the shipped empty capath is checked: a hashed entry in it refuses the start;
 - the set directory is ``faultmaven-slack-tls-<uid>``.
 
 A certificate is a PEM block labelled ``CERTIFICATE``. When a set file is
@@ -31,13 +45,14 @@ file this process names, or its bytes are exactly the bytes this process would
 write; an inherited ``SSL_CERT_DIR`` only when no element holds a hashed entry.
 Anything else refuses the start (``SystemExit``), as do an OS bundle that does
 not load, a setting with no certificate or a non-plain one, no usable temporary
-directory, and a set file that cannot be written safely or does not load.
+directory, a set file that cannot be written safely or does not load, a hashed
+entry in the shipped empty capath, and a platform without ``os.getuid``. A
+``SLACK_DATABASE_URL`` naming ``sslrootcert`` is refused by ``oauth_store``.
 Imports no client.
 """
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import logging
 import os
@@ -59,8 +74,8 @@ EXTRA_CA_FILE_SETTING = "TLS_EXTRA_CA_FILE"
 #: so slack-sdk's WebClient and Socket Mode) and httpx. ``REQUESTS_CA_BUNDLE``,
 #: then ``CURL_CA_BUNDLE``: requests. ``AWS_CA_BUNDLE``: botocore.
 #: ``GRPC_DEFAULT_SSL_ROOTS_FILE_PATH``: gRPC. ``PGSSLROOTCERT``: libpq's
-#: ``require`` and ``verify-*`` verify against it (``oauth_store`` defaults a
-#: Postgres URL to ``require``).
+#: ``require`` and ``verify-*`` verify against it, and ``prefer`` and ``allow``
+#: too, falling back to plaintext when that fails.
 FILE_VARIABLES = (
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
@@ -73,6 +88,8 @@ FILE_VARIABLES = (
 #: never a second root source.
 DIRECTORY_VARIABLE = "SSL_CERT_DIR"
 OWNED_VARIABLES = FILE_VARIABLES + (DIRECTORY_VARIABLE,)
+#: libpq's default ``sslmode`` for a URL that names none; an inherited one is kept.
+PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
 
 _REPO = Path(__file__).resolve().parent
 #: Shipped with the agent; holds only a README.
@@ -111,6 +128,16 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
     ``extra_ca_file`` is ``TLS_EXTRA_CA_FILE``; empty or whitespace is unset.
     """
 
+    if not hasattr(os, "getuid"):
+        raise SystemExit(
+            "TLS root set: this platform is not supported (no os.getuid, so the "
+            "set directory's owner cannot be checked; no Windows certificate store)."
+        )
+    if _hashed_entries(EMPTY_CAPATH):
+        raise SystemExit(
+            f"TLS root set: {EMPTY_CAPATH} must hold no certificate, and holds a "
+            "hashed certificate entry: remove it."
+        )
     os_source, pem, os_file = _resolve_os_bundle()
     extra = _resolve_setting(extra_ca_file)
     if extra is not None:
@@ -126,6 +153,7 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
     for name in FILE_VARIABLES:
         os.environ[name] = path
     os.environ[DIRECTORY_VARIABLE] = EMPTY_CAPATH
+    os.environ.setdefault(PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT)
     sources = (os_source,) + ((extra,) if extra else ())
     root_set = RootSet(path, sources, extra, len(pem_digests(pem)))
     logger.info(
@@ -202,8 +230,7 @@ def _hashed_entries(directory: str) -> list[str]:
 
 
 def _directory_name() -> str:
-    user = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
-    return "faultmaven-slack-tls-" + re.sub(r"[^A-Za-z0-9_.-]", "_", user)
+    return f"faultmaven-slack-tls-{os.getuid()}"
 
 
 def _set_directory() -> str:
