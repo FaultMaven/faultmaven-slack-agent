@@ -84,7 +84,7 @@ def _isolated(tmp_path, monkeypatch):
     tmp_path; ``os.environ`` and the settings cache restored after."""
 
     saved = dict(os.environ)
-    for name in (*OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE"):
+    for name in (*OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE", "PGSERVICE"):
         os.environ.pop(name, None)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config.get_settings.cache_clear()
@@ -380,6 +380,19 @@ def test_a_hashed_entry_in_the_shipped_empty_capath_refuses(os_bundle, tmp_path,
         apply_root_set(None)
 
 
+def test_an_inherited_pgservice_refuses_and_a_service_file_alone_does_not(
+    os_bundle, tmp_path
+):
+    """A service's options, sslrootcert among them, apply before the
+    environment's; PGSERVICEFILE alone names no service."""
+
+    os.environ["PGSERVICEFILE"] = str(tmp_path / "pg_service.conf")
+    apply_root_set(None)
+    os.environ["PGSERVICE"] = "probe"
+    with pytest.raises(SystemExit, match="PGSERVICE='probe'.*TLS_EXTRA_CA_FILE"):
+        apply_root_set(None)
+
+
 def test_a_platform_without_getuid_refuses_the_start(os_bundle, monkeypatch):
     """Windows: no certificate store support, and no owner check."""
 
@@ -642,3 +655,23 @@ def test_preflight_applies_the_root_set_after_config_and_before_any_client(
         assert code == 0
         assert calls[:3] == ["config", "set /etc/private-ca.pem", "check_slack_bot"]
         assert "/the/set.pem" in out
+
+
+def test_generate_api_models_applies_the_set_from_dotenv_before_the_fetch(
+    tmp_path, monkeypatch
+):
+    """The contract fetch is stubbed: no network."""
+
+    import scripts.generate_api_models as generate
+
+    (tmp_path / ".env").write_text("TLS_EXTRA_CA_FILE=/etc/private-ca.pem\n")
+    calls: list[str] = []
+    monkeypatch.setattr(generate, "REPO_ROOT", tmp_path)  # its .env is read
+    monkeypatch.setattr(generate, "OUTPUT_PATH", tmp_path / "api_generated.py")
+    monkeypatch.setattr(tls_root_set, "apply_root_set", lambda extra: calls.append(f"set {extra}"))
+    monkeypatch.setattr(generate, "local_copy", lambda spec, *a, **k: calls.append("fetch") or "x")
+    monkeypatch.setattr(generate, "generate", lambda path: calls.append("generate") or 0)
+    monkeypatch.delenv("FM_OPENAPI_SPEC", raising=False)
+    monkeypatch.setattr("sys.argv", ["generate_api_models.py"])
+    assert generate.main() == 0
+    assert calls == ["set /etc/private-ca.pem", "fetch", "generate"]

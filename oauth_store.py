@@ -88,6 +88,7 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     connect_args = {"check_same_thread": False} if is_sqlite else {}
     # The URL object, not str(url): its string form masks the password.
     engine = create_engine(url, connect_args=connect_args)
+    _refuse_root_overrides(engine)  # before the first connection
 
     installation_store = SQLAlchemyInstallationStore(
         client_id=client_id, engine=engine, logger=logger
@@ -128,17 +129,39 @@ def _engine_url(database_url: str) -> URL:
 
     The ``sslmode`` default is not set here: ``tls_root_set`` sets
     ``PGSSLMODE=verify-full``, which libpq applies only when neither the URL nor
-    a service file names one. A URL naming ``sslrootcert`` refuses the start:
-    libpq would verify against that file instead of the root set.
+    a service file names one. ``_refuse_root_overrides`` checks what libpq
+    will be given.
     """
 
     url = make_url(database_url)
-    if "sslrootcert" in url.query:
-        raise SystemExit(
-            f"TLS root set: SLACK_DATABASE_URL names sslrootcert="
-            f"{url.query['sslrootcert']!r}. The agent names the set in PGSSLROOTCERT "
-            "itself: remove sslrootcert, or put its CA certificates in TLS_EXTRA_CA_FILE."
-        )
     if url.drivername == "postgresql":
         url = url.set(drivername=_POSTGRES_DRIVERNAME)
     return url
+
+
+def _refuse_root_overrides(engine: Engine) -> None:
+    """Refuse the start when the conninfo libpq will be given names
+    ``sslrootcert`` (libpq would verify against that file, not the root set) or
+    ``service`` (a service file's options, ``sslrootcert`` among them, apply
+    before the environment's).
+
+    Read as psycopg2 builds it: the dialect's connect arguments merged by
+    ``make_dsn`` and parsed back, so a ``dsn=`` alias or a key with stray
+    whitespace is seen as libpq sees it.
+    """
+
+    if engine.dialect.driver != "psycopg2":
+        return
+    from psycopg2.extensions import make_dsn, parse_dsn
+
+    cargs, cparams = engine.dialect.create_connect_args(engine.url)
+    params = dict(cparams)
+    dsn = cargs[0] if cargs else params.pop("dsn", None)
+    conninfo = parse_dsn(make_dsn(dsn, **params))
+    for key in ("sslrootcert", "service"):
+        if key in conninfo:
+            raise SystemExit(
+                f"TLS root set: SLACK_DATABASE_URL names {key}={conninfo[key]!r}. "
+                "The agent names the set in PGSSLROOTCERT itself: remove it, and put "
+                "the server's CA certificates in TLS_EXTRA_CA_FILE."
+            )

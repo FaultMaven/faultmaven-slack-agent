@@ -60,8 +60,8 @@ RUN find / -xdev \( -path '*/pip/_vendor/certifi/cacert.pem' \
 
 # Non-root: the runtime needs no privileged access. Owns /app/data so a SQLite
 # fallback (dev only — the cluster uses Postgres) can be written if configured.
-# The empty capath SSL_CERT_DIR names (tls_root_set.py) stays root's, so the
-# runtime user cannot add a root to it.
+# The empty capath SSL_CERT_DIR names (tls_root_set.py) stays root-owned, so
+# the runtime user cannot write into it.
 RUN useradd --create-home --uid 10001 faultmaven \
     && mkdir -p /app/data \
     && chown -R faultmaven:faultmaven /app \

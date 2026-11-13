@@ -46,8 +46,10 @@ write; an inherited ``SSL_CERT_DIR`` only when no element holds a hashed entry.
 Anything else refuses the start (``SystemExit``), as do an OS bundle that does
 not load, a setting with no certificate or a non-plain one, no usable temporary
 directory, a set file that cannot be written safely or does not load, a hashed
-entry in the shipped empty capath, and a platform without ``os.getuid``. A
-``SLACK_DATABASE_URL`` naming ``sslrootcert`` is refused by ``oauth_store``.
+entry in the shipped empty capath, a platform without ``os.getuid``, and an
+inherited ``PGSERVICE`` (a service's options, ``sslrootcert`` among them, apply
+before the environment's). A ``SLACK_DATABASE_URL`` whose conninfo names
+``sslrootcert`` or ``service`` is refused by ``oauth_store``.
 Imports no client.
 """
 
@@ -90,6 +92,9 @@ DIRECTORY_VARIABLE = "SSL_CERT_DIR"
 OWNED_VARIABLES = FILE_VARIABLES + (DIRECTORY_VARIABLE,)
 #: libpq's default ``sslmode`` for a URL that names none; an inherited one is kept.
 PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
+#: Names a libpq service, whose options libpq applies before the environment's;
+#: refused. ``PGSERVICEFILE`` and ``PGSYSCONFDIR`` alone name no service.
+PG_SERVICE_VARIABLE = "PGSERVICE"
 
 _REPO = Path(__file__).resolve().parent
 #: Shipped with the agent; holds only a README.
@@ -132,6 +137,13 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
         raise SystemExit(
             "TLS root set: this platform is not supported (no os.getuid, so the "
             "set directory's owner cannot be checked; no Windows certificate store)."
+        )
+    if os.environ.get(PG_SERVICE_VARIABLE):
+        raise SystemExit(
+            f"TLS root set: {PG_SERVICE_VARIABLE}={os.environ[PG_SERVICE_VARIABLE]!r} "
+            "names a libpq service, whose options (sslrootcert, sslmode) apply before "
+            f"the root set's: unset {PG_SERVICE_VARIABLE}, name the connection in "
+            f"SLACK_DATABASE_URL, and put its CA certificates in {EXTRA_CA_FILE_SETTING}."
         )
     if _hashed_entries(EMPTY_CAPATH):
         raise SystemExit(

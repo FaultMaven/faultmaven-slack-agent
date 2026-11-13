@@ -227,14 +227,41 @@ def test_explicit_driver_sslmode_and_sqlite_urls_are_left_alone(raw):
     assert _engine_url(raw).render_as_string(hide_password=False) == raw
 
 
-@pytest.mark.parametrize("value", ["system", "/etc/ssl/certs/ca-certificates.crt"])
-def test_a_database_url_naming_sslrootcert_refuses_the_start(value):
-    """libpq would verify against that file, not the root set."""
+@pytest.mark.parametrize(
+    ("query", "key"),
+    [
+        ("sslrootcert=system", "sslrootcert"),
+        ("sslrootcert=/etc/ssl/certs/ca-certificates.crt", "sslrootcert"),
+        ("dsn=sslrootcert%3D/tmp/other-ca.pem", "sslrootcert"),
+        ("sslrootcert%20=/tmp/other-ca.pem", "sslrootcert"),
+        ("service=x", "service"),
+    ],
+)
+def test_a_database_url_whose_conninfo_names_sslrootcert_or_service_refuses(query, key):
+    """libpq would verify against that file, or a service's options, not the
+    root set. Read as psycopg2 merges it, so an alias is no way around it."""
 
-    from oauth_store import _engine_url
+    from oauth_store import build_oauth_stores
 
-    with pytest.raises(SystemExit, match="sslrootcert=.*TLS_EXTRA_CA_FILE"):
-        _engine_url(f"postgresql://u:p@db/faultmaven_slack?sslrootcert={value}")
+    with pytest.raises(SystemExit, match=f"names {key}=.*TLS_EXTRA_CA_FILE"):
+        build_oauth_stores(database_url=f"postgresql://u@127.0.0.1/d?{query}", client_id="1")
+
+
+def test_a_database_url_with_sslmode_disable_goes_on_to_connect():
+    """Nothing refused: the connection itself is attempted (to a closed port)."""
+
+    import socket
+
+    import sqlalchemy.exc
+
+    from oauth_store import build_oauth_stores
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    url = f"postgresql://u@127.0.0.1:{port}/d?sslmode=disable&connect_timeout=5"
+    with pytest.raises(sqlalchemy.exc.OperationalError, match="Connection refused"):
+        build_oauth_stores(database_url=url, client_id="1")
 
 
 # --- FastAPI app -------------------------------------------------------------

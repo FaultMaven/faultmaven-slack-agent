@@ -78,8 +78,10 @@ Every TLS client the agent builds verifies against one root set: the OS CA
 bundle, plus the certificates in `TLS_EXTRA_CA_FILE` (`tls_root_set.py`). At
 start the agent names the set in `SSL_CERT_FILE`, `PGSSLROOTCERT` and the other
 variables its clients read, so do not set those in its environment: any other
-value refuses the start. A `SLACK_DATABASE_URL` naming `sslrootcert` refuses it
-too.
+value refuses the start. So do a `SLACK_DATABASE_URL` whose connection options
+name `sslrootcert` or a libpq `service` (a `dsn=` alias included), and an
+inherited `PGSERVICE`: a service file's options, `sslrootcert` among them,
+apply before the root set's.
 
 A `SLACK_DATABASE_URL` that names no `sslmode` connects with `verify-full`:
 the server's certificate must chain to the set and name the URL's host (ruled
