@@ -164,8 +164,14 @@ def _refuse_root_overrides(engine: Engine) -> None:
     conninfo = parse_dsn(make_dsn(dsn, **params))
     for key in ("sslrootcert", "sslcrl", "sslcrldir", "service"):
         if key in conninfo:
+            crl = (
+                " Postgres CRL revocation checking is not available here: libpq loads a"
+                " CRL source into its trust store, CA certificates included."
+                if key.startswith("sslcrl")
+                else ""
+            )
             raise SystemExit(
                 f"TLS root set: SLACK_DATABASE_URL names {key}={conninfo[key]!r}. "
                 "The agent names the set in PGSSLROOTCERT itself: remove it, and put "
-                "the server's CA certificates in TLS_EXTRA_CA_FILE."
+                f"the server's CA certificates in TLS_EXTRA_CA_FILE.{crl}"
             )

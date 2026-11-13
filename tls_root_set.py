@@ -16,10 +16,11 @@ against the set and the host name, and an explicit choice is never lowered.
 
 libpq also loads a CRL file or directory into its trust store, CA certificates
 in it included: ``sslcrl``/``sslcrldir``, ``PGSSLCRL``/``PGSSLCRLDIR``, and by
-default ``~/.postgresql/root.crl``. So ``PGSSLCRL`` names an empty file written
-beside the set file (``empty.crl``, same directory and checks), and libpq never
-reads the default; an inherited ``PGSSLCRL`` or ``PGSSLCRLDIR`` naming anything
-else refuses the start, as ``sslcrl`` or ``sslcrldir`` in the URL does.
+default ``~/.postgresql/root.crl``. So ``PGSSLCRL`` names ``/dev/null``, an
+empty CRL source, and libpq never reads the default; an inherited ``PGSSLCRL``
+or ``PGSSLCRLDIR`` naming anything else refuses the start, as ``sslcrl`` or
+``sslcrldir`` in the URL does. Postgres CRL revocation checking is therefore
+not available.
 
 A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
 (the agent does not depend on core). Deliberate differences:
@@ -38,6 +39,10 @@ A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
   environment first), and no client reads it either;
 - ``PGSSLMODE`` defaults to ``verify-full`` (core keeps libpq's ``prefer``);
 - the shipped empty capath is checked: a hashed entry in it refuses the start;
+- ``PGSSLCRL`` is exported as ``/dev/null``, and an inherited ``PGSSLCRL`` or
+  ``PGSSLCRLDIR`` naming anything else refuses the start (core leaves libpq's
+  CRL sources alone);
+- an inherited ``PGSERVICE``, of any value, refuses the start;
 - the set directory is ``faultmaven-slack-tls-<uid>``.
 
 A certificate is a PEM block labelled ``CERTIFICATE``. When a set file is
@@ -56,7 +61,7 @@ directory, a set file that cannot be written safely or does not load, a hashed
 entry in the shipped empty capath, a platform without ``os.getuid``, an
 inherited ``PGSERVICE`` of any value, empty included (a service's options,
 ``sslrootcert`` among them, apply before the environment's), and an inherited
-``PGSSLCRL`` or ``PGSSLCRLDIR`` that is not the agent's empty file. A
+``PGSSLCRL`` or ``PGSSLCRLDIR`` that is not ``/dev/null``. A
 ``SLACK_DATABASE_URL`` whose conninfo names ``sslrootcert``, ``sslcrl``,
 ``sslcrldir`` or ``service`` is refused by ``oauth_store``.
 Imports no client.
@@ -105,10 +110,10 @@ PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
 #: refused. ``PGSERVICEFILE`` and ``PGSYSCONFDIR`` alone name no service.
 PG_SERVICE_VARIABLE = "PGSERVICE"
 #: libpq loads these into its trust store, roots included; ``PGSSLCRL`` is
-#: exported as the agent's empty file, so the ``~/.postgresql/root.crl``
-#: default is never read.
+#: exported as ``EMPTY_CRL`` (no file to write), so the
+#: ``~/.postgresql/root.crl`` default is never read.
 PG_CRL_VARIABLES = ("PGSSLCRL", "PGSSLCRLDIR")
-EMPTY_CRL_NAME = "empty.crl"
+EMPTY_CRL = os.devnull
 
 _REPO = Path(__file__).resolve().parent
 #: Shipped with the agent; holds only a README.
@@ -174,16 +179,14 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
     named = extra is None and os_file
     path = os_source if named else os.path.join(_set_directory(), _name(pem))
     _check_inherited(path, pem, extra)
-    empty_crl = os.path.join(_set_directory(), EMPTY_CRL_NAME)
-    _check_inherited_crl(empty_crl)
+    _check_inherited_crl()
     if not named:  # written, or re-written if missing or altered (self-heal)
         _write_set(path, pem)
-    _write_safely(empty_crl, b"")
     for name in FILE_VARIABLES:
         os.environ[name] = path
     os.environ[DIRECTORY_VARIABLE] = EMPTY_CAPATH
     os.environ.setdefault(PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT)
-    os.environ[PG_CRL_VARIABLES[0]] = empty_crl
+    os.environ[PG_CRL_VARIABLES[0]] = EMPTY_CRL
     sources = (os_source,) + ((extra,) if extra else ())
     root_set = RootSet(path, sources, extra, len(pem_digests(pem)))
     logger.info(
@@ -349,14 +352,18 @@ def _check_inherited(path: str, pem: bytes, extra: str | None) -> None:
         _refuse(DIRECTORY_VARIABLE, directories, reason)
 
 
-def _check_inherited_crl(empty_crl: str) -> None:
-    """Refuse an inherited CRL variable that is not the agent's empty file."""
+def _check_inherited_crl() -> None:
+    """Refuse an inherited CRL variable that is not ``EMPTY_CRL``."""
 
     for name in PG_CRL_VARIABLES:
         value = os.environ.get(name)
-        if value and os.path.realpath(value) != os.path.realpath(empty_crl):
-            reason = "names a CRL source, which libpq loads into its trust store, roots included"
-            _refuse(name, value, reason)
+        if value and os.path.realpath(value) != EMPTY_CRL:
+            raise SystemExit(
+                f"TLS root set: {name}={value!r} names a CRL source, which libpq loads "
+                "into its trust store, CA certificates in it included. The agent names "
+                f"no CRL source but an empty one ({EMPTY_CRL}): unset {name}, and put "
+                f"CA certificates in {EXTRA_CA_FILE_SETTING}."
+            )
 
 
 def _refuse(name: str, value: str, reason: str) -> NoReturn:

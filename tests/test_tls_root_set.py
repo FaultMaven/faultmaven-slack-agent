@@ -434,7 +434,7 @@ def test_a_capath_only_os_bundle_is_built_into_a_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("unset", [None, "", "  "])
-def test_unset_names_the_os_bundle_in_every_variable_and_writes_only_the_empty_crl(
+def test_unset_names_the_os_bundle_in_every_variable_and_writes_nothing(
     os_bundle, tmp_path, unset
 ):
     applied = apply_root_set(unset)
@@ -444,7 +444,7 @@ def test_unset_names_the_os_bundle_in_every_variable_and_writes_only_the_empty_c
     )
     assert os.environ["SSL_CERT_DIR"] == EMPTY_CAPATH
     assert os.listdir(EMPTY_CAPATH) == ["README"]
-    assert os.listdir(_set_directory(tmp_path)) == ["empty.crl"]
+    assert not _set_directory(tmp_path).exists()
     assert EXTRA_CA_FILE_SETTING not in os.environ
 
 
@@ -531,40 +531,33 @@ def test_two_applies_name_one_file_and_write_nothing_else(os_bundle, extra_file)
         os.environ.pop(name)
     second = apply_root_set(str(extra_file))
     assert second.path == first.path
-    assert sorted(os.listdir(Path(first.path).parent)) == sorted(
-        [Path(first.path).name, "empty.crl"]
-    )
+    assert os.listdir(Path(first.path).parent) == [Path(first.path).name]
 
 
-def test_pgsslcrl_names_an_empty_file_beside_the_set(os_bundle, extra_file):
+def test_pgsslcrl_names_dev_null_and_no_file_is_written(os_bundle, tmp_path):
     """libpq loads a CRL source into its trust store, roots included; naming an
     empty one keeps it from reading ~/.postgresql/root.crl."""
 
-    applied = apply_root_set(str(extra_file))
-    crl = Path(os.environ["PGSSLCRL"])
-    assert crl.parent == Path(applied.path).parent and crl.name == "empty.crl"
-    assert crl.is_file() and crl.read_bytes() == b""
-    crl.write_bytes(b"planted")  # re-written, as the set file is
-    for name in (*OWNED_VARIABLES, "PGSSLCRL"):
-        os.environ.pop(name)
-    apply_root_set(str(extra_file))
-    assert crl.read_bytes() == b""
+    apply_root_set(None)
+    assert os.environ["PGSSLCRL"] == os.devnull
+    assert not _set_directory(tmp_path).exists()
 
 
 @pytest.mark.parametrize("name", ["PGSSLCRL", "PGSSLCRLDIR"])
-def test_an_inherited_crl_source_refuses_unless_it_is_the_agents_empty_file(
-    os_bundle, tmp_path, name
-):
-    apply_root_set(None)
-    own = os.environ.pop("PGSSLCRL")
-    os.environ[name] = own  # the agent's own empty file: accepted
+def test_an_inherited_crl_source_refuses_unless_it_is_dev_null(os_bundle, tmp_path, name):
+    os.environ[name] = os.devnull  # an empty source: accepted
     apply_root_set(None)
     os.environ.pop("PGSSLCRL", None)
-    other = tmp_path / "ca-plus-crl.pem"
+    planted = tmp_path / f"faultmaven-slack-tls-{os.getuid()}"
+    planted.mkdir()  # beside a set file: still not the earlier-start message
+    other = planted / "ca-plus-crl.pem"
     other.write_bytes(_ca_pem("outside CA"))
     os.environ[name] = str(other)
-    with pytest.raises(SystemExit, match=f"{name}=.*CRL source.*TLS_EXTRA_CA_FILE"):
+    with pytest.raises(SystemExit) as refusal:
         apply_root_set(None)
+    message = str(refusal.value)
+    assert f"{name}=" in message and "names no CRL source but an empty one" in message
+    assert "names the set" not in message and "earlier" not in message
 
 
 @pytest.mark.parametrize("damage", ["deleted", "altered"])
