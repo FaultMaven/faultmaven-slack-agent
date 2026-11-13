@@ -1,0 +1,5 @@
+# Kept out of the build context: a checkout's virtualenv, git metadata and
+# local secrets (.env) must never reach an image layer.
+.venv
+.git
+.env

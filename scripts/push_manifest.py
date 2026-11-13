@@ -48,6 +48,8 @@ import httpx  # noqa: E402
 from pydantic import Field  # noqa: E402
 from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: E402
 
+from tls_root_set import apply_root_set  # noqa: E402
+
 _API = "https://slack.com/api"
 # Auth-shaped errors mean the config token is bad/expired, not the manifest.
 _AUTH_ERRORS = {"token_expired", "invalid_auth", "not_authed", "token_revoked"}
@@ -69,6 +71,9 @@ class _ConfigTokens(BaseSettings):
 
     slack_config_token: str = Field(default="", validation_alias="SLACK_CONFIG_TOKEN")
     slack_app_id: str = Field(default="", validation_alias="SLACK_APP_ID")
+    # The agent's TLS_EXTRA_CA_FILE: the Slack API is verified against the same
+    # root set as the agent's (tls_root_set.py).
+    tls_extra_ca_file: str | None = Field(default=None, validation_alias="TLS_EXTRA_CA_FILE")
 
 
 def _call(method: str, token: str, **params: str) -> dict:
@@ -145,6 +150,7 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = _ConfigTokens()
+    apply_root_set(cfg.tls_extra_ca_file)  # before the first request
     if not cfg.slack_config_token:
         print(
             "✗ SLACK_CONFIG_TOKEN is not set. Generate an app configuration token at\n"

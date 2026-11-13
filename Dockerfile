@@ -6,15 +6,18 @@
 # entrypoint dispatches on SLACK_TRANSPORT; the hosted deployment sets it to
 # "http". See docs/HOSTING.md.
 
-# The trust-store check is core's script at a pinned commit, verified by digest. The
-# Cloud image pins the same commit, and the two move together; its scheduled pin-drift
-# check is the signal for both. A failed fetch (a 404 or 5xx body) reads as a digest
-# mismatch. CI's gha cache restores this layer by its checksum, so a dead URL shows
-# only on a cold cache. This stage only feeds a bind mount below: nothing of it ships.
+# The trust-store checks are core's scripts at a pinned commit, verified by digest. The
+# commit moves when core's checks change; the Cloud image pins its own. A failed fetch
+# (a 404 or 5xx body) reads as a digest mismatch. CI's gha cache restores these layers
+# by their checksums, so a dead URL shows only on a cold cache. This stage only feeds
+# the bind mounts below: nothing of it ships.
 FROM scratch AS trust-check
-ADD --checksum=sha256:af182a0403cd0c82fe1d6f159a5e59395fd47d66a46cacab65cb973e0c905ff7 \
-    https://raw.githubusercontent.com/FaultMaven/faultmaven/9a702772183c045576c069f9e1d81f50bcf2b831/scripts/check_image_trust_store.py \
+ADD --checksum=sha256:5ee708a5a56f4ce45897ae9c9abb6132c9aa0e3617211411b4e96382ea1d292f \
+    https://raw.githubusercontent.com/FaultMaven/faultmaven/b8e5ade7f3fbc9cba3d9deb1e0ecb39af450fb87/scripts/check_image_trust_store.py \
     /check_image_trust_store.py
+ADD --checksum=sha256:b3af597fbe27b7e2e4ad71664f0336d6438cf13da888320c737c538c556cf7d6 \
+    https://raw.githubusercontent.com/FaultMaven/faultmaven/b8e5ade7f3fbc9cba3d9deb1e0ecb39af450fb87/scripts/check_pip_root_set.py \
+    /check_pip_root_set.py
 
 FROM python:3.12-slim
 
@@ -31,9 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 
 # pip (24.2+) verifies through truststore, whose context loads the OS store, pip's own
-# vendored certifi bundle (an old one, holding both roots the check below bans) and
+# vendored certifi bundle (an old one, holding both roots the checks below ban) and
 # PIP_CERT. So the vendored bundle is linked to the OS store and PIP_CERT is set to it,
-# before the first pip; the check below asserts the pip on PATH still reads it.
+# before the first pip. Never ENV a TLS root variable the agent owns (tls_root_set.py):
+# any value but the set's own file refuses the start.
 RUN cacert="$(python -c 'import pip._vendor.certifi as c; print(c.where())')" \
     && ln -sf /etc/ssl/certs/ca-certificates.crt "$cacert"
 ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
@@ -46,6 +50,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Link every pip's vendored bundle to the OS bundle, so a pip run --isolated or
+# without PIP_CERT verifies against it, and remove the ensurepip pip wheel, which
+# would install its old bundle into a new venv (core #2756). After the last install
+# and the source COPY.
+RUN find / -xdev \( -path '*/pip/_vendor/certifi/cacert.pem' \
+        -exec ln -sfv /etc/ssl/certs/ca-certificates.crt {} \; \) \
+    -o \( -path '*/ensurepip/_bundled/pip-*.whl' -print -delete \)
+
 # Non-root: the runtime needs no privileged access. Owns /app/data so a SQLite
 # fallback (dev only — the cluster uses Postgres) can be written if configured.
 RUN useradd --create-home --uid 10001 faultmaven \
@@ -54,18 +66,14 @@ RUN useradd --create-home --uid 10001 faultmaven \
 
 # Fail the build if "emSign ECC Root CA - G3" (GHSA-6q48-6c7w-9gw2: compromised
 # intermediate keys) or "AAA Certificate Services" is in OpenSSL's default cafile or
-# capath, which slack-sdk reads through urllib, or in certifi, which httpx (the
-# FaultMaven API client) reads. The script does not read pip's bundle, so the step
-# then asserts that the pip on PATH, run by its own interpreter (a venv included),
-# reads the file PIP_CERT names. It runs at the last root step, and
-# tests/test_dockerfile_trust_store.py keeps everything after it inert, so it sees the
-# stores the image ships.
+# capath, certifi or any pip wheel, or in any pip bundle, which must also be the
+# cafile; then measure, from pip's own session, that a pip run --isolated or without
+# PIP_CERT verifies against the cafile. The last root step, to see the stores the
+# image ships; tests/test_dockerfile_trust_store.py keeps everything after it inert.
+# CI runs scripts/check_tls_root_set.py in the built image.
 RUN --mount=type=bind,from=trust-check,source=/check_image_trust_store.py,target=/tmp/check_image_trust_store.py \
-    python /tmp/check_image_trust_store.py \
-    && pip_python="$(sed -n '1s/^#!//p' "$(command -v pip)")" \
-    && "$pip_python" -c 'import os, sys, pip._vendor.certifi as c; \
-bundle, cert = (os.path.realpath(p) for p in (c.where(), os.environ["PIP_CERT"])); \
-bundle == cert or sys.exit(f"the pip on PATH reads {bundle}, not PIP_CERT ({cert})")'
+    --mount=type=bind,from=trust-check,source=/check_pip_root_set.py,target=/tmp/check_pip_root_set.py \
+    python /tmp/check_image_trust_store.py && python /tmp/check_pip_root_set.py
 USER faultmaven
 
 EXPOSE 3000

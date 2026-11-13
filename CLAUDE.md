@@ -26,7 +26,8 @@ python app.py                              # SLACK_TRANSPORT=socket (default) or
   a shared `SLACK_DATABASE_URL` or a copy of a running agent's credential store.
 
 CI (`ci.yml`) runs lint, contract drift and test; the no-push Docker build
-`needs: [lint, test]` only. `publish-docker.yml` publishes to GHCR the commit
+`needs: [lint, test]` only, and runs `scripts/check_tls_root_set.py` in the
+built image. `publish-docker.yml` publishes to GHCR the commit
 CI passed on a push to `main`; a `v*.*.*` tag or a manual dispatch publishes
 only a commit with such a green push run. `workflow-lint.yml` runs actionlint
 (FaultMaven/ci-actions `lint-workflows`) on any change under
@@ -51,7 +52,8 @@ done when its check conclusions are green, not when local tests pass.
 | `binding.py`, `pending_binds.py`, `install_pages.py` | Install-time workspace binding (Slack OAuth chained to FaultMaven consent) |
 | `rendering.py`, `slack_mrkdwn.py`, `slack_text.py` | TurnResult → Block Kit; Markdown → mrkdwn; Slack message → plain text |
 | `slack_files.py` | Downloads attached files (bot-token auth) to forward as multipart evidence |
-| `scripts/` | `preflight.py`, `push_manifest.py`, `generate_api_models.py` |
+| `tls_root_set.py` | The one TLS root set (OS bundle + `TLS_EXTRA_CA_FILE`), named in `SSL_CERT_FILE`/`PGSSLROOTCERT` before any client is built |
+| `scripts/` | `preflight.py`, `push_manifest.py`, `generate_api_models.py`, `check_tls_root_set.py` (the image's handshake check) |
 | `manifest.json` / `manifest.dev.json` | Hosted (HTTP/OAuth) / local-dev (Socket Mode) Slack app manifests |
 
 ## Talking to Slack

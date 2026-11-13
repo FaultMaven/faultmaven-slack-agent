@@ -47,6 +47,7 @@ from binding import InstallerAuthority, authorize_url, installer_authority
 from oauth_store import OAuthStores, build_oauth_stores
 from pending_binds import BIND_COOKIE_NAME, PENDING_BIND_TTL_SECONDS, PendingBindStore
 from store import CaseStore
+from tls_root_set import apply_root_set
 
 logger = logging.getLogger("faultmaven.slack")
 
@@ -444,6 +445,9 @@ def main() -> None:
     """Process entrypoint. Dispatches to the HTTP runtime or the Socket loop."""
 
     settings = get_settings()
+    logging.basicConfig(level=settings.log_level)
+    # Before any client is built: every one verifies against this set.
+    apply_root_set(settings.tls_extra_ca_file)
     if settings.slack_transport == "http":
         # The HTTP transport is an ASGI server; hand off to :mod:`web`.
         from web import run_http

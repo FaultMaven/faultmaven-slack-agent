@@ -43,6 +43,7 @@ from faultmaven import (  # noqa: E402
     FaultMavenCredentialError,
     FaultMavenError,
 )
+from tls_root_set import apply_root_set  # noqa: E402
 
 GREEN, RED, YELLOW, DIM, RESET = (
     "\033[32m",
@@ -338,6 +339,8 @@ def main() -> int:
     results.append(config_ok)
     if settings is None:
         return _summarize(results)
+    # Before any client is built, as app.main() does.
+    apply_root_set(settings.tls_extra_ca_file)
 
     # Slack checks don't need the backend, and vice-versa — run all, report all.
     # The Slack-side checks differ by transport: Socket Mode verifies the static

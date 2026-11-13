@@ -117,6 +117,8 @@ def database_url(request, tmp_path):
     """A store URL per backend. The cluster runs the stores on Postgres, and a
     SQLite-only suite let #81's boot crash through, so CI sets TEST_POSTGRES_URL
     to a bare ``postgresql://`` — the hosted shape — and the Postgres case runs.
+    Its service has no TLS, so the URL names ``sslmode=disable`` (a URL naming no
+    ``sslmode`` requires TLS).
     """
 
     if request.param == "sqlite":
@@ -211,15 +213,39 @@ def test_oauth_stores_name_the_installed_driver_for_a_bare_postgres_url(monkeypa
 @pytest.mark.parametrize(
     "raw",
     [
-        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack",
-        "postgresql+psycopg://u:p@db:5432/faultmaven_slack",
+        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack?sslmode=verify-full",
+        "postgresql+psycopg://u:p@db:5432/faultmaven_slack?sslmode=require",
+        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack?sslmode=disable",
         "sqlite:///data/oauth.db",
     ],
 )
-def test_explicit_driver_and_sqlite_urls_are_left_alone(raw):
+def test_explicit_driver_sslmode_and_sqlite_urls_are_left_alone(raw):
     from oauth_store import _engine_url
 
     assert _engine_url(raw).render_as_string(hide_password=False) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "postgresql://u:p@db:5432/faultmaven_slack",
+            "postgresql+psycopg2://u:p@db:5432/faultmaven_slack?sslmode=require",
+        ),
+        (
+            "postgresql+psycopg://u:p@db/s?connect_timeout=5",
+            "postgresql+psycopg://u:p@db/s?connect_timeout=5&sslmode=require",
+        ),
+    ],
+)
+def test_a_postgres_url_naming_no_sslmode_requires_tls(raw, expected):
+    """Ruled 2026-11-13 (FaultMaven #2733): fail closed. libpq's default
+    ``prefer`` falls back to plaintext when the server's certificate is outside
+    PGSSLROOTCERT; ``require`` refuses the connection."""
+
+    from oauth_store import _engine_url
+
+    assert _engine_url(raw).render_as_string(hide_password=False) == expected
 
 
 # --- FastAPI app -------------------------------------------------------------

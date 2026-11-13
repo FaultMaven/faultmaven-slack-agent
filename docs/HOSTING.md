@@ -66,10 +66,33 @@ the infra repo.
 | `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all. **Unset: 3 x the attempt timeout** (the first attempt, a re-send after a doubtful outcome, one more for a `TURN_IN_PROGRESS` wait or an `LLM_TIMEOUT`), and never less than 3 x the API's published bound + 15 s even under a shorter `FAULTMAVEN_REQUEST_TIMEOUT` pin; `660` when nothing is published. A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
+| `TLS_EXTRA_CA_FILE` | config | a PEM file of CA certificates added to the OS CA bundle: the one root set every TLS client verifies against (Slack, the FaultMaven API, Postgres). Read once per start. See [TLS roots](#tls-roots-and-postgres) |
 
 Missing http-mode credentials fail fast at boot with a named error
 (`config.Settings._validate_transport_requirements`), never as an opaque runtime
 error on the first Slack event.
+
+## TLS roots and Postgres
+
+Every TLS client the agent builds verifies against one root set: the OS CA
+bundle, plus the certificates in `TLS_EXTRA_CA_FILE` (`tls_root_set.py`). At
+start the agent names the set in `SSL_CERT_FILE`, `PGSSLROOTCERT` and the other
+variables its clients read, so do not set those yourself: any other value
+refuses the start.
+
+A `SLACK_DATABASE_URL` that names no `sslmode` connects with `sslmode=require`,
+verified against that set (ruled 2026-11-13, FaultMaven #2733). So, **before
+this image rolls out**:
+
+- put the deployment's Postgres CA in `TLS_EXTRA_CA_FILE` (a Postgres served
+  with a certificate from a public CA needs nothing);
+- or, for a Postgres without TLS, add `?sslmode=disable` to the URL.
+
+With neither, the agent refuses the connection; it never falls back to
+plaintext. An explicit `sslmode` in the URL is kept.
+
+With `TLS_EXTRA_CA_FILE` set, the agent writes the set to a file under `TMPDIR`
+(default `/tmp`), which must then be writable.
 
 ## Shutdown drain (a deploy requirement for the infra repo)
 

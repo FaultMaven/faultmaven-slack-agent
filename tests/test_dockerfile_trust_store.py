@@ -1,26 +1,30 @@
-"""What the image build cannot catch about its trust-store treatment (core #2633).
+"""What the image build cannot catch about its trust-store treatment (core #2633,
+#2756; FaultMaven #2733).
 
-CI builds the image on every PR, and its check step fails the build if the
-OpenSSL or certifi stores trust a banned root, or if the pip on PATH does not
-read the file PIP_CERT names. These tests pin what a passing build does not
-prove:
+CI builds the image on every PR, and its check step runs core's two scripts:
+``check_image_trust_store.py`` fails the build if the OpenSSL or certifi stores,
+any pip bundle or any pip wheel trust a banned root, or a pip bundle is not the
+cafile; ``check_pip_root_set.py`` fails it unless a pip run ``--isolated`` or
+without PIP_CERT verifies against the cafile. These tests pin what a passing
+build does not prove:
 
-- Every pip trusts only the OS store. pip 24.2+ verifies through truststore,
-  whose context also loads pip's vendored certifi bundle (an old one, holding
-  the banned roots); PIP_CERT alone only adds to that set. The build asserts the
-  final image's pip, not a pip that ran earlier, so in every stage that runs pip
-  the bundle must be linked to the OS store, and PIP_CERT set, before its first
-  pip.
-- The check runs, as written, on the stores the image ships. BuildKit skips a
+- Every pip that runs during the build trusts only the OS store. pip 24.2+
+  verifies through truststore, whose context also loads pip's vendored certifi
+  bundle (an old one, holding the banned roots); PIP_CERT alone only adds to
+  that set. So in every stage that runs pip the bundle is linked to the OS
+  store, and PIP_CERT set, before its first pip.
+- After the last pip and the source COPY, one step links every pip's vendored
+  bundle to the OS store and deletes the ensurepip wheel, as written.
+- The checks run, as written, on the stores the image ships. BuildKit skips a
   stage nothing references, so a deleted check RUN leaves a green build, and a
   check that is moved earlier, or whose command gains an ``|| true``, passes
-  without proving anything. So the check RUN carries an exact command, bind-mounts
-  the script from the trust-check stage, and is the final stage's last
-  instruction that can change a store: only USER, EXPOSE, HEALTHCHECK, CMD,
-  ENTRYPOINT and LABEL may follow it.
-- The script is core's, fetched at a 40-hex commit with a sha256 checksum, in a
-  ``FROM scratch AS trust-check`` stage, and reaches the final stage only through
-  that bind mount, so nothing of it ships.
+  without proving anything. So the check RUN carries an exact command,
+  bind-mounts both scripts from the trust-check stage, and is the final
+  stage's last instruction that can change a store: only USER, EXPOSE,
+  HEALTHCHECK, CMD, ENTRYPOINT and LABEL may follow it.
+- Each script is core's, fetched at a 40-hex commit with a sha256 checksum, in
+  a ``FROM scratch AS trust-check`` stage, and reaches the final stage only
+  through its bind mount, so nothing of it ships.
 """
 
 from __future__ import annotations
@@ -29,23 +33,20 @@ import re
 import shlex
 from pathlib import Path
 
+import pytest
+
 DOCKERFILE = Path(__file__).resolve().parent.parent / "Dockerfile"
 OS_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
-SCRIPT = "check_image_trust_store.py"
+SCRIPTS = ("check_image_trust_store.py", "check_pip_root_set.py")
 INERT = {"USER", "EXPOSE", "HEALTHCHECK", "CMD", "ENTRYPOINT", "LABEL"}
-CHECK_COMMAND = (
-    "python {target}"
-    " && pip_python=\"$(sed -n '1s/^#!//p' \"$(command -v pip)\")\""
-    " && \"$pip_python\" -c 'import os, sys, pip._vendor.certifi as c;"
-    ' bundle, cert = (os.path.realpath(p) for p in (c.where(), os.environ["PIP_CERT"]));'
-    ' bundle == cert or sys.exit(f"the pip on PATH reads {bundle}, not PIP_CERT ({cert})")\''
+CHECK_COMMAND = "python {0} && python {1}"
+LINK_COMMAND = (
+    "find / -xdev \\( -path '*/pip/_vendor/certifi/cacert.pem'"
+    f" -exec ln -sfv {OS_BUNDLE} {{}} \\; \\)"
+    " -o \\( -path '*/ensurepip/_bundled/pip-*.whl' -print -delete \\)"
 )
 
 PIP = re.compile(r"(?<![\w.-])pip(?:\d+(?:\.\d+)*)?(?![\w.-])")  # pip, pip3.12, -m pip
-SCRIPT_URL = re.compile(
-    r"https://raw\.githubusercontent\.com/FaultMaven/faultmaven/[0-9a-f]{40}"
-    rf"/scripts/{re.escape(SCRIPT)}"
-)
 HEREDOC_WORD = re.compile(r"<<(-?)([\"']?)(\w+)\2")
 
 
@@ -120,15 +121,22 @@ def _bind_mounts(args: str) -> list[dict[str, str]]:
     return [m for m in mounts if m.get("type") == "bind"]
 
 
-def _fetch() -> tuple[str, str]:
+def _script_url(script: str) -> re.Pattern[str]:
+    return re.compile(
+        r"https://raw\.githubusercontent\.com/FaultMaven/faultmaven/[0-9a-f]{40}"
+        rf"/scripts/{re.escape(script)}"
+    )
+
+
+def _fetch(script: str) -> tuple[str, str]:
     """The FROM line of the stage holding the script's fetch, and the ADD's arguments."""
     found = [
         (stage[0][1], args)
         for stage in _stages()
         for kw, args in stage
-        if kw == "ADD" and any(SCRIPT_URL.fullmatch(t) for t in _split(args))
+        if kw == "ADD" and any(_script_url(script).fullmatch(t) for t in _split(args))
     ]
-    assert len(found) == 1, f"core's {SCRIPT} must be fetched once, by commit"
+    assert len(found) == 1, f"core's {script} must be fetched once, by commit"
     return found[0]
 
 
@@ -151,30 +159,47 @@ def test_every_pip_trusts_only_the_os_store() -> None:
     assert pip_stages, "no stage runs pip"
 
 
-def test_the_check_script_is_fetched_at_a_pinned_commit_by_digest() -> None:
-    flags, _ = _flags_and_rest(_fetch()[1])
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_each_check_script_is_fetched_at_a_pinned_commit_by_digest(script) -> None:
+    flags, _ = _flags_and_rest(_fetch(script)[1])
     assert any(re.fullmatch(r"--checksum=sha256:[0-9a-f]{64}", flag) for flag in flags), flags
 
 
-def test_the_fetch_is_in_a_scratch_trust_check_stage() -> None:
-    from_line, _ = _fetch()
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_each_fetch_is_in_a_scratch_trust_check_stage(script) -> None:
+    from_line, _ = _fetch(script)
     assert re.fullmatch(r"scratch\s+AS\s+trust-check", from_line, re.IGNORECASE), from_line
 
 
-def test_the_check_runs_as_written_last_and_is_the_only_reference_to_the_script() -> None:
+def test_every_pip_bundle_is_linked_and_the_ensurepip_wheel_deleted_after_the_last_pip() -> (
+    None
+):
+    final = _stages()[-1]
+    links = [i for i, (kw, a) in enumerate(final) if kw == "RUN" and a == " ".join(LINK_COMMAND.split())]
+    assert len(links) == 1, "the final stage must run the link step once, as written"
+    copies = [i for i, (kw, a) in enumerate(final) if kw == "COPY" and _split(a)[-2:] == [".", "."]]
+    assert copies and links[0] > max(copies), "the link step must follow COPY . ."
+    later = [a for kw, a in final[links[0] + 1 :] if kw == "RUN" and PIP.search(a)]
+    assert not later, f"the link step must follow the last pip: {later}"
+
+
+def test_the_checks_run_as_written_last_and_are_the_only_reference_to_the_scripts() -> None:
     final = _stages()[-1]
     last = max(i for i, (kw, _) in enumerate(final) if kw not in INERT)
     keyword, args = final[last]
     assert keyword == "RUN", f"only {sorted(INERT)} may follow the check RUN, not {keyword}"
     assert "USER" in [kw for kw, _ in final[last + 1 :]], "the final stage must drop root"
-    dest = _flags_and_rest(_fetch()[1])[1][-1]
-    mounts = [
-        m for m in _bind_mounts(args) if m.get("from") == "trust-check" and m.get("source") == dest
-    ]
-    assert len(mounts) == 1, "the check RUN must bind-mount the script from trust-check"
-    expected = CHECK_COMMAND.replace("{target}", mounts[0]["target"])
+    targets = []
+    for script in SCRIPTS:
+        dest = _flags_and_rest(_fetch(script)[1])[1][-1]
+        mounts = [
+            m for m in _bind_mounts(args) if m.get("from") == "trust-check" and m.get("source") == dest
+        ]
+        assert len(mounts) == 1, f"the check RUN must bind-mount {script} from trust-check"
+        targets.append(mounts[0]["target"])
+    expected = CHECK_COMMAND.format(*targets)
     assert " ".join(_flags_and_rest(args)[1]) == " ".join(expected.split())
     others = [a for kw, a in final if (kw, a) != (keyword, args)]
-    assert not [a for a in others if SCRIPT in a or "trust-check" in a], (
-        "the final stage must reach the script only through the check's bind mount"
+    assert not [a for a in others if any(s in a for s in SCRIPTS) or "trust-check" in a], (
+        "the final stage must reach the scripts only through the check's bind mounts"
     )
