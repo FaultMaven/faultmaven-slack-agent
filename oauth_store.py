@@ -129,8 +129,9 @@ def _engine_url(database_url: str) -> URL:
 
     The ``sslmode`` default is not set here: ``tls_root_set`` sets
     ``PGSSLMODE=verify-full``, which libpq applies only when neither the URL nor
-    a service file names one. ``_refuse_root_overrides`` checks what libpq
-    will be given.
+    a service file names one; a service is refused, by ``tls_root_set``
+    (``PGSERVICE``) and by ``_refuse_root_overrides`` (in the URL), which
+    checks what libpq will be given.
     """
 
     url = make_url(database_url)
@@ -141,9 +142,10 @@ def _engine_url(database_url: str) -> URL:
 
 def _refuse_root_overrides(engine: Engine) -> None:
     """Refuse the start when the conninfo libpq will be given names
-    ``sslrootcert`` (libpq would verify against that file, not the root set) or
-    ``service`` (a service file's options, ``sslrootcert`` among them, apply
-    before the environment's).
+    ``sslrootcert`` (libpq would verify against that file, not the root set),
+    ``sslcrl`` or ``sslcrldir`` (libpq loads a CRL source into its trust store,
+    CA certificates in it included) or ``service`` (a service file's options,
+    ``sslrootcert`` among them, apply before the environment's).
 
     Read as psycopg2 builds it: the dialect's connect arguments merged by
     ``make_dsn`` and parsed back, so a ``dsn=`` alias or a key with stray
@@ -156,9 +158,11 @@ def _refuse_root_overrides(engine: Engine) -> None:
 
     cargs, cparams = engine.dialect.create_connect_args(engine.url)
     params = dict(cparams)
+    for key in ("async", "async_"):  # psycopg2.connect takes these out first
+        params.pop(key, None)
     dsn = cargs[0] if cargs else params.pop("dsn", None)
     conninfo = parse_dsn(make_dsn(dsn, **params))
-    for key in ("sslrootcert", "service"):
+    for key in ("sslrootcert", "sslcrl", "sslcrldir", "service"):
         if key in conninfo:
             raise SystemExit(
                 f"TLS root set: SLACK_DATABASE_URL names {key}={conninfo[key]!r}. "

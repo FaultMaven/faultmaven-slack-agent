@@ -171,7 +171,8 @@ def check_oauth_db(settings: Settings):
             database_url=settings.slack_database_url,
             client_id=settings.slack_client_id,
         )
-    # SystemExit: a URL naming sslrootcert, refused as the agent's start would.
+    # SystemExit: a URL whose conninfo names sslrootcert, sslcrl, sslcrldir or
+    # service, refused as the agent's start would.
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — driver missing / DB unreachable
         return (
             _fail(

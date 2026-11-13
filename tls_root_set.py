@@ -10,9 +10,16 @@ is built: it is called first in ``app.main()``, and in ``scripts/preflight.py``,
 
 It also sets ``PGSSLMODE=verify-full`` unless the environment names a mode
 (ruled 2026-11-13, FaultMaven #2733): libpq applies it only when neither the
-URL nor a service file names ``sslmode``, so a database URL that names none
-verifies the chain against the set and the host name, and an explicit choice is
-never lowered.
+URL nor a service file names ``sslmode`` (a service is refused here, and in the
+URL by ``oauth_store``), so a database URL that names none verifies the chain
+against the set and the host name, and an explicit choice is never lowered.
+
+libpq also loads a CRL file or directory into its trust store, CA certificates
+in it included: ``sslcrl``/``sslcrldir``, ``PGSSLCRL``/``PGSSLCRLDIR``, and by
+default ``~/.postgresql/root.crl``. So ``PGSSLCRL`` names an empty file written
+beside the set file (``empty.crl``, same directory and checks), and libpq never
+reads the default; an inherited ``PGSSLCRL`` or ``PGSSLCRLDIR`` naming anything
+else refuses the start, as ``sslcrl`` or ``sslcrldir`` in the URL does.
 
 A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
 (the agent does not depend on core). Deliberate differences:
@@ -46,10 +53,12 @@ write; an inherited ``SSL_CERT_DIR`` only when no element holds a hashed entry.
 Anything else refuses the start (``SystemExit``), as do an OS bundle that does
 not load, a setting with no certificate or a non-plain one, no usable temporary
 directory, a set file that cannot be written safely or does not load, a hashed
-entry in the shipped empty capath, a platform without ``os.getuid``, and an
-inherited ``PGSERVICE`` (a service's options, ``sslrootcert`` among them, apply
-before the environment's). A ``SLACK_DATABASE_URL`` whose conninfo names
-``sslrootcert`` or ``service`` is refused by ``oauth_store``.
+entry in the shipped empty capath, a platform without ``os.getuid``, an
+inherited ``PGSERVICE`` of any value, empty included (a service's options,
+``sslrootcert`` among them, apply before the environment's), and an inherited
+``PGSSLCRL`` or ``PGSSLCRLDIR`` that is not the agent's empty file. A
+``SLACK_DATABASE_URL`` whose conninfo names ``sslrootcert``, ``sslcrl``,
+``sslcrldir`` or ``service`` is refused by ``oauth_store``.
 Imports no client.
 """
 
@@ -95,6 +104,11 @@ PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
 #: Names a libpq service, whose options libpq applies before the environment's;
 #: refused. ``PGSERVICEFILE`` and ``PGSYSCONFDIR`` alone name no service.
 PG_SERVICE_VARIABLE = "PGSERVICE"
+#: libpq loads these into its trust store, roots included; ``PGSSLCRL`` is
+#: exported as the agent's empty file, so the ``~/.postgresql/root.crl``
+#: default is never read.
+PG_CRL_VARIABLES = ("PGSSLCRL", "PGSSLCRLDIR")
+EMPTY_CRL_NAME = "empty.crl"
 
 _REPO = Path(__file__).resolve().parent
 #: Shipped with the agent; holds only a README.
@@ -138,7 +152,7 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
             "TLS root set: this platform is not supported (no os.getuid, so the "
             "set directory's owner cannot be checked; no Windows certificate store)."
         )
-    if os.environ.get(PG_SERVICE_VARIABLE):
+    if PG_SERVICE_VARIABLE in os.environ:
         raise SystemExit(
             f"TLS root set: {PG_SERVICE_VARIABLE}={os.environ[PG_SERVICE_VARIABLE]!r} "
             "names a libpq service, whose options (sslrootcert, sslmode) apply before "
@@ -160,12 +174,16 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
     named = extra is None and os_file
     path = os_source if named else os.path.join(_set_directory(), _name(pem))
     _check_inherited(path, pem, extra)
+    empty_crl = os.path.join(_set_directory(), EMPTY_CRL_NAME)
+    _check_inherited_crl(empty_crl)
     if not named:  # written, or re-written if missing or altered (self-heal)
         _write_set(path, pem)
+    _write_safely(empty_crl, b"")
     for name in FILE_VARIABLES:
         os.environ[name] = path
     os.environ[DIRECTORY_VARIABLE] = EMPTY_CAPATH
     os.environ.setdefault(PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT)
+    os.environ[PG_CRL_VARIABLES[0]] = empty_crl
     sources = (os_source,) + ((extra,) if extra else ())
     root_set = RootSet(path, sources, extra, len(pem_digests(pem)))
     logger.info(
@@ -331,6 +349,16 @@ def _check_inherited(path: str, pem: bytes, extra: str | None) -> None:
         _refuse(DIRECTORY_VARIABLE, directories, reason)
 
 
+def _check_inherited_crl(empty_crl: str) -> None:
+    """Refuse an inherited CRL variable that is not the agent's empty file."""
+
+    for name in PG_CRL_VARIABLES:
+        value = os.environ.get(name)
+        if value and os.path.realpath(value) != os.path.realpath(empty_crl):
+            reason = "names a CRL source, which libpq loads into its trust store, roots included"
+            _refuse(name, value, reason)
+
+
 def _refuse(name: str, value: str, reason: str) -> NoReturn:
     parent = os.path.dirname(os.path.realpath(value))
     if os.path.basename(parent) == _directory_name():
@@ -347,7 +375,19 @@ def _refuse(name: str, value: str, reason: str) -> NoReturn:
 
 
 def _write_set(path: str, pem: bytes) -> None:
-    """Write the set once per content, in a directory only this user can write."""
+    """Write the set once per content, then check that it loads."""
+
+    _write_safely(path, pem)
+    if not _loads(path):
+        raise SystemExit(
+            f"TLS root set: the set written to {path} does not load; check "
+            f"{EXTRA_CA_FILE_SETTING} and the OS CA bundle."
+        )
+
+
+def _write_safely(path: str, data: bytes) -> None:
+    """Write ``data`` unless ``path`` already holds it, in a directory only
+    this user can write."""
 
     directory = os.path.dirname(path)
     try:
@@ -357,16 +397,11 @@ def _write_set(path: str, pem: bytes) -> None:
             raise OSError(f"{directory} is not a directory")
         if status.st_uid != os.getuid() or status.st_mode & 0o022:
             raise OSError(f"{directory} is not this user's alone")
-        if _read(path) != pem:
+        if not _is_bytes(path, data):
             handle, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
             with os.fdopen(handle, "wb") as file:
-                file.write(pem)
+                file.write(data)
             os.chmod(temporary, 0o644)
             os.replace(temporary, path)
     except OSError as error:
         raise _tmpdir_refusal(error) from error
-    if not _loads(path):
-        raise SystemExit(
-            f"TLS root set: the set written to {path} does not load; check "
-            f"{EXTRA_CA_FILE_SETTING} and the OS CA bundle."
-        )

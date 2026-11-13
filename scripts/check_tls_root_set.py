@@ -25,8 +25,10 @@ libpq's ``prefer``, which verifies nothing without a root file. Against the
 set's leaf it connects under **set**; against the outside leaf it is refused
 under **set**; against the wrong-host leaf **set** refuses the host name. An
 explicit ``verify-full`` and ``sslmode=disable`` (no TLS attempted) are rows
-too. One row reads ``TLS_EXTRA_CA_FILE`` only from a ``.env`` through
-``Settings``.
+too. One row puts the outside CA, with a CRL it signed, in the child's
+``~/.postgresql/root.crl``, which libpq loads into its trust store by default:
+**set** still refuses the outside leaf. One row reads ``TLS_EXTRA_CA_FILE`` only
+from a ``.env`` through ``Settings``.
 
 Socket Mode's builtin client wraps TLS only on port 443, so its responder
 listens on ``127.0.0.1:443`` (unprivileged in a container). Every row connects
@@ -174,6 +176,9 @@ ROWS = {
     "postgres verify-full": ("pg", _oauth_stores("pg", "&sslmode=verify-full"), "pg"),
     "postgres no sslmode, set CA": ("pg", _oauth_stores("pg", ""), "default"),
     "postgres no sslmode, outside CA": ("outside", _oauth_stores("outside", ""), "outside"),
+    "postgres root.crl in HOME, outside CA": (
+        "outside", _oauth_stores("outside", ""), "crlhome",
+    ),  # fmt: skip
     "postgres no sslmode, wrong host": (
         "wronghost", _oauth_stores("wronghost", ""), "wronghost",
     ),  # fmt: skip
@@ -317,9 +322,9 @@ def _verdict(kind: str, arm: str, code: int, said: str, tls: int, plain: int) ->
     refused_unverified = code != 0 and any(text in said for text in VERIFY_FAILED)
     if kind == "plain":  # sslmode=disable: through in plaintext, in every arm
         return code == 0 and tls == 0 and plain >= 1
-    if kind in ("default", "outside", "wronghost") and arm == "bare":
+    if kind in ("default", "outside", "crlhome", "wronghost") and arm == "bare":
         return tls >= 1  # libpq's prefer: TLS, verified against nothing
-    if kind == "outside":  # outside the set: refused with or without the setting
+    if kind in ("outside", "crlhome"):  # outside the set: refused either way
         return refused_unverified
     if kind == "wronghost" and arm == "set":  # verify-full checks the host name
         return code != 0 and "does not match host name" in said
@@ -339,6 +344,8 @@ def _run(name: str, arm: str, ports: dict, counts: dict, env: dict, scratch: Pat
         cwd = scratch / "dotenv"  # the setting arrives only through .env
     if arm != "set" or kind == "dotenv":
         env.pop("TLS_EXTRA_CA_FILE")
+    if kind == "crlhome":  # libpq's default CRL file holds the outside CA
+        env["HOME"] = str(scratch / "crlhome")
     command = [sys.executable, __file__, "--child", name, "--arm", arm]
     try:
         result = subprocess.run(
@@ -390,6 +397,9 @@ def check(certs: Path) -> int:
         (scratch / "dotenv" / ".env").write_text(
             f"TLS_EXTRA_CA_FILE={certs / 'set-ca.pem'}\n"
         )
+        (scratch / "crlhome" / ".postgresql").mkdir(parents=True)
+        root_crl = (certs / "outside-root.crl").read_bytes()
+        (scratch / "crlhome" / ".postgresql" / "root.crl").write_bytes(root_crl)
         inside, outside = _server_context(certs, "set"), _server_context(certs, "outside")
         servers = {
             "https": (inside, False, 0),
@@ -443,6 +453,17 @@ subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid
 """
 
+#: ``openssl ca -gencrl``'s: an empty CRL, signed by the CA.
+_CRL_CONFIG = """\
+[ca]
+default_ca = probe
+[probe]
+database = {work}/index.txt
+crlnumber = {work}/crlnumber
+default_md = sha256
+default_crl_days = 2
+"""
+
 
 #: CA: its leaves, each (name, subjectAltName).
 _LEAVES = {
@@ -452,8 +473,9 @@ _LEAVES = {
 
 
 def make_certs(directory: Path) -> None:
-    """``<ca>-ca.pem`` for ``set`` and ``outside``, and ``<leaf>-chain.pem`` and
-    ``<leaf>-key.pem`` for each of ``_LEAVES``, world-readable (throwaway) so the
+    """``<ca>-ca.pem`` for ``set`` and ``outside``, ``<leaf>-chain.pem`` and
+    ``<leaf>-key.pem`` for each of ``_LEAVES``, and ``outside-root.crl`` (the
+    outside CA plus a CRL it signed), world-readable (throwaway) so the
     image's user reads them through a bind mount. The CA keys are discarded."""
 
     def openssl(*args) -> None:
@@ -477,6 +499,14 @@ def make_certs(directory: Path) -> None:
                         "-extfile", config, "-extensions", "leaf", "-out", leaf)  # fmt: skip
                 chain = leaf.read_bytes() + ca.read_bytes()
                 (directory / f"{leaf_name}-chain.pem").write_bytes(chain)
+        # outside-root.crl: what libpq loads from ~/.postgresql/root.crl, the
+        # outside CA and a CRL it signed (the last CA made is the outside one).
+        (work / "index.txt").write_text("")
+        (work / "crlnumber").write_text("01\n")
+        config.write_text(_CRL_CONFIG.format(work=work))
+        openssl("ca", "-gencrl", "-config", config, "-keyfile", ca_key, "-cert", ca,
+                "-out", work / "crl")  # fmt: skip
+        (directory / "outside-root.crl").write_bytes(ca.read_bytes() + (work / "crl").read_bytes())
     directory.chmod(0o755)
     for file in directory.iterdir():
         file.chmod(0o644)

@@ -234,6 +234,8 @@ def test_explicit_driver_sslmode_and_sqlite_urls_are_left_alone(raw):
         ("sslrootcert=/etc/ssl/certs/ca-certificates.crt", "sslrootcert"),
         ("dsn=sslrootcert%3D/tmp/other-ca.pem", "sslrootcert"),
         ("sslrootcert%20=/tmp/other-ca.pem", "sslrootcert"),
+        ("sslcrl=/tmp/ca-plus-crl.pem", "sslcrl"),
+        ("sslcrldir=/tmp/crldir", "sslcrldir"),
         ("service=x", "service"),
     ],
 )
@@ -245,6 +247,17 @@ def test_a_database_url_whose_conninfo_names_sslrootcert_or_service_refuses(quer
 
     with pytest.raises(SystemExit, match=f"names {key}=.*TLS_EXTRA_CA_FILE"):
         build_oauth_stores(database_url=f"postgresql://u@127.0.0.1/d?{query}", client_id="1")
+
+
+def test_psycopg2s_async_keys_are_taken_out_before_the_conninfo_is_read():
+    """As psycopg2.connect does; left in, parse_dsn would reject the conninfo."""
+
+    from sqlalchemy import create_engine
+
+    from oauth_store import _engine_url, _refuse_root_overrides
+
+    engine = create_engine(_engine_url("postgresql://u@127.0.0.1/d?async_=0&sslmode=disable"))
+    _refuse_root_overrides(engine)  # no refusal, no ProgrammingError
 
 
 def test_a_database_url_with_sslmode_disable_goes_on_to_connect():

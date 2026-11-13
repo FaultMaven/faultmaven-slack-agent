@@ -79,15 +79,18 @@ bundle, plus the certificates in `TLS_EXTRA_CA_FILE` (`tls_root_set.py`). At
 start the agent names the set in `SSL_CERT_FILE`, `PGSSLROOTCERT` and the other
 variables its clients read, so do not set those in its environment: any other
 value refuses the start. So do a `SLACK_DATABASE_URL` whose connection options
-name `sslrootcert` or a libpq `service` (a `dsn=` alias included), and an
-inherited `PGSERVICE`: a service file's options, `sslrootcert` among them,
-apply before the root set's.
+name `sslrootcert`, `sslcrl`, `sslcrldir` or a libpq `service` (a `dsn=` alias
+included); an inherited `PGSERVICE`, even empty, since a service file's
+options, `sslrootcert` among them, apply before the root set's; and an
+inherited `PGSSLCRL` or `PGSSLCRLDIR`. libpq loads a CRL source into its trust
+store, CA certificates in it included, so the agent names an empty file in
+`PGSSLCRL` and libpq never reads its default `~/.postgresql/root.crl`.
 
 A `SLACK_DATABASE_URL` that names no `sslmode` connects with `verify-full`:
 the server's certificate must chain to the set and name the URL's host (ruled
 2026-11-13, FaultMaven #2733). The agent sets it as `PGSSLMODE` unless its
-environment names one, so a URL or service-file `sslmode`, or an inherited
-`PGSSLMODE`, is kept. So, **before this image is promoted**, the deployment's
+environment names one, so only a URL `sslmode`, or an inherited `PGSSLMODE`,
+is kept (a service is refused). So, **before this image is promoted**, the deployment's
 database URL must either:
 
 - reach a Postgres serving TLS with a certificate that names the URL's host
@@ -101,8 +104,8 @@ With neither, the agent refuses the connection. An explicit `prefer` or
 it falls back to plaintext: use `verify-full`, or `disable` for a server with
 no TLS.
 
-With `TLS_EXTRA_CA_FILE` set, the agent writes the set to a file under `TMPDIR`
-(default `/tmp`), which must then be writable.
+The agent writes the empty CRL file, and with `TLS_EXTRA_CA_FILE` set the set
+file, under `TMPDIR` (default `/tmp`), which must be writable.
 
 ## Shutdown drain (a deploy requirement for the infra repo)
 

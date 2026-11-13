@@ -84,7 +84,10 @@ def _isolated(tmp_path, monkeypatch):
     tmp_path; ``os.environ`` and the settings cache restored after."""
 
     saved = dict(os.environ)
-    for name in (*OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE", "PGSERVICE"):
+    for name in (
+        *OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE", "PGSERVICE", "PGSSLCRL",
+        "PGSSLCRLDIR",
+    ):  # fmt: skip
         os.environ.pop(name, None)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config.get_settings.cache_clear()
@@ -388,9 +391,10 @@ def test_an_inherited_pgservice_refuses_and_a_service_file_alone_does_not(
 
     os.environ["PGSERVICEFILE"] = str(tmp_path / "pg_service.conf")
     apply_root_set(None)
-    os.environ["PGSERVICE"] = "probe"
-    with pytest.raises(SystemExit, match="PGSERVICE='probe'.*TLS_EXTRA_CA_FILE"):
-        apply_root_set(None)
+    for value in ("probe", ""):  # an empty name selects a "[]" section
+        os.environ["PGSERVICE"] = value
+        with pytest.raises(SystemExit, match=f"PGSERVICE={value!r}.*TLS_EXTRA_CA_FILE"):
+            apply_root_set(None)
 
 
 def test_a_platform_without_getuid_refuses_the_start(os_bundle, monkeypatch):
@@ -430,7 +434,7 @@ def test_a_capath_only_os_bundle_is_built_into_a_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("unset", [None, "", "  "])
-def test_unset_names_the_os_bundle_in_every_variable_and_writes_nothing(
+def test_unset_names_the_os_bundle_in_every_variable_and_writes_only_the_empty_crl(
     os_bundle, tmp_path, unset
 ):
     applied = apply_root_set(unset)
@@ -440,7 +444,7 @@ def test_unset_names_the_os_bundle_in_every_variable_and_writes_nothing(
     )
     assert os.environ["SSL_CERT_DIR"] == EMPTY_CAPATH
     assert os.listdir(EMPTY_CAPATH) == ["README"]
-    assert not _set_directory(tmp_path).exists()
+    assert os.listdir(_set_directory(tmp_path)) == ["empty.crl"]
     assert EXTRA_CA_FILE_SETTING not in os.environ
 
 
@@ -523,11 +527,44 @@ def test_a_relative_extra_file_resolves_against_the_repo_not_the_cwd(
 
 def test_two_applies_name_one_file_and_write_nothing_else(os_bundle, extra_file):
     first = apply_root_set(str(extra_file))
-    for name in OWNED_VARIABLES:  # a second start, not a child
+    for name in (*OWNED_VARIABLES, "PGSSLCRL"):  # a second start, not a child
         os.environ.pop(name)
     second = apply_root_set(str(extra_file))
     assert second.path == first.path
-    assert os.listdir(Path(first.path).parent) == [Path(first.path).name]
+    assert sorted(os.listdir(Path(first.path).parent)) == sorted(
+        [Path(first.path).name, "empty.crl"]
+    )
+
+
+def test_pgsslcrl_names_an_empty_file_beside_the_set(os_bundle, extra_file):
+    """libpq loads a CRL source into its trust store, roots included; naming an
+    empty one keeps it from reading ~/.postgresql/root.crl."""
+
+    applied = apply_root_set(str(extra_file))
+    crl = Path(os.environ["PGSSLCRL"])
+    assert crl.parent == Path(applied.path).parent and crl.name == "empty.crl"
+    assert crl.is_file() and crl.read_bytes() == b""
+    crl.write_bytes(b"planted")  # re-written, as the set file is
+    for name in (*OWNED_VARIABLES, "PGSSLCRL"):
+        os.environ.pop(name)
+    apply_root_set(str(extra_file))
+    assert crl.read_bytes() == b""
+
+
+@pytest.mark.parametrize("name", ["PGSSLCRL", "PGSSLCRLDIR"])
+def test_an_inherited_crl_source_refuses_unless_it_is_the_agents_empty_file(
+    os_bundle, tmp_path, name
+):
+    apply_root_set(None)
+    own = os.environ.pop("PGSSLCRL")
+    os.environ[name] = own  # the agent's own empty file: accepted
+    apply_root_set(None)
+    os.environ.pop("PGSSLCRL", None)
+    other = tmp_path / "ca-plus-crl.pem"
+    other.write_bytes(_ca_pem("outside CA"))
+    os.environ[name] = str(other)
+    with pytest.raises(SystemExit, match=f"{name}=.*CRL source.*TLS_EXTRA_CA_FILE"):
+        apply_root_set(None)
 
 
 @pytest.mark.parametrize("damage", ["deleted", "altered"])
