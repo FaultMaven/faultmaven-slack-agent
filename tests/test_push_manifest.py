@@ -76,11 +76,9 @@ def _recorded_calls(monkeypatch, tmp_path):
 
     monkeypatch.setattr(pm, "_call", fake_call)
     monkeypatch.setattr(pm, "httpx", _NoNetwork())
-    monkeypatch.setattr(
-        pm,
-        "_ConfigTokens",
-        lambda: type("C", (), {"slack_config_token": "xoxe-x", "slack_app_id": "A123"})(),
-    )
+    monkeypatch.setattr(pm, "apply_root_set", lambda extra: calls.append(f"root set {extra}"))
+    config = {"slack_config_token": "xoxe-x", "slack_app_id": "A123", "tls_extra_ca_file": "ca.pem"}
+    monkeypatch.setattr(pm, "_ConfigTokens", lambda: type("C", (), config)())
 
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps({"display_information": {"name": "Local"}}), encoding="utf-8")
@@ -124,6 +122,7 @@ def test_apply_is_the_only_form_that_updates(_recorded_calls, monkeypatch):
     assert pm.main() == 0
     assert "apps.manifest.export" in calls, "--apply must still show the diff first"
     assert "apps.manifest.update" in calls
+    assert calls[0] == "root set ca.pem", "the root set is applied before any request"
 
 
 def test_apply_aborts_when_the_live_config_cannot_be_read(_recorded_calls, monkeypatch):
@@ -153,7 +152,7 @@ def test_validate_only_touches_neither_export_nor_update(_recorded_calls, monkey
     monkeypatch.setattr("sys.argv", ["push_manifest.py", path, "--validate"])
 
     assert pm.main() == 0
-    assert calls == ["apps.manifest.validate"]
+    assert calls == ["root set ca.pem", "apps.manifest.validate"]
 
 
 def test_env_is_read_from_the_repo_not_the_cwd(tmp_path, monkeypatch):

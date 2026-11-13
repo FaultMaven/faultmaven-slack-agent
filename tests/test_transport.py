@@ -116,7 +116,8 @@ def test_explicit_postgres_url_passes_through(monkeypatch):
 def database_url(request, tmp_path):
     """A store URL per backend. The cluster runs the stores on Postgres, and a
     SQLite-only suite let #81's boot crash through, so CI sets TEST_POSTGRES_URL
-    to a bare ``postgresql://`` — the hosted shape — and the Postgres case runs.
+    to a ``postgresql://`` URL with no driver named, and the Postgres case runs.
+    Its service has no TLS, so the URL names ``sslmode=disable``.
     """
 
     if request.param == "sqlite":
@@ -213,13 +214,67 @@ def test_oauth_stores_name_the_installed_driver_for_a_bare_postgres_url(monkeypa
     [
         "postgresql+psycopg2://u:p@db:5432/faultmaven_slack",
         "postgresql+psycopg://u:p@db:5432/faultmaven_slack",
+        "postgresql+psycopg2://u:p@db:5432/faultmaven_slack?sslmode=prefer",
         "sqlite:///data/oauth.db",
     ],
 )
-def test_explicit_driver_and_sqlite_urls_are_left_alone(raw):
+def test_explicit_driver_sslmode_and_sqlite_urls_are_left_alone(raw):
+    """No ``sslmode`` is written into the URL: the default is PGSSLMODE
+    (tls_root_set), which libpq applies only when the URL names none."""
+
     from oauth_store import _engine_url
 
     assert _engine_url(raw).render_as_string(hide_password=False) == raw
+
+
+@pytest.mark.parametrize(
+    ("query", "key"),
+    [
+        ("sslrootcert=system", "sslrootcert"),
+        ("sslrootcert=/etc/ssl/certs/ca-certificates.crt", "sslrootcert"),
+        ("dsn=sslrootcert%3D/tmp/other-ca.pem", "sslrootcert"),
+        ("sslrootcert%20=/tmp/other-ca.pem", "sslrootcert"),
+        ("sslcrl=/tmp/ca-plus-crl.pem", "sslcrl"),
+        ("sslcrldir=/tmp/crldir", "sslcrldir"),
+        ("service=x", "service"),
+    ],
+)
+def test_a_database_url_whose_conninfo_names_sslrootcert_or_service_refuses(query, key):
+    """libpq would verify against that file, or a service's options, not the
+    root set. Read as psycopg2 merges it, so an alias is no way around it."""
+
+    from oauth_store import build_oauth_stores
+
+    with pytest.raises(SystemExit, match=f"names {key}=.*TLS_EXTRA_CA_FILE"):
+        build_oauth_stores(database_url=f"postgresql://u@127.0.0.1/d?{query}", client_id="1")
+
+
+def test_psycopg2s_async_keys_are_taken_out_before_the_conninfo_is_read():
+    """As psycopg2.connect does; left in, parse_dsn would reject the conninfo."""
+
+    from sqlalchemy import create_engine
+
+    from oauth_store import _engine_url, _refuse_root_overrides
+
+    engine = create_engine(_engine_url("postgresql://u@127.0.0.1/d?async_=0&sslmode=disable"))
+    _refuse_root_overrides(engine)  # no refusal, no ProgrammingError
+
+
+def test_a_database_url_with_sslmode_disable_goes_on_to_connect():
+    """Nothing refused: the connection itself is attempted (to a closed port)."""
+
+    import socket
+
+    import sqlalchemy.exc
+
+    from oauth_store import build_oauth_stores
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    url = f"postgresql://u@127.0.0.1:{port}/d?sslmode=disable&connect_timeout=5"
+    with pytest.raises(sqlalchemy.exc.OperationalError, match="Connection refused"):
+        build_oauth_stores(database_url=url, client_id="1")
 
 
 # --- FastAPI app -------------------------------------------------------------

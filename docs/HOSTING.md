@@ -56,7 +56,7 @@ the infra repo.
 | `SLACK_TRANSPORT=http` | config | selects the HTTP/OAuth runtime |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | secret | Basic Information → App Credentials |
 | `SLACK_SIGNING_SECRET` | secret | verifies inbound requests |
-| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. |
+| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. Naming no `sslmode`, it connects with `verify-full` ([TLS roots](#tls-roots-and-postgres)) |
 | `SLACK_OAUTH_REDIRECT_URI` | config | pinned to `https://slack.faultmaven.ai/slack/oauth_redirect` |
 | `FAULTMAVEN_API_URL=https://api.faultmaven.ai` | config | cluster backend |
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
@@ -66,10 +66,50 @@ the infra repo.
 | `FAULTMAVEN_TURN_RECOVERY_SECONDS` | config | seconds a thread waits for one turn in all. **Unset: 3 x the attempt timeout** (the first attempt, a re-send after a doubtful outcome, one more for a `TURN_IN_PROGRESS` wait or an `LLM_TIMEOUT`), and never less than 3 x the API's published bound + 15 s even under a shorter `FAULTMAVEN_REQUEST_TIMEOUT` pin; `660` when nothing is published. A policy bound: past an unanswered attempt the agent re-sends the turn under its `Idempotency-Key` until the API answers with it. Shutdown cuts it short, so it does not size the drain (below) |
 | `CASE_STORE_PATH` | config | thread→case SQLite path — **must be on a persistent volume** (see below) |
 | `CREDENTIAL_STORE_PATH` | config | rotated refresh credential SQLite path — **must be on a persistent volume** |
+| `TLS_EXTRA_CA_FILE` | config | a PEM file of CA certificates added to the OS CA bundle: the one root set every TLS client verifies against (Slack, the FaultMaven API, Postgres). Read once per start. See [TLS roots](#tls-roots-and-postgres) |
 
 Missing http-mode credentials fail fast at boot with a named error
 (`config.Settings._validate_transport_requirements`), never as an opaque runtime
 error on the first Slack event.
+
+## TLS roots and Postgres
+
+Every TLS client the agent builds verifies against one root set: the OS CA
+bundle, plus the certificates in `TLS_EXTRA_CA_FILE` (`tls_root_set.py`). At
+start the agent names the set in `SSL_CERT_FILE`, `PGSSLROOTCERT` and the other
+variables its clients read, so do not set those in its environment: any other
+value refuses the start. So do a `SLACK_DATABASE_URL` whose connection options
+name `sslrootcert`, `sslcrl`, `sslcrldir` or a libpq `service` (a `dsn=` alias
+included); an inherited `PGSERVICE`, even empty, since a service file's
+options, `sslrootcert` among them, apply before the root set's; and an
+inherited `PGSSLCRL` or `PGSSLCRLDIR` that names anything but `/dev/null`. libpq loads a CRL source into its trust
+store, CA certificates in it included, so the agent names `/dev/null` (an
+empty CRL source) in `PGSSLCRL` and libpq never reads its default
+`~/.postgresql/root.crl`. Postgres CRL revocation checking is therefore not
+available.
+
+A `SLACK_DATABASE_URL` that names no `sslmode` connects with `verify-full`:
+the server's certificate must chain to the set and name the URL's host (ruled
+2026-11-13, FaultMaven #2733). The agent sets it as `PGSSLMODE` unless its
+environment names one, so only a URL `sslmode`, or an inherited `PGSSLMODE`,
+is kept (a service is refused). So, **before this image is promoted**, the deployment's
+database URL must either:
+
+- reach a Postgres serving TLS with a certificate that names the URL's host
+  and chains to the set: a private CA goes in `TLS_EXTRA_CA_FILE`, and a
+  public CA's certificate still has to name that host;
+- or name an `sslmode` explicitly: `?sslmode=disable` for a Postgres without
+  TLS.
+
+With neither, the agent refuses the connection. An explicit `prefer` or
+`allow` is kept too, and against a server whose certificate is outside the set
+it falls back to plaintext: use `verify-full`, or `disable` for a server with
+no TLS.
+
+The agent writes a set file under `TMPDIR` (default `/tmp`) when
+`TLS_EXTRA_CA_FILE` is set, or when the OS bundle has no loadable file and is
+built from OpenSSL's certificate directory; `TMPDIR` must then be writable. It
+writes no other file.
 
 ## Shutdown drain (a deploy requirement for the infra repo)
 

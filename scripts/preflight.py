@@ -11,11 +11,13 @@ the agent is ready before you click anything.
 Checks, in order (each independent; we run them all and summarize at the end):
 
   1. Config loads          — env present + token formats valid (fail-fast rules)
-  2. Slack bot token       — auth.test → workspace + bot identity
-  3. Slack app token       — apps.connections.open → Socket Mode + connections:write
-  4. FaultMaven backend    — /health reachable (degraded is a warning, not a fail)
-  5. FaultMaven auth        — a bearer token is obtained AND accepted (/auth/me)
-  6. Turn contract (--full)— create a case, submit one turn, render the reply
+  2. TLS root set          — OS bundle + TLS_EXTRA_CA_FILE named for every client,
+                             before any is built (a refusal ends the run)
+  3. Slack bot token       — auth.test → workspace + bot identity
+  4. Slack app token       — apps.connections.open → Socket Mode + connections:write
+  5. FaultMaven backend    — /health reachable (degraded is a warning, not a fail)
+  6. FaultMaven auth        — a bearer token is obtained AND accepted (/auth/me)
+  7. Turn contract (--full)— create a case, submit one turn, render the reply
 
 Exit code is non-zero if any check fails, so it doubles as a CI/start gate.
 """
@@ -43,6 +45,7 @@ from faultmaven import (  # noqa: E402
     FaultMavenCredentialError,
     FaultMavenError,
 )
+from tls_root_set import apply_root_set  # noqa: E402
 
 GREEN, RED, YELLOW, DIM, RESET = (
     "\033[32m",
@@ -89,6 +92,15 @@ def check_config() -> tuple[bool, Settings | None]:
     # missing one would have raised above), so here we just report the mode.
     _ok(f"transport = {settings.slack_transport}")
     return True, settings
+
+
+def check_tls_root_set(settings: Settings) -> bool:
+    print("\nTLS root set")
+    try:
+        root_set = apply_root_set(settings.tls_extra_ca_file)
+    except SystemExit as exc:  # the refusal the agent would start with
+        return _fail(str(exc), "fix the setting or variable it names, as it says.")
+    return _ok(f"clients verify against {root_set.path}", f"{root_set.certificates} certificates")
 
 
 def check_slack_bot(settings: Settings) -> bool:
@@ -159,7 +171,9 @@ def check_oauth_db(settings: Settings):
             database_url=settings.slack_database_url,
             client_id=settings.slack_client_id,
         )
-    except Exception as exc:  # noqa: BLE001 — driver missing / DB unreachable
+    # SystemExit: a URL whose conninfo names sslrootcert, sslcrl, sslcrldir or
+    # service, refused as the agent's start would.
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — driver missing / DB unreachable
         return (
             _fail(
                 f"could not open the OAuth store: {exc}",
@@ -337,6 +351,11 @@ def main() -> int:
     config_ok, settings = check_config()
     results.append(config_ok)
     if settings is None:
+        return _summarize(results)
+    # Before any client is built, as app.main() does; a refusal ends the run.
+    tls_ok = check_tls_root_set(settings)
+    results.append(tls_ok)
+    if not tls_ok:
         return _summarize(results)
 
     # Slack checks don't need the backend, and vice-versa — run all, report all.

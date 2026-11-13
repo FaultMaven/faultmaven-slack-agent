@@ -240,6 +240,13 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
+    # A PEM file of CA certificates added to the OS CA bundle, the one root set
+    # every TLS client verifies against (tls_root_set.py). Read once per start;
+    # a relative path resolves against the repo, like the store paths.
+    tls_extra_ca_file: str | None = Field(
+        default=None, validation_alias="TLS_EXTRA_CA_FILE"
+    )
+
     @field_validator("slack_transport")
     @classmethod
     def _normalize_transport(cls, value: str) -> str:

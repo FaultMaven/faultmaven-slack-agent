@@ -88,6 +88,7 @@ def build_oauth_stores(*, database_url: str, client_id: str) -> OAuthStores:
     connect_args = {"check_same_thread": False} if is_sqlite else {}
     # The URL object, not str(url): its string form masks the password.
     engine = create_engine(url, connect_args=connect_args)
+    _refuse_root_overrides(engine)  # before the first connection
 
     installation_store = SQLAlchemyInstallationStore(
         client_id=client_id, engine=engine, logger=logger
@@ -125,9 +126,52 @@ def _engine_url(database_url: str) -> URL:
     ``create_engine`` imports the DBAPI eagerly, so a URL that resolves to an
     uninstalled driver fails at boot. An explicit ``postgresql+<driver>://`` is
     the operator's choice and is left alone.
+
+    The ``sslmode`` default is not set here: ``tls_root_set`` sets
+    ``PGSSLMODE=verify-full``, which libpq applies only when neither the URL nor
+    a service file names one; a service is refused, by ``tls_root_set``
+    (``PGSERVICE``) and by ``_refuse_root_overrides`` (in the URL), which
+    checks what libpq will be given.
     """
 
     url = make_url(database_url)
     if url.drivername == "postgresql":
         url = url.set(drivername=_POSTGRES_DRIVERNAME)
     return url
+
+
+def _refuse_root_overrides(engine: Engine) -> None:
+    """Refuse the start when the conninfo libpq will be given names
+    ``sslrootcert`` (libpq would verify against that file, not the root set),
+    ``sslcrl`` or ``sslcrldir`` (libpq loads a CRL source into its trust store,
+    CA certificates in it included) or ``service`` (a service file's options,
+    ``sslrootcert`` among them, apply before the environment's).
+
+    Read as psycopg2 builds it: the dialect's connect arguments merged by
+    ``make_dsn`` and parsed back, so a ``dsn=`` alias or a key with stray
+    whitespace is seen as libpq sees it.
+    """
+
+    if engine.dialect.driver != "psycopg2":
+        return
+    from psycopg2.extensions import make_dsn, parse_dsn
+
+    cargs, cparams = engine.dialect.create_connect_args(engine.url)
+    params = dict(cparams)
+    for key in ("async", "async_"):  # psycopg2.connect takes these out first
+        params.pop(key, None)
+    dsn = cargs[0] if cargs else params.pop("dsn", None)
+    conninfo = parse_dsn(make_dsn(dsn, **params))
+    for key in ("sslrootcert", "sslcrl", "sslcrldir", "service"):
+        if key in conninfo:
+            crl = (
+                " Postgres CRL revocation checking is not available here: libpq loads a"
+                " CRL source into its trust store, CA certificates included."
+                if key.startswith("sslcrl")
+                else ""
+            )
+            raise SystemExit(
+                f"TLS root set: SLACK_DATABASE_URL names {key}={conninfo[key]!r}. "
+                "The agent names the set in PGSSLROOTCERT itself: remove it, and put "
+                f"the server's CA certificates in TLS_EXTRA_CA_FILE.{crl}"
+            )

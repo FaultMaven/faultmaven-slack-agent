@@ -47,9 +47,12 @@ jobs:
       # The generator formats with the pinned ruff, so both pins matter: an
       # unpinned formatter or generator shows up here as a contract change that
       # never happened.
+      # pydantic-settings: the generator reads TLS_EXTRA_CA_FILE as the agent
+      # does before it fetches the contract (tls_root_set.py).
       - run: |
           pip install "$(grep -E '^datamodel-code-generator==' requirements-dev.txt)" \
-                      "$(grep -E '^ruff==' requirements-dev.txt)"
+                      "$(grep -E '^ruff==' requirements-dev.txt)" \
+                      "$(grep -E '^pydantic-settings==' requirements.txt)"
 
       # Regenerates from the PINNED contract (api-contract.pin.json), not from
       # the API's main branch. Adoption of a contract change is moving that
@@ -83,7 +86,9 @@ jobs:
     timeout-minutes: 15
     # The cluster runs the OAuth stores on Postgres; every other test uses
     # SQLite, which let SQLAlchemy 2.1's driver change (#81) pass CI and
-    # crash-loop at boot. A bare postgresql:// is the hosted URL shape.
+    # crash-loop at boot. The URL names no driver, as the hosted one does. The
+    # service has no TLS, so it names sslmode=disable: the agent's default for a
+    # URL naming no sslmode is verify-full (PGSSLMODE, tls_root_set.py).
     services:
       postgres:
         image: postgres:16
@@ -98,7 +103,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/faultmaven_slack
+      TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/faultmaven_slack?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -134,7 +139,16 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: faultmaven-slack-agent:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+      # Every TLS client the agent builds accepts a private CA given through
+      # TLS_EXTRA_CA_FILE and refuses it without (FaultMaven #2733). The
+      # throwaway CAs are made here, with the runner's openssl, and mounted in.
+      - name: Check the TLS root set in the built image
+        run: |
+          python3 scripts/check_tls_root_set.py --make-certs "$RUNNER_TEMP/tls-certs"
+          docker run --rm --network none -v "$RUNNER_TEMP/tls-certs:/certs:ro" \
+            faultmaven-slack-agent:ci python scripts/check_tls_root_set.py --certs /certs
