@@ -82,7 +82,7 @@ value refuses the start. So do a `SLACK_DATABASE_URL` whose connection options
 name `sslrootcert`, `sslcrl`, `sslcrldir` or a libpq `service` (a `dsn=` alias
 included); an inherited `PGSERVICE`, even empty, since a service file's
 options, `sslrootcert` among them, apply before the root set's; and an
-inherited `PGSSLCRL` or `PGSSLCRLDIR`. libpq loads a CRL source into its trust
+inherited `PGSSLCRL` or `PGSSLCRLDIR` that names anything but `/dev/null`. libpq loads a CRL source into its trust
 store, CA certificates in it included, so the agent names `/dev/null` (an
 empty CRL source) in `PGSSLCRL` and libpq never reads its default
 `~/.postgresql/root.crl`. Postgres CRL revocation checking is therefore not
@@ -106,8 +106,10 @@ With neither, the agent refuses the connection. An explicit `prefer` or
 it falls back to plaintext: use `verify-full`, or `disable` for a server with
 no TLS.
 
-With `TLS_EXTRA_CA_FILE` set, the agent writes the set file under `TMPDIR`
-(default `/tmp`), which must then be writable; it writes no other file.
+The agent writes a set file under `TMPDIR` (default `/tmp`) when
+`TLS_EXTRA_CA_FILE` is set, or when the OS bundle has no loadable file and is
+built from OpenSSL's certificate directory; `TMPDIR` must then be writable. It
+writes no other file.
 
 ## Shutdown drain (a deploy requirement for the infra repo)
 
