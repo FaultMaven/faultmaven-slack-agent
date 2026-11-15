@@ -2615,10 +2615,14 @@ class FaultMavenClient:
                 elif resp.status_code == 500:
                     # The turn may have committed (contract 14.5.0,
                     # faultmaven#2280): a database that stops answering
-                    # mid-commit is answered 500, the same 500 UNEXPECTED_ERROR
-                    # as any failure after the commit. So this is never "nothing
-                    # was saved": a re-send under the key is answered from the
-                    # receipt if it did, and runs the turn once if it did not.
+                    # mid-commit is answered 500. The contract names no code
+                    # for it, and core sends it as 500 SERVICE_ERROR with
+                    # "Please try again" (the commit's error is mapped like an
+                    # LLM failure), while a failure after the commit is 500
+                    # UNEXPECTED_ERROR. So no 500 is ever "nothing was saved",
+                    # whatever its code: a re-send under the key is answered
+                    # from the receipt if it did, and runs the turn once if it
+                    # did not.
                     server_errors += 1
                     pending = FaultMavenTimeoutError(
                         "submit_turn: the backend failed (HTTP 500"

@@ -568,19 +568,29 @@ def test_an_overloaded_backend_mid_recovery_is_waited_out():
 
 
 # -- a 500 may have committed; a 503 committed nothing (#143) -----------------
-def _server_error(code: str | None = "UNEXPECTED_ERROR", retry_after: str | None = "10"):
-    """The turn route's 500 as the core sends it: ``UNEXPECTED_ERROR`` with
-    ``Retry-After: 10`` is what a database that stops answering mid-commit, or
-    any failure after the commit, is answered with (contract 14.5.0)."""
+#: The 500s core answers a turn with, by code: a database that stops answering
+#: during the commit (contract 14.5.0) comes out of core's LLM error mapping as
+#: SERVICE_ERROR (probed against core 7e747f6e7 by driving the real
+#: ``commit_turn`` into a ``DatabaseTimeout``); a failure after the commit is
+#: the route's catch-all, UNEXPECTED_ERROR. Both carry ``Retry-After: 10``.
+_500_DETAIL = {
+    "SERVICE_ERROR": "Unable to process this request. Please try again.",
+    "UNEXPECTED_ERROR": "An unexpected error occurred. Error ID: abc",
+    None: "Internal server error",
+}
+
+
+def _server_error(code: str | None = "SERVICE_ERROR", retry_after: str | None = "10"):
+    """A turn route 500 as core sends it. The default is the mid-commit
+    database timeout's: ``SERVICE_ERROR``, ``Retry-After: 10``, and a detail
+    that says "Please try again" for a turn that may have committed."""
 
     headers = {}
     if code:
         headers["x-error-code"] = code
     if retry_after:
         headers["Retry-After"] = retry_after
-    return httpx.Response(
-        500, json={"detail": "An unexpected error occurred. Error ID: abc"}, headers=headers
-    )
+    return httpx.Response(500, json={"detail": _500_DETAIL[code]}, headers=headers)
 
 
 def _unavailable(code: str = "DATABASE_UNAVAILABLE", retry_after: str = "5"):
@@ -594,14 +604,17 @@ def _unavailable(code: str = "DATABASE_UNAVAILABLE", retry_after: str = "5"):
 
 
 @pytest.mark.parametrize(
-    "code", ["UNEXPECTED_ERROR", None, "SERVICE_ERROR"], ids=["unexpected", "uncoded", "service"]
+    "code",
+    ["SERVICE_ERROR", "UNEXPECTED_ERROR", None],
+    ids=["mid-commit-service-error", "after-commit-unexpected", "uncoded"],
 )
 def test_a_500_is_recovered_under_its_key_not_reported_unsaved(code):
     """#143: a turn whose commit meets a database that stops answering is
-    answered 500 with the outcome unknown (contract 14.5.0), and the route
-    answers any failure after its commit the same way. The contract names no
-    code for it, so no 500 is read as "nothing was saved": the turn is re-sent
-    under the SAME key, which the receipt answers when it committed."""
+    answered 500 with the outcome unknown (contract 14.5.0); core sends it as
+    SERVICE_ERROR, and a failure after the commit as UNEXPECTED_ERROR. The
+    contract names no code for it, so no 500 is read as "nothing was saved":
+    the turn is re-sent under the SAME key, which the receipt answers when it
+    committed."""
 
     backend = _Backend(_server_error(code), _ok(replayed=True))
     client, clock = _client(backend)
