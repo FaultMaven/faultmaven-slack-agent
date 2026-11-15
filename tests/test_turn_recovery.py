@@ -41,6 +41,7 @@ from faultmaven.client import (
     IdempotencyReplayUnavailableError,
     TurnResult,
 )
+import faultmaven.client as fm_client
 from listeners.actions import apply_action
 from tests._clock import FakeClock
 
@@ -566,6 +567,139 @@ def test_an_overloaded_backend_mid_recovery_is_waited_out():
     assert clock.waits == [1.0, 5.0]  # backoff, then the 503's own Retry-After
 
 
+# -- a 500 may have committed; a 503 committed nothing (#143) -----------------
+def _server_error(code: str | None = "UNEXPECTED_ERROR", retry_after: str | None = "10"):
+    """The turn route's 500 as the core sends it: ``UNEXPECTED_ERROR`` with
+    ``Retry-After: 10`` is what a database that stops answering mid-commit, or
+    any failure after the commit, is answered with (contract 14.5.0)."""
+
+    headers = {}
+    if code:
+        headers["x-error-code"] = code
+    if retry_after:
+        headers["Retry-After"] = retry_after
+    return httpx.Response(
+        500, json={"detail": "An unexpected error occurred. Error ID: abc"}, headers=headers
+    )
+
+
+def _unavailable(code: str = "DATABASE_UNAVAILABLE", retry_after: str = "5"):
+    """A 503 the turn route answers: nothing of THIS request committed."""
+
+    return httpx.Response(
+        503,
+        json={"detail": "The database is not answering."},
+        headers={"x-error-code": code, "Retry-After": retry_after},
+    )
+
+
+@pytest.mark.parametrize(
+    "code", ["UNEXPECTED_ERROR", None, "SERVICE_ERROR"], ids=["unexpected", "uncoded", "service"]
+)
+def test_a_500_is_recovered_under_its_key_not_reported_unsaved(code):
+    """#143: a turn whose commit meets a database that stops answering is
+    answered 500 with the outcome unknown (contract 14.5.0), and the route
+    answers any failure after its commit the same way. The contract names no
+    code for it, so no 500 is read as "nothing was saved": the turn is re-sent
+    under the SAME key, which the receipt answers when it committed."""
+
+    backend = _Backend(_server_error(code), _ok(replayed=True))
+    client, clock = _client(backend)
+    result = client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert result.replayed and result.agent_response == _ANSWER["agent_response"]
+    assert backend.keys == [_KEY] * 2
+    assert clock.waits == [10.0]  # the 500's own Retry-After
+
+
+def test_a_500_reaches_the_thread_as_the_recovered_answer():
+    backend = _Backend(_server_error(), _ok(replayed=True))
+    client, _ = _client(backend)
+    slack = _Slack()
+
+    _turn.run_turn_and_post(
+        slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
+        team_id="T1", text="why", idempotency_key=_KEY,
+    )
+
+    texts = [u["text"] for u in slack.updates]
+    assert texts == [_turn.STILL_WORKING_TEXT, _ANSWER["agent_response"]]
+    assert not any("Nothing was saved" in t for t in texts)
+
+
+def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick():
+    """A re-send that did not commit runs the turn again, charged; a failure
+    that repeats is not waited out to the bound. It ends as the unknown outcome:
+    "check the case", never "nothing was saved", and no button re-arms, since a
+    re-click goes out under a new key and could save the turn twice."""
+
+    backend = _Backend(_server_error())
+    client, clock = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert backend.keys == [_KEY] * (1 + fm_client._SERVER_ERROR_RESENDS)
+    assert clock.waits == [10.0] * fm_client._SERVER_ERROR_RESENDS
+    text = _turn.turn_error_text(err.value)
+    assert text == _turn.TURN_TIMEOUT_TEXT and "Nothing was saved" not in text
+    assert not _turn.retry_may_help(err.value)
+
+
+def test_a_500_while_recovering_keeps_the_recovery_going():
+    """It used to end the recovery as an answered refusal; it is one more
+    unknown outcome, so the turn is asked about again."""
+
+    backend = _Backend(_read_timeout, _server_error(), _ok(replayed=True))
+    client, clock = _client(backend)
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert backend.keys == [_KEY] * 3
+    assert clock.waits == [1.0, 10.0]
+
+
+def test_a_500_then_a_labelled_504_is_nothing_committed():
+    """A re-send that RAN (a labelled 504 commits nothing, contract 12.4.0)
+    found no receipt, so the 500's attempt did not commit either: a retry is
+    safe, as after any labelled 504."""
+
+    backend = _Backend(
+        _server_error(),
+        httpx.Response(504, json={"detail": "x"}, headers={"x-error-code": "REQUEST_TIMEOUT"}),
+    )
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenNothingCommittedError):
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert backend.keys == [_KEY] * 2
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["DATABASE_UNAVAILABLE", "TENANT_TURN_CAP_UNAVAILABLE", "REVOCATION_STATE_UNKNOWN"],
+)
+def test_a_coded_503_mid_recovery_is_waited_out(code):
+    """#143: every 503 the turn route answers commits nothing of THAT request
+    and invites a retry after ``Retry-After`` (contract 14.5.0), so it says
+    nothing about the attempt being recovered: it keeps the recovery going, as
+    an uncoded 5xx does, instead of ending it with the unknown outcome."""
+
+    backend = _Backend(_server_error(), _unavailable(code), _ok(replayed=True))
+    client, clock = _client(backend)
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert backend.keys == [_KEY] * 3
+    assert clock.waits == [10.0, 5.0]
+
+
+def test_a_coded_503_on_a_first_attempt_is_the_answer():
+    """Nothing can have committed: it surfaces as itself, retry offered."""
+
+    backend = _Backend(_unavailable())
+    client, clock = _client(backend)
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert not isinstance(err.value, FaultMavenTimeoutError)
+    assert (err.value.status_code, err.value.code) == (503, "DATABASE_UNAVAILABLE")
+    assert len(backend.requests) == 1 and clock.waits == []
+    assert "Nothing was saved" in _turn.turn_error_text(err.value)
+    assert _turn.retry_may_help(err.value)
+
+
 def test_a_rate_limit_mid_recovery_ends_as_the_unknown_outcome():
     """F1: a 429 while recovering ends with the thread told the turn may have
     gone through — never "rate limited, send it again", which would run a
@@ -675,10 +809,9 @@ def test_the_turn_cap_mid_recovery_reaches_the_thread():
     "later",
     [
         httpx.Response(400, json={"detail": "file type not allowed"}),
-        httpx.Response(503, json={"detail": "cap"}, headers={"x-error-code": "TENANT_TURN_CAP_UNAVAILABLE"}),
         _conflict("DUPLICATE_REQUEST"),
     ],
-    ids=["400", "coded-503", "other-409"],
+    ids=["400", "other-409"],
 )
 def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
     """F1: a re-send's refusal says nothing about whether the FIRST attempt

@@ -436,11 +436,18 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
             f"(HTTP {exc.status_code}){suffix} "
             "Re-sending the same input won't help."
         )
-    # A coded 5xx is the app's own answer, and a turn commits only on a 2xx, so
-    # nothing was saved and a retry is safe. Its detail is a sentence written for
-    # the user ("The AI provider could not process this request."), so it is
-    # shown; an uncoded 5xx may be a proxy's page, and keeps the generic text.
-    if isinstance(exc, FaultMavenAPIError) and exc.status_code >= 500 and exc.code:
+    # A coded 5xx other than a 500 is the app's own answer and commits nothing,
+    # so nothing was saved and a retry is safe. Its detail is a sentence written
+    # for the user ("The AI provider could not process this request."), so it is
+    # shown; an uncoded 5xx may be a proxy's page, and keeps the generic text. A
+    # 500 may have committed (contract 14.5.0): ``submit_turn`` raises it as the
+    # unknown outcome, and one from anywhere else is never "nothing was saved".
+    if (
+        isinstance(exc, FaultMavenAPIError)
+        and exc.status_code >= 500
+        and exc.status_code != 500
+        and exc.code
+    ):
         detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
         suffix = f": _{detail}_" if detail else "."
         return (

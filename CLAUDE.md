@@ -107,10 +107,14 @@ done when its check conclusions are green, not when local tests pass.
   and no turn sends its first attempt: `submit_turn` checks before the probe and
   again after the probe and the token fetch, and the thread is told to resend. A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
   after its `Retry-After`, at most twice) committed nothing and surfaces as
-  `FaultMavenNothingCommittedError`. Only an unlabelled 502/504 is a gateway;
-  any other coded non-2xx is the app's own answer and commits nothing (a coded
-  502 `LLM_PROVIDER_ERROR` is a `FaultMavenAPIError`, retry offered). While
-  recovering, a 429 is waited for its `Retry-After`, or ends the loop at once
+  `FaultMavenNothingCommittedError`. Only an unlabelled 502/504 is a gateway.
+  A 500, coded or not, may have committed (contract 14.5.0: a database that
+  stops answering mid-commit) and is the unknown outcome: re-sent under its key
+  after `Retry-After`, twice at most, never "nothing was saved". Any other
+  coded non-2xx is the app's own answer and commits nothing (a coded 502
+  `LLM_PROVIDER_ERROR` is a `FaultMavenAPIError`, retry offered). While
+  recovering, a 503 (every one commits nothing, `DATABASE_UNAVAILABLE`
+  included) or an uncoded 5xx keeps the loop going; a 429 is waited for its `Retry-After`, or ends the loop at once
   when that outlasts the bound (`turn_cap` set for `TENANT_TURN_CAP_EXCEEDED`),
   and a wait that would reach the bound is cut short for one last ask.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,

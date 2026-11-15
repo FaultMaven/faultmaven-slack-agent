@@ -228,6 +228,15 @@ _TIMING_MAX_BOUND_SECONDS = 1200.0
 #: retry. LLM_TIMEOUT is transient and gets two, after its Retry-After.
 _REQUEST_TIMEOUT_RESENDS = 0
 _LLM_TIMEOUT_RESENDS = 2
+#: Re-sends allowed after a 500, per message. A 500 may have committed the turn
+#: (contract 14.5.0: a database that stops answering mid-commit; the turn route
+#: answers any failure after its commit the same way), so it is re-sent under
+#: its key, where a committed turn is answered from its receipt. One that did
+#: not commit runs again, charged, and a failure that repeats on every run is
+#: not worth the user's wait to the bound: after these, the turn ends as the
+#: unknown outcome it is. (While the database is down, a re-send is refused 503
+#: before it runs, which does not count here.)
+_SERVER_ERROR_RESENDS = 2
 
 # How long to wait before re-polling a TURN_IN_PROGRESS key. ``Retry-After`` is
 # the remaining TTL of the first request's claim, which is an UPPER bound: the
@@ -514,8 +523,8 @@ class FaultMavenTimeoutError(FaultMavenError):
     the backend may still complete it.
 
     Raised only for a genuine unknown outcome: a client-side timeout, a dropped
-    connection, an unlabelled gateway 502/504 or a claim still held. A labelled
-    504 commits nothing (contract 12.4.0) and is
+    connection, an unlabelled gateway 502/504, a 500 (contract 14.5.0) or a
+    claim still held. A labelled 504 commits nothing (contract 12.4.0) and is
     :class:`FaultMavenNothingCommittedError` instead.
 
     Distinguished so the user-facing message can warn against blind re-sends
@@ -2302,8 +2311,8 @@ class FaultMavenClient:
         carries the key the turn committed under.
 
         **Recovery.** An attempt whose outcome is unknown — the client timed
-        out, a gateway answered an unlabelled 502/504, or the connection dropped
-        after the body was sent — usually means the turn is still running or
+        out, a gateway answered an unlabelled 502/504, the API answered 500, or
+        the connection dropped after the body was sent — usually means the turn is still running or
         has already committed. Instead of giving up, the same request is re-sent under the
         same key until the backend answers with the turn, for at most
         ``turn_recovery_seconds`` in all:
@@ -2324,8 +2333,17 @@ class FaultMavenClient:
           is a fresh, charged run, so it starts only if a whole attempt still
           fits in the bound. Any other labelled 504 is final. Whatever ends
           these is raised as :class:`FaultMavenNothingCommittedError`.
-        - an uncoded 5xx while recovering: the backend is overloaded or
-          restarting, which says nothing about the turn. Keep asking, after
+        - a ``500``, coded or not, on any attempt: the outcome is unknown. The
+          contract (14.5.0) answers a turn whose commit meets a database that
+          stops answering with a 500, and the route answers any failure after
+          its commit the same way, so a 500 never says "nothing was saved".
+          Re-sent under the key after ``Retry-After`` (clamped) or the backoff,
+          twice at most (:data:`_SERVER_ERROR_RESENDS`); after that, the
+          unknown outcome is raised.
+        - a ``503`` (coded or not), or any other uncoded 5xx, while recovering:
+          the backend is overloaded, restarting or without its database, which
+          says nothing about the turn (every 503 the route answers commits
+          nothing, ``DATABASE_UNAVAILABLE`` included). Keep asking, after
           ``Retry-After`` (clamped) or the backoff.
         - a 429 while recovering (the rate limiter, or the daily turn cap) says
           nothing about the turn either. Its ``Retry-After`` is when an ask is
@@ -2339,8 +2357,8 @@ class FaultMavenClient:
           (see :data:`_DEFINITIVE_WHILE_RECOVERING`); any other refusal raises
           the unknown outcome. When no earlier attempt can have committed (none
           yet, or a labelled 504 since), a refusal is the real answer and
-          surfaces as itself: a coded non-2xx is the app's own answer and the
-          turn commits only on a 2xx, so a coded 502 (``LLM_PROVIDER_ERROR``)
+          surfaces as itself: a coded non-2xx other than a 500 is the app's own
+          answer and commits nothing, so a coded 502 (``LLM_PROVIDER_ERROR``)
           is a :class:`FaultMavenAPIError`, not a gateway timeout.
 
         A wait that would run to the bound is cut short to leave one last ask
@@ -2421,14 +2439,15 @@ class FaultMavenClient:
         # failure that never reached the backend is safe to report as retryable.
         pending: FaultMavenTimeoutError | FaultMavenNothingCommittedError | None = None
         # Can an EARLIER attempt have committed this turn? Set by a transport
-        # loss, a client timeout, an unlabelled gateway 502/504 or a claim still
-        # held; cleared by a labelled 504, which says the backend ran it and
+        # loss, a client timeout, an unlabelled gateway 502/504, a 500 or a
+        # claim still held; cleared by a labelled 504, which says the backend ran it and
         # committed nothing. While it is False a refusal is the real answer.
         maybe_committed = False
         backoff = _RECOVERY_BACKOFF_FIRST_SECONDS
         version_conflicts = 0
         request_timeouts = 0
         llm_timeouts = 0
+        server_errors = 0
         # Set when this attempt was answered by a labelled 504: the next attempt
         # is a fresh, charged run, and starts only if a whole attempt fits.
         fresh_run_next = False
@@ -2575,10 +2594,37 @@ class FaultMavenClient:
                             raise pending from error
                     else:
                         wait = float(max(retry_after, _IN_PROGRESS_POLL_MIN_SECONDS))
-                elif maybe_committed and resp.status_code >= 500 and not code:
-                    # A backend that is overloaded or restarting says nothing
-                    # about the attempt being recovered, which may have
-                    # committed: keep asking, at the pace it asks for.
+                elif resp.status_code == 500:
+                    # The turn may have committed (contract 14.5.0,
+                    # faultmaven#2280): a database that stops answering
+                    # mid-commit is answered 500, the same 500 UNEXPECTED_ERROR
+                    # as any failure after the commit. So this is never "nothing
+                    # was saved": a re-send under the key is answered from the
+                    # receipt if it did, and runs the turn once if it did not.
+                    server_errors += 1
+                    pending = FaultMavenTimeoutError(
+                        "submit_turn: the backend failed (HTTP 500"
+                        f"{' ' + code if code else ''}); the turn may have "
+                        "committed"
+                    )
+                    maybe_committed = True
+                    if server_errors > _SERVER_ERROR_RESENDS:
+                        raise pending
+                    retry_after = self._retry_after(resp)
+                    if retry_after is None:
+                        wait, backoff = backoff, _next_backoff(backoff)
+                    else:
+                        wait = _in_progress_poll_seconds(retry_after)
+                elif maybe_committed and (
+                    resp.status_code == 503
+                    or (resp.status_code >= 500 and not code)
+                ):
+                    # A backend that is overloaded, restarting or without its
+                    # database says nothing about the attempt being recovered,
+                    # which may have committed: keep asking, at the pace it asks
+                    # for. A coded 503 is the route's own "nothing of THIS
+                    # request committed" (DATABASE_UNAVAILABLE and the rest),
+                    # which is no answer about the earlier attempt either.
                     retry_after = self._retry_after(resp)
                     if retry_after is None:
                         wait, backoff = backoff, _next_backoff(backoff)
@@ -2701,10 +2747,10 @@ class FaultMavenClient:
             )
         except FaultMavenAPIError as exc:
             # No status-keyed "may have committed" arm here. The unlabelled
-            # gateway 502/504 is answered in ``submit_turn`` before this is
-            # called, and every 504 the app labels too; what is left with a 5xx
-            # is coded, so the app's own answer, and the turn commits only on a
-            # 2xx. A coded 502 (``LLM_PROVIDER_ERROR``: the AI provider refused
+            # gateway 502/504 and every 500 (which may have committed, contract
+            # 14.5.0) are answered in ``submit_turn`` before this is called,
+            # and every 504 the app labels too; what is left with a 5xx is
+            # coded, so the app's own answer, and commits nothing. A coded 502 (``LLM_PROVIDER_ERROR``: the AI provider refused
             # the request) used to be raised here as a gateway timeout, which
             # told the user the turn might still complete and offered no retry.
             if isinstance(exc, FaultMavenRateLimitError) and exc.code == _TURN_CAP_CODE:
