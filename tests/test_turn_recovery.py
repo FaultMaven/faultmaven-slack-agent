@@ -629,7 +629,8 @@ def test_a_500_reaches_the_thread_as_the_recovered_answer():
 def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick():
     """A re-send that did not commit runs the turn again, charged; a failure
     that repeats is not waited out to the bound. It ends as the unknown outcome:
-    "check the case", never "nothing was saved", and no button re-arms, since a
+    "check the case", never "nothing was saved" and never "I stopped waiting"
+    (the backend answered, with a failure), and no button re-arms, since a
     re-click goes out under a new key and could save the turn twice."""
 
     backend = _Backend(_server_error())
@@ -638,9 +639,24 @@ def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick():
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert backend.keys == [_KEY] * (1 + fm_client._SERVER_ERROR_RESENDS)
     assert clock.waits == [10.0] * fm_client._SERVER_ERROR_RESENDS
+    assert err.value.server_error
     text = _turn.turn_error_text(err.value)
-    assert text == _turn.TURN_TIMEOUT_TEXT and "Nothing was saved" not in text
+    assert text == _turn.TURN_SERVER_ERROR_TEXT
+    assert "Nothing was saved" not in text and "stopped waiting" not in text
+    assert "check the case" in text.lower()
     assert not _turn.retry_may_help(err.value)
+
+
+def test_a_500_then_a_timeout_ends_as_the_timeout():
+    """The text follows the LAST unknown outcome: a re-send the client gave up
+    waiting on is the timeout, whatever came before it."""
+
+    backend = _Backend(_server_error(), _read_timeout)
+    client, _ = _client(backend, recovery=30.0)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert not err.value.server_error
+    assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
 
 
 def test_a_500_while_recovering_keeps_the_recovery_going():

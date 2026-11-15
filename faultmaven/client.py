@@ -278,6 +278,18 @@ def _in_progress_poll_seconds(retry_after: int | None) -> float:
     )
 
 
+def _resend_wait(retry_after: int | None, backoff: float) -> tuple[float, float]:
+    """The wait before a re-send the backend paced, and the backoff after it.
+
+    The backend's ``Retry-After`` clamped to a poll interval when it sent one
+    (the backoff is left as it was); otherwise the backoff, which then doubles.
+    """
+
+    if retry_after is None:
+        return backoff, _next_backoff(backoff)
+    return _in_progress_poll_seconds(retry_after), backoff
+
+
 def _notify_waiting(on_waiting: Callable[[], None]) -> None:
     """Run a surface's "still working" callback. Never raises: it is cosmetic,
     and the turn it reports on is still in flight."""
@@ -538,13 +550,22 @@ class FaultMavenTimeoutError(FaultMavenError):
     ``turn_cap`` is set when the loop gave up because a re-send met the daily
     turn cap until past its bound: the outcome is still unknown, and a new
     message cannot run until the cap resets either.
+
+    ``server_error`` is set when the last unknown outcome was the backend's own
+    500 rather than a wait that ran out: the client did not stop waiting, the
+    backend failed in a way that may have committed the turn.
     """
 
     def __init__(
-        self, message: str, *, turn_cap: TurnCapExceededError | None = None
+        self,
+        message: str,
+        *,
+        turn_cap: TurnCapExceededError | None = None,
+        server_error: bool = False,
     ) -> None:
         super().__init__(message)
         self.turn_cap = turn_cap
+        self.server_error = server_error
 
 
 class FaultMavenNothingCommittedError(FaultMavenError):
@@ -2541,10 +2562,7 @@ class FaultMavenClient:
                     if resends > limit:
                         raise pending
                     if kind == "llm_timeout":
-                        if retry_after is None:
-                            wait, backoff = backoff, _next_backoff(backoff)
-                        else:
-                            wait = _in_progress_poll_seconds(retry_after)
+                        wait, backoff = _resend_wait(retry_after, backoff)
                     fresh_run_next = True
                 elif resp.status_code in (502, 504) and not code:
                     # A gateway timed out on an upstream it had forwarded to:
@@ -2605,16 +2623,13 @@ class FaultMavenClient:
                     pending = FaultMavenTimeoutError(
                         "submit_turn: the backend failed (HTTP 500"
                         f"{' ' + code if code else ''}); the turn may have "
-                        "committed"
+                        "committed",
+                        server_error=True,
                     )
                     maybe_committed = True
                     if server_errors > _SERVER_ERROR_RESENDS:
                         raise pending
-                    retry_after = self._retry_after(resp)
-                    if retry_after is None:
-                        wait, backoff = backoff, _next_backoff(backoff)
-                    else:
-                        wait = _in_progress_poll_seconds(retry_after)
+                    wait, backoff = _resend_wait(self._retry_after(resp), backoff)
                 elif maybe_committed and (
                     resp.status_code == 503
                     or (resp.status_code >= 500 and not code)
@@ -2625,11 +2640,7 @@ class FaultMavenClient:
                     # for. A coded 503 is the route's own "nothing of THIS
                     # request committed" (DATABASE_UNAVAILABLE and the rest),
                     # which is no answer about the earlier attempt either.
-                    retry_after = self._retry_after(resp)
-                    if retry_after is None:
-                        wait, backoff = backoff, _next_backoff(backoff)
-                    else:
-                        wait = _in_progress_poll_seconds(retry_after)
+                    wait, backoff = _resend_wait(self._retry_after(resp), backoff)
                 else:
                     try:
                         self._raise_turn_error(resp, polled=polled)

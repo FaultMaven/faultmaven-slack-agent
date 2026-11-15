@@ -88,6 +88,15 @@ TURN_TIMEOUT_TEXT = (
     "gone through. Check the case before sending it again: a re-send runs as a "
     "new turn, and would repeat it if it did."
 )
+# The backend answered 500 and the re-sends under the turn's key did not settle
+# it: a 500 may have committed (contract 14.5.0), so as with the timeout this
+# points at the case, never at a re-send. Not "I stopped waiting": the backend
+# answered, with a failure.
+TURN_SERVER_ERROR_TEXT = (
+    ":warning: FaultMaven hit an error on that turn, and I couldn't confirm "
+    "whether it was saved. Check the case before sending it again: a re-send "
+    "runs as a new turn, and would repeat it if it did."
+)
 # The backend ran the turn out of time and committed NOTHING (a labelled 504,
 # contract 12.4.0), so a retry is safe: it carries a new key and repeats nothing.
 NOTHING_COMMITTED_TEXT = (
@@ -351,6 +360,8 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
                 "Check the case before sending it again: a re-send runs as a new "
                 "turn, and would repeat it if it did."
             )
+        if exc.server_error:
+            return TURN_SERVER_ERROR_TEXT
         return TURN_TIMEOUT_TEXT
     # Above the shutdown override: the turn committed, which a restart does not
     # undo, so "resend it in a minute" would run it twice.
@@ -442,12 +453,7 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # shown; an uncoded 5xx may be a proxy's page, and keeps the generic text. A
     # 500 may have committed (contract 14.5.0): ``submit_turn`` raises it as the
     # unknown outcome, and one from anywhere else is never "nothing was saved".
-    if (
-        isinstance(exc, FaultMavenAPIError)
-        and exc.status_code >= 500
-        and exc.status_code != 500
-        and exc.code
-    ):
+    if isinstance(exc, FaultMavenAPIError) and exc.status_code > 500 and exc.code:
         detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
         suffix = f": _{detail}_" if detail else "."
         return (
