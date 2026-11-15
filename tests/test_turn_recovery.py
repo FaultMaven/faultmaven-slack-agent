@@ -640,20 +640,22 @@ def test_a_coded_500_on_a_first_attempt_committed_nothing(code):
     assert (err.value.status_code, err.value.code) == (500, code)
     assert len(backend.requests) == 1 and clock.waits == []
     assert _turn.turn_error_text(err.value) == _turn.TURN_ERROR_TEXT
+    assert _turn.retry_may_help(err.value), "the user is offered the retry"
 
 
-def test_a_coded_500_while_recovering_keeps_the_outcome_unknown():
+def test_a_coded_500_while_recovering_keeps_the_recovery_going():
     """A re-send's coded 500 says nothing of THIS request committed, and
-    nothing about the earlier attempt it recovers, which may have: the turn
-    ends as that attempt's unknown outcome."""
+    nothing about the earlier attempt it recovers (it can fail before the
+    receipt lookup), which may have: the turn is asked about again, as after a
+    coded 503, at the pace the 500 names."""
 
-    backend = _Backend(_read_timeout, _server_error("SERVICE_ERROR", retry_after="10"))
-    client, _ = _client(backend)
-    with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
-    assert backend.keys == [_KEY] * 2
-    assert not err.value.server_error
-    assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
+    backend = _Backend(
+        _read_timeout, _server_error("SERVICE_ERROR", retry_after="10"), _ok(replayed=True)
+    )
+    client, clock = _client(backend)
+    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert backend.keys == [_KEY] * 3
+    assert clock.waits == [1.0, 10.0]
 
 
 def test_a_500_reaches_the_thread_as_the_recovered_answer():
@@ -671,14 +673,17 @@ def test_a_500_reaches_the_thread_as_the_recovered_answer():
     assert not any("Nothing was saved" in t for t in texts)
 
 
-def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick():
+@pytest.mark.parametrize(
+    "code", ["TURN_OUTCOME_UNKNOWN", None], ids=["outcome-unknown", "uncoded"]
+)
+def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick(code):
     """A re-send that did not commit runs the turn again, charged; a failure
     that repeats is not waited out to the bound. It ends as the unknown outcome:
     "check the case", never "nothing was saved" and never "I stopped waiting"
     (the backend answered, with a failure), and no button re-arms, since a
     re-click goes out under a new key and could save the turn twice."""
 
-    backend = _Backend(_server_error())
+    backend = _Backend(_server_error(code))
     client, clock = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
@@ -890,7 +895,12 @@ def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
 @pytest.mark.parametrize(
     ("later", "expected"),
     [
-        (httpx.Response(404, json={"detail": "Case not found"}), "CaseNotFoundError"),
+        (
+            httpx.Response(
+                404, json={"detail": "Case not found"}, headers={"x-error-code": "CASE_NOT_FOUND"}
+            ),
+            "CaseNotFoundError",
+        ),
         (
             httpx.Response(
                 409, json={"detail": "closed"}, headers={"x-error-code": "CASE_TERMINAL"}

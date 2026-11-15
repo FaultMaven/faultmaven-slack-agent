@@ -112,7 +112,10 @@ done when its check conclusions are green, not when local tests pass.
   (contract 15.1.0: a COMMIT the database did not say it rolled back, a failure
   after the commit, or a failure outside the route) and is the unknown outcome:
   re-sent under its key after `Retry-After`, twice at most, never "nothing was
-  saved". A 500 with any other code committed nothing. Any other
+  saved". A 500 with any other code committed nothing (while recovering an
+  earlier attempt it is no answer about that one and keeps the loop going, as
+  a 503 does). A turn's 404 means the case is gone only when labelled
+  `CASE_NOT_FOUND` (contract 15.0.0); an unlabelled 404 never tombstones. Any other
   coded non-2xx is the app's own answer and commits nothing (a coded 502
   `LLM_PROVIDER_ERROR` is a `FaultMavenAPIError`, retry offered). While
   recovering, a 503 (every one commits nothing, `DATABASE_UNAVAILABLE`

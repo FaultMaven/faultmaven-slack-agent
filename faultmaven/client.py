@@ -167,6 +167,10 @@ _CASE_TERMINAL_CODE = "CASE_TERMINAL"
 # 14.14.0, faultmaven#2096). No ``Retry-After``: the case is gone once the
 # delete succeeds.
 _CASE_DELETE_IN_PROGRESS_CODE = "CASE_DELETE_IN_PROGRESS"
+# The case's own 404 (contract 15.0.0, faultmaven#2806): absent, deleted or
+# unreadable. Only it means the case is gone; a 404 for anything else (inside
+# the case, or a proxy's) is unlabelled, and must not unlink a live thread.
+_CASE_NOT_FOUND_CODE = "CASE_NOT_FOUND"
 
 # The turn receipt's answers (contract 12.2.0, faultmaven#1888). A turn sent with
 # an ``Idempotency-Key`` commits a receipt with it, so a retry under the same key
@@ -1987,7 +1991,11 @@ class FaultMavenClient:
             detail = self._error_detail(resp)
             code = resp.headers.get("x-error-code") or None
             message = f"{op} failed: HTTP {resp.status_code}: {detail}"
-            if not_found_is_case and resp.status_code == 404:
+            if (
+                not_found_is_case
+                and resp.status_code == 404
+                and code == _CASE_NOT_FOUND_CODE
+            ):
                 raise CaseNotFoundError(
                     message, status_code=404, detail=detail, code=code
                 ) from exc
@@ -2337,8 +2345,8 @@ class FaultMavenClient:
         carries the key the turn committed under.
 
         **Recovery.** An attempt whose outcome is unknown — the client timed
-        out, a gateway answered an unlabelled 502/504, the API answered 500, or
-        the connection dropped after the body was sent — usually means the turn is still running or
+        out, a gateway answered an unlabelled 502/504, the API answered 500
+        ``TURN_OUTCOME_UNKNOWN`` or an uncoded 500, or the connection dropped after the body was sent — usually means the turn is still running or
         has already committed. Instead of giving up, the same request is re-sent under the
         same key until the backend answers with the turn, for at most
         ``turn_recovery_seconds`` in all:
@@ -2366,8 +2374,10 @@ class FaultMavenClient:
           failed outside the route and says nothing. Re-sent under the key
           after ``Retry-After`` (clamped) or the backoff, twice at most
           (:data:`_SERVER_ERROR_RESENDS`); after that, the unknown outcome is
-          raised. A 500 with any other code committed nothing, and is mapped
-          like any coded refusal (below).
+          raised. A 500 with any other code committed nothing: on a first
+          attempt it is mapped like any coded refusal (below); while an earlier
+          attempt may have committed it is no answer about that one, and is
+          re-sent under the same cap.
         - a ``503`` (coded or not), or any other uncoded 5xx, while recovering:
           the backend is overloaded, restarting or without its database, which
           says nothing about the turn (every 503 the route answers commits
@@ -2380,14 +2390,18 @@ class FaultMavenClient:
           (``turn_cap``) when that was the refusal.
         - anything else is mapped as it always was on a first attempt. While an
           earlier attempt may have committed the turn (a transport loss, a
-          client timeout, an unlabelled gateway 502/504, a claim still held),
+          client timeout, an unlabelled gateway 502/504, a
+          ``TURN_OUTCOME_UNKNOWN`` or uncoded 500, a claim still held),
           only an answer about the turn itself ends the loop with its own class
           (see :data:`_DEFINITIVE_WHILE_RECOVERING`); any other refusal raises
           the unknown outcome. When no earlier attempt can have committed (none
           yet, or a labelled 504 since), a refusal is the real answer and
-          surfaces as itself: a coded non-2xx other than a 500 is the app's own
-          answer and commits nothing, so a coded 502 (``LLM_PROVIDER_ERROR``)
-          is a :class:`FaultMavenAPIError`, not a gateway timeout.
+          surfaces as itself: a coded non-2xx (a 500 included, unless it is
+          ``TURN_OUTCOME_UNKNOWN``) is the app's own answer and commits
+          nothing, so a coded 502 (``LLM_PROVIDER_ERROR``) or 500
+          (``SERVICE_ERROR``) is a :class:`FaultMavenAPIError`, not a gateway
+          timeout. A 404 is :class:`CaseNotFoundError` only when labelled
+          ``CASE_NOT_FOUND`` (contract 15.0.0).
 
         A wait that would run to the bound is cut short to leave one last ask
         (:data:`_LAST_ASK_SECONDS`), so a turn that committed during it is still
@@ -2620,7 +2634,7 @@ class FaultMavenClient:
                     else:
                         wait = float(max(retry_after, _IN_PROGRESS_POLL_MIN_SECONDS))
                 elif resp.status_code == 500 and (
-                    not code or code == _TURN_OUTCOME_UNKNOWN_CODE
+                    not code or code == _TURN_OUTCOME_UNKNOWN_CODE or maybe_committed
                 ):
                     # The turn may have committed (contract 15.1.0,
                     # faultmaven#2813): its COMMIT failed without the database
@@ -2629,8 +2643,12 @@ class FaultMavenClient:
                     # middleware, the response's serialization), possibly after
                     # a commit. A re-send under the key is answered from the
                     # receipt if it did, and runs the turn once if it did not.
-                    # Any other coded 500 committed nothing and falls through
-                    # to the coded refusals below.
+                    # While an earlier attempt may have committed, a coded 500
+                    # is no answer about it (it can fail before the receipt
+                    # lookup), so it keeps the recovery going too, as a coded
+                    # 503 does, under the same cap. Any other coded 500
+                    # committed nothing and falls through to the coded
+                    # refusals below.
                     server_errors += 1
                     pending = FaultMavenTimeoutError(
                         "submit_turn: the backend failed (HTTP 500"
@@ -2760,10 +2778,11 @@ class FaultMavenClient:
         """Map a final non-2xx turn response onto the typed exceptions. Always
         raises."""
 
-        # A 404 means "case deleted" only on the turn POST itself. A 404 from
-        # the polled Location URL is the STATUS resource expiring/moving — the
-        # case may be alive, so it must not trigger the caller's mapping
-        # eviction.
+        # A 404 means "case deleted" only on the turn POST itself, and only
+        # labelled ``CASE_NOT_FOUND`` (contract 15.0.0). A 404 from the polled
+        # Location URL is the STATUS resource expiring/moving, and an
+        # unlabelled one is something else's (inside the case, or a proxy's):
+        # the case may be alive, so neither may evict the caller's mapping.
         try:
             self._raise_for_status(
                 resp, "submit_turn", not_found_is_case=not polled

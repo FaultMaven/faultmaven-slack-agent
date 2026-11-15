@@ -134,13 +134,48 @@ def _client(handler, *, token: str = "", dev: str = "") -> FaultMavenClient:
 
 def test_submit_turn_404_raises_case_not_found_with_detail():
     def handler(req):
-        return httpx.Response(404, json={"detail": "Case not found"})
+        return httpx.Response(
+            404, json={"detail": "Case not found"}, headers={"x-error-code": "CASE_NOT_FOUND"}
+        )
 
     client = _client(handler, token="tok")
     with pytest.raises(CaseNotFoundError) as err:
         client.submit_turn("dead", query="hi", idempotency_key="test-turn-key")
     assert err.value.status_code == 404
     assert "Case not found" in err.value.detail
+
+
+@pytest.mark.parametrize(
+    "body", [{"detail": "File not found"}, {}], ids=["inside-the-case", "proxy"]
+)
+def test_submit_turn_unlabelled_404_is_not_a_missing_case(body):
+    """Contract 15.0.0: only ``CASE_NOT_FOUND`` says the case is gone. A 404
+    for something inside the case, or a proxy's during a rollout, carries no
+    label, and must not tombstone a live thread."""
+
+    client = _client(lambda req: httpx.Response(404, json=body), token="tok")
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("live", query="hi", idempotency_key="test-turn-key")
+    assert not isinstance(err.value, CaseNotFoundError)
+    assert err.value.status_code == 404
+
+
+def test_submit_turn_403_case_not_driver_is_a_rejection():
+    """Contract 15.0.0 labels the turn's 403 ``CASE_NOT_DRIVER``; it stays the
+    4xx rejection it was."""
+
+    client = _client(
+        lambda req: httpx.Response(
+            403,
+            json={"detail": "Only the case's driver can do this"},
+            headers={"x-error-code": "CASE_NOT_DRIVER"},
+        ),
+        token="tok",
+    )
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", query="hi", idempotency_key="test-turn-key")
+    assert (err.value.status_code, err.value.code) == (403, "CASE_NOT_DRIVER")
+    assert not isinstance(err.value, CaseNotFoundError)
 
 
 def test_submit_turn_4xx_carries_backend_detail():
