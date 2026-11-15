@@ -89,7 +89,8 @@ TURN_TIMEOUT_TEXT = (
     "new turn, and would repeat it if it did."
 )
 # The backend answered 500 and the re-sends under the turn's key did not settle
-# it: a 500 may have committed (contract 14.5.0), so as with the timeout this
+# it: a TURN_OUTCOME_UNKNOWN or uncoded 500 may have committed (contract
+# 15.1.0), so as with the timeout this
 # points at the case, never at a re-send. Not "I stopped waiting": the backend
 # answered, with a failure.
 TURN_SERVER_ERROR_TEXT = (
@@ -451,8 +452,10 @@ def turn_error_text(exc: Exception, channel_id: str = "") -> str:
     # so nothing was saved and a retry is safe. Its detail is a sentence written
     # for the user ("The AI provider could not process this request."), so it is
     # shown; an uncoded 5xx may be a proxy's page, and keeps the generic text. A
-    # 500 may have committed (contract 14.5.0): ``submit_turn`` raises it as the
-    # unknown outcome, and one from anywhere else is never "nothing was saved".
+    # 500 keeps it too: from ``submit_turn`` one that may have committed
+    # (``TURN_OUTCOME_UNKNOWN`` or uncoded, contract 15.1.0) arrives as the
+    # unknown outcome, and a coded 500 from ``create_case`` says nothing about
+    # whether the case was created, so neither is "nothing was saved".
     if isinstance(exc, FaultMavenAPIError) and exc.status_code > 500 and exc.code:
         detail = escape_mrkdwn(exc.detail[:200]) if exc.detail else ""
         suffix = f": _{detail}_" if detail else "."

@@ -695,11 +695,13 @@ all — while `is_unlinked` preserves the memory:
    turn at once with a "nothing was saved, try narrowing it" notice; `504
    LLM_TIMEOUT` (nothing committed; `Retry-After: 30`) is re-sent after that
    wait, twice at most, if a whole attempt still fits the bound (contract
-   12.4.0; both surface as `FaultMavenNothingCommittedError`); a `500`, coded or
-   not, may have committed (contract 14.5.0: a database that stops answering
-   mid-commit is answered 500, which core sends as `SERVICE_ERROR` with "Please
-   try again"; a failure after the commit is `500 UNEXPECTED_ERROR`), so it is re-sent after its `Retry-After`, twice at most, and then
-   ends as the unknown outcome, never "nothing was saved"; a `503` (every one
+   12.4.0; both surface as `FaultMavenNothingCommittedError`); a `500`
+   labelled `TURN_OUTCOME_UNKNOWN`, or with no code, may have committed
+   (contract 15.1.0: a COMMIT the database did not say it rolled back, a failure
+   after the commit, or a failure outside the route), so it is re-sent after its
+   `Retry-After`, twice at most, and then ends as the unknown outcome, never
+   "nothing was saved"; a `500` with any other code committed nothing and is
+   mapped like any coded refusal; a `503` (every one
    the route answers commits nothing, `DATABASE_UNAVAILABLE` included), an
    uncoded 5xx or a 429 keeps the loop going (the backend is overloaded,
    restarting or without its database, which says nothing about the turn). Only answers about the turn itself end it with their own meaning —

@@ -567,23 +567,28 @@ def test_an_overloaded_backend_mid_recovery_is_waited_out():
     assert clock.waits == [1.0, 5.0]  # backoff, then the 503's own Retry-After
 
 
-# -- a 500 may have committed; a 503 committed nothing (#143) -----------------
-#: The 500s core answers a turn with, by code: a database that stops answering
-#: during the commit (contract 14.5.0) comes out of core's LLM error mapping as
-#: SERVICE_ERROR (probed against core 7e747f6e7 by driving the real
-#: ``commit_turn`` into a ``DatabaseTimeout``); a failure after the commit is
-#: the route's catch-all, UNEXPECTED_ERROR. Both carry ``Retry-After: 10``.
+# -- a 500 may have committed only when it says so; a 503 committed nothing ----
+#: The 500s core answers a turn with, by code (contract 15.1.0,
+#: faultmaven#2813). TURN_OUTCOME_UNKNOWN: the COMMIT failed without the
+#: database saying it rolled back, or answering failed after the commit; no
+#: ``Retry-After``. SERVICE_ERROR and UNEXPECTED_ERROR: failures before the
+#: commit, so nothing committed (``Retry-After: 10``). An uncoded 500 failed
+#: outside the route and says nothing about the turn.
 _500_DETAIL = {
+    "TURN_OUTCOME_UNKNOWN": (
+        "The turn may have been saved. Retry with the same Idempotency-Key to "
+        "learn whether it was; without a key, reload the case before sending "
+        "it again."
+    ),
     "SERVICE_ERROR": "Unable to process this request. Please try again.",
     "UNEXPECTED_ERROR": "An unexpected error occurred. Error ID: abc",
     None: "Internal server error",
 }
 
 
-def _server_error(code: str | None = "SERVICE_ERROR", retry_after: str | None = "10"):
-    """A turn route 500 as core sends it. The default is the mid-commit
-    database timeout's: ``SERVICE_ERROR``, ``Retry-After: 10``, and a detail
-    that says "Please try again" for a turn that may have committed."""
+def _server_error(code: str | None = "TURN_OUTCOME_UNKNOWN", retry_after: str | None = None):
+    """A turn route 500 as core sends it. The default is the one that may have
+    committed: ``TURN_OUTCOME_UNKNOWN``, with no ``Retry-After``."""
 
     headers = {}
     if code:
@@ -604,24 +609,51 @@ def _unavailable(code: str = "DATABASE_UNAVAILABLE", retry_after: str = "5"):
 
 
 @pytest.mark.parametrize(
-    "code",
-    ["SERVICE_ERROR", "UNEXPECTED_ERROR", None],
-    ids=["mid-commit-service-error", "after-commit-unexpected", "uncoded"],
+    "code", ["TURN_OUTCOME_UNKNOWN", None], ids=["outcome-unknown", "uncoded"]
 )
-def test_a_500_is_recovered_under_its_key_not_reported_unsaved(code):
-    """#143: a turn whose commit meets a database that stops answering is
-    answered 500 with the outcome unknown (contract 14.5.0); core sends it as
-    SERVICE_ERROR, and a failure after the commit as UNEXPECTED_ERROR. The
-    contract names no code for it, so no 500 is read as "nothing was saved":
-    the turn is re-sent under the SAME key, which the receipt answers when it
-    committed."""
+def test_a_500_that_may_have_committed_is_recovered_under_its_key(code):
+    """#143, faultmaven#2813: ``TURN_OUTCOME_UNKNOWN`` says the turn may have
+    committed, and an uncoded 500 failed outside the route and says nothing,
+    so neither is read as "nothing was saved": the turn is re-sent under the
+    SAME key, which the receipt answers when it committed."""
 
     backend = _Backend(_server_error(code), _ok(replayed=True))
     client, clock = _client(backend)
     result = client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert result.replayed and result.agent_response == _ANSWER["agent_response"]
     assert backend.keys == [_KEY] * 2
-    assert clock.waits == [10.0]  # the 500's own Retry-After
+    assert clock.waits == [1.0]  # no Retry-After: the backoff
+
+
+@pytest.mark.parametrize("code", ["SERVICE_ERROR", "UNEXPECTED_ERROR"])
+def test_a_coded_500_on_a_first_attempt_committed_nothing(code):
+    """faultmaven#2813: any other coded 500 is the route's answer before the
+    commit, so nothing committed. It surfaces as itself after one request:
+    not re-sent (each re-send is a charged run of a failure that may repeat),
+    and never the unknown outcome."""
+
+    backend = _Backend(_server_error(code, retry_after="10"), _ok())
+    client, clock = _client(backend)
+    with pytest.raises(FaultMavenAPIError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert not isinstance(err.value, FaultMavenTimeoutError)
+    assert (err.value.status_code, err.value.code) == (500, code)
+    assert len(backend.requests) == 1 and clock.waits == []
+    assert _turn.turn_error_text(err.value) == _turn.TURN_ERROR_TEXT
+
+
+def test_a_coded_500_while_recovering_keeps_the_outcome_unknown():
+    """A re-send's coded 500 says nothing of THIS request committed, and
+    nothing about the earlier attempt it recovers, which may have: the turn
+    ends as that attempt's unknown outcome."""
+
+    backend = _Backend(_read_timeout, _server_error("SERVICE_ERROR", retry_after="10"))
+    client, _ = _client(backend)
+    with pytest.raises(FaultMavenTimeoutError) as err:
+        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    assert backend.keys == [_KEY] * 2
+    assert not err.value.server_error
+    assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
 
 
 def test_a_500_reaches_the_thread_as_the_recovered_answer():
@@ -651,7 +683,7 @@ def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick():
     with pytest.raises(FaultMavenTimeoutError) as err:
         client.submit_turn("c1", idempotency_key=_KEY, query="x")
     assert backend.keys == [_KEY] * (1 + fm_client._SERVER_ERROR_RESENDS)
-    assert clock.waits == [10.0] * fm_client._SERVER_ERROR_RESENDS
+    assert clock.waits == [1.0, 2.0]  # the backoff, doubling
     assert err.value.server_error
     text = _turn.turn_error_text(err.value)
     assert text == _turn.TURN_SERVER_ERROR_TEXT
@@ -680,7 +712,7 @@ def test_a_500_while_recovering_keeps_the_recovery_going():
     client, clock = _client(backend)
     assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
-    assert clock.waits == [1.0, 10.0]
+    assert clock.waits == [1.0, 2.0]
 
 
 def test_a_500_then_a_labelled_504_is_nothing_committed():
@@ -712,7 +744,7 @@ def test_a_coded_503_mid_recovery_is_waited_out(code):
     client, clock = _client(backend)
     assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
-    assert clock.waits == [10.0, 5.0]
+    assert clock.waits == [1.0, 5.0]
 
 
 def test_a_coded_503_on_a_first_attempt_is_the_answer():

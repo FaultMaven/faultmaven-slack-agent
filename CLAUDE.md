@@ -108,9 +108,11 @@ done when its check conclusions are green, not when local tests pass.
   again after the probe and the token fetch, and the thread is told to resend. A labelled 504 (`REQUEST_TIMEOUT` final at once, `LLM_TIMEOUT` re-sent
   after its `Retry-After`, at most twice) committed nothing and surfaces as
   `FaultMavenNothingCommittedError`. Only an unlabelled 502/504 is a gateway.
-  A 500, coded or not, may have committed (contract 14.5.0: a database that
-  stops answering mid-commit) and is the unknown outcome: re-sent under its key
-  after `Retry-After`, twice at most, never "nothing was saved". Any other
+  A 500 labelled `TURN_OUTCOME_UNKNOWN`, or with no code, may have committed
+  (contract 15.1.0: a COMMIT the database did not say it rolled back, a failure
+  after the commit, or a failure outside the route) and is the unknown outcome:
+  re-sent under its key after `Retry-After`, twice at most, never "nothing was
+  saved". A 500 with any other code committed nothing. Any other
   coded non-2xx is the app's own answer and commits nothing (a coded 502
   `LLM_PROVIDER_ERROR` is a `FaultMavenAPIError`, retry offered). While
   recovering, a 503 (every one commits nothing, `DATABASE_UNAVAILABLE`
