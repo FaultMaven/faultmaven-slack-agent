@@ -685,7 +685,7 @@ all — while `is_unlinked` preserves the memory:
    (`msg:team:channel:ts`, `click:team:channel:action_ts`,
    `shortcut:team:trigger_id`), so a redelivered event is the same turn and two
    messages or clicks never are. When an attempt's outcome is unknown (the client
-   timed out after the attempt timeout, a gateway 502/504, a connection
+   timed out after the attempt timeout, a gateway 502/504, a 500, a connection
    dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
    request under the same key: `200` (with `X-Idempotency-Replayed: true` when an
    earlier attempt committed) is the answer; `409 TURN_IN_PROGRESS` waits
@@ -695,9 +695,14 @@ all — while `is_unlinked` preserves the memory:
    turn at once with a "nothing was saved, try narrowing it" notice; `504
    LLM_TIMEOUT` (nothing committed; `Retry-After: 30`) is re-sent after that
    wait, twice at most, if a whole attempt still fits the bound (contract
-   12.4.0; both surface as `FaultMavenNothingCommittedError`); an uncoded 5xx or a 429 keeps the loop
-   going (the backend is overloaded or restarting, which says nothing about the
-   turn). Only answers about the turn itself end it with their own meaning —
+   12.4.0; both surface as `FaultMavenNothingCommittedError`); a `500`, coded or
+   not, may have committed (contract 14.5.0: a database that stops answering
+   mid-commit is answered 500, which core sends as `SERVICE_ERROR` with "Please
+   try again"; a failure after the commit is `500 UNEXPECTED_ERROR`), so it is re-sent after its `Retry-After`, twice at most, and then
+   ends as the unknown outcome, never "nothing was saved"; a `503` (every one
+   the route answers commits nothing, `DATABASE_UNAVAILABLE` included), an
+   uncoded 5xx or a 429 keeps the loop going (the backend is overloaded,
+   restarting or without its database, which says nothing about the turn). Only answers about the turn itself end it with their own meaning —
    `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal
    case, a case being deleted, a 404, a second version conflict, a 401; any other refusal while
    recovering is reported as the unknown outcome it is. The loop is bounded by
