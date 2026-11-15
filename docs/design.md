@@ -504,7 +504,7 @@ the next message and answering it clearly.
 | Condition | What the agent sees | Reply |
 |---|---|---|
 | **Terminal, still online** (`resolved`/`closed`) | `409` with `x-error-code: CASE_TERMINAL` | Says the investigation is closed, that it can still answer questions about what was found, and that anything new needs a fresh thread. No HTTP status, no "error". |
-| **Missing** | `404` on the turn POST | Says it *couldn't find* the case — a 404 is the whole of what we know, and deletion, a DB reset and a restore that predates the case are indistinguishable from here. **Tombstones** the thread (§6.4a) and refuses the turn rather than answering it on a new case: the message was written into a conversation whose history is what has gone missing. Points at the deliberate restart that suits the surface — an `@mention` in a channel, a new chat in a 1:1. |
+| **Missing** | `404` with `x-error-code: CASE_NOT_FOUND` on the turn POST (contract 15.0.0; an unlabelled 404 is something else's, a proxy's or one inside the case, and is reported as a plain failure) | Says it *couldn't find* the case — a 404 is the whole of what we know, and deletion, a DB reset and a restore that predates the case are indistinguishable from here. **Tombstones** the thread (§6.4a) and refuses the turn rather than answering it on a new case: the message was written into a conversation whose history is what has gone missing. Points at the deliberate restart that suits the surface — an `@mention` in a channel, a new chat in a 1:1. |
 | **Being deleted** | `409` with `x-error-code: CASE_DELETE_IN_PROGRESS` (contract 14.14.0) | Says the case is being deleted, that the message was not added, and to write here again in a moment. No restart hint, and it outranks the drain notice: a restart does not undo a delete that succeeds. The buttons stay armed: a re-click is refused again while the delete runs, meets the `404` path once the case is gone, and is applied if the delete failed (on a case the agent still drives). **Not** tombstoned: the delete can still fail and keep the case (`500 DELETE_CASE_ERROR`), and once it succeeds the next message meets the `404` above. `DELETE /cases/{id}` is creator-only, so this reaches a thread when the agent runs on an account a human also uses (the default credential with `FAULTMAVEN_DEV_LOGIN_USERNAME`, or a human's `FAULTMAVEN_API_TOKEN`: Slack cases are then created by that account, and that human can delete them), or for a case moved to a human owner (`fm-reassign-cases`) that the agent still reads through a team share (Cloud's workspace Team): there every turn outside a delete is answered `403`, so after a failed delete a message or a re-click gets the `403` reply. Without a share, every turn is a `404`, and this refusal never reaches the thread. |
 | **Version conflict** (*not* a lifecycle event) | `409` with `x-error-code: CASE_VERSION_CONFLICT` | Asks for a re-send — the turn never committed. The **only** 4xx where retrying is the right advice. |
 | **Rate limited** (*not* a lifecycle event) | `429` + `Retry-After` | Says FaultMaven is rate-limiting and quotes the wait ("send it again in 45 seconds" / "about an hour"). Not framed as an error — nothing is broken — and never "re-sending won't help", because a 429 *does* succeed later. |
@@ -601,7 +601,7 @@ all — while `is_unlinked` preserves the memory:
 |---|---|
 | Channel thread reply | Posts the notice **once** (`claim_unlink_notice`, a conditional `UPDATE` whose rowcount *is* the claim — replies arrive in bursts across Bolt's thread pool, so a read-then-write would let two of them both post), then leaves the thread alone. A war-room thread keeps talking after FaultMaven drops out of it; repeating this on every reply would turn one piece of bad news into a heckle. A content-free reply doesn't spend the notice. |
 | `@mention` / **Ask** shortcut | The way back: opens a fresh case, and `put` clears the tombstone. Its first reply carries a note saying *why* it is a new case — owed via `restart_pending`, which is armed by `mark_unlinked` and retired by `mark_seeded` rather than by the write that opens the replacement, because the note travels on a reply and a restart whose first turn fails would otherwise continue on an empty case unexplained — a re-summons that arrives with an unfamiliar case id and no explanation reads as the agent having quietly forgotten the conversation, which is precisely what happened. |
-| Assistant Chat / DM | Says it once, then **forgets** the thread. There is no `@mention` here to come back through, so a tombstone that outlived the telling would answer every later message the same way for good — and a 404 is not always a deleted case (a proxy 404 during a backend deploy arrives as the same error). Having been told, the user's next message is a deliberate fresh start rather than a silent one. |
+| Assistant Chat / DM | Says it once, then **forgets** the thread. There is no `@mention` here to come back through, so a tombstone that outlived the telling would answer every later message the same way for good — and `CASE_NOT_FOUND` cannot tell a deleted case from a database reset or a restore that predates it. Having been told, the user's next message is a deliberate fresh start rather than a silent one. |
 | Suggested-action button | Answers every time, with the same wording — including when the row is missing entirely rather than tombstoned, since "the case can't be found" is true either way. The buttons stay down: the decision one carries belongs to a case that isn't there, and re-arming it would land a stale choice on whatever case the thread opens next. |
 
 ---
@@ -685,8 +685,8 @@ all — while `is_unlinked` preserves the memory:
    (`msg:team:channel:ts`, `click:team:channel:action_ts`,
    `shortcut:team:trigger_id`), so a redelivered event is the same turn and two
    messages or clicks never are. When an attempt's outcome is unknown (the client
-   timed out after the attempt timeout, a gateway 502/504, a 500, a connection
-   dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
+   timed out after the attempt timeout, a gateway 502/504, a 500
+   `TURN_OUTCOME_UNKNOWN` or uncoded, a connection dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
    request under the same key: `200` (with `X-Idempotency-Replayed: true` when an
    earlier attempt committed) is the answer; `409 TURN_IN_PROGRESS` waits
    `Retry-After`, clamped to a 1–60 s poll interval; `409 CASE_VERSION_CONFLICT`
@@ -695,16 +695,20 @@ all — while `is_unlinked` preserves the memory:
    turn at once with a "nothing was saved, try narrowing it" notice; `504
    LLM_TIMEOUT` (nothing committed; `Retry-After: 30`) is re-sent after that
    wait, twice at most, if a whole attempt still fits the bound (contract
-   12.4.0; both surface as `FaultMavenNothingCommittedError`); a `500`, coded or
-   not, may have committed (contract 14.5.0: a database that stops answering
-   mid-commit is answered 500, which core sends as `SERVICE_ERROR` with "Please
-   try again"; a failure after the commit is `500 UNEXPECTED_ERROR`), so it is re-sent after its `Retry-After`, twice at most, and then
-   ends as the unknown outcome, never "nothing was saved"; a `503` (every one
+   12.4.0; both surface as `FaultMavenNothingCommittedError`); a `500`
+   labelled `TURN_OUTCOME_UNKNOWN`, or with no code, may have committed
+   (contract 15.1.0: a COMMIT the database did not say it rolled back, a failure
+   after the commit, or a failure outside the route), so it is re-sent after its
+   `Retry-After`, twice at most, and then ends as the unknown outcome, never
+   "nothing was saved"; a `500` with any other code committed nothing and, on a
+   first attempt, is mapped like any coded refusal (while an earlier attempt may
+   have committed it is no answer about that one, and is re-sent under the same
+   cap); a `503` (every one
    the route answers commits nothing, `DATABASE_UNAVAILABLE` included), an
    uncoded 5xx or a 429 keeps the loop going (the backend is overloaded,
    restarting or without its database, which says nothing about the turn). Only answers about the turn itself end it with their own meaning —
    `409 IDEMPOTENCY_KEY_REUSE`, `409 IDEMPOTENCY_REPLAY_UNAVAILABLE`, a terminal
-   case, a case being deleted, a 404, a second version conflict, a 401; any other refusal while
+   case, a case being deleted, a 404 `CASE_NOT_FOUND`, a second version conflict, a 401; any other refusal while
    recovering is reported as the unknown outcome it is. The loop is bounded by
    the recovery bound (3 attempts' worth, `FAULTMAVEN_TURN_RECOVERY_SECONDS` to
    pin; a policy bound) and ends at shutdown. The attempt timeout is the API's

@@ -150,9 +150,10 @@ def test_coded_5xx_shows_the_apps_answer_and_advises_retry():
 
 
 def test_a_coded_500_is_never_told_nothing_was_saved():
-    """#143: a 500 may have committed (contract 14.5.0). ``submit_turn`` raises
-    it as the unknown outcome; one reaching here any other way (create_case)
-    keeps the generic text, which claims nothing about what was saved."""
+    """#143: a 500 that may have committed (``TURN_OUTCOME_UNKNOWN`` or
+    uncoded, contract 15.1.0) arrives from ``submit_turn`` as the unknown
+    outcome; any other 500 reaching here (a coded one, or create_case's) keeps
+    the generic text, which claims nothing about what was saved."""
 
     exc = FaultMavenAPIError(
         "x", status_code=500, detail="An unexpected error occurred.", code="UNEXPECTED_ERROR"

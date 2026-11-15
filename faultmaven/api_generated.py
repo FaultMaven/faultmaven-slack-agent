@@ -15,6 +15,7 @@ from pydantic import (
     constr,
 )
 from typing import Any, Literal
+from datetime import date as date_aliased
 
 
 class Access(Enum):
@@ -122,6 +123,7 @@ class AuthSessionStatus(Enum):
     active = "active"
     expired = "expired"
     terminated = "terminated"
+    archived = "archived"
 
 
 class CodeChallengeMethodEnum(Enum):
@@ -688,6 +690,19 @@ class LLMConnectionTestResponse(BaseModel):
     timestamp: AwareDatetime = Field(..., title="Timestamp")
 
 
+class LLMHeavyTurn(BaseModel):
+    calls: int = Field(..., title="Calls")
+    case_id: str = Field(..., title="Case Id")
+    estimated_cost_usd: float = Field(..., title="Estimated Cost Usd")
+    investigation_turn: int | None = Field(
+        ..., description="The ordinal to display", title="Investigation Turn"
+    )
+    occurred_at: AwareDatetime = Field(..., title="Occurred At")
+    spend_weighted_tokens: int = Field(..., title="Spend Weighted Tokens")
+    turn_number: int = Field(..., description="The message clock", title="Turn Number")
+    unpriced_calls: int = Field(..., title="Unpriced Calls")
+
+
 class LLMProviderDetail(BaseModel):
     available_models: list[str] | None = Field(
         None,
@@ -765,6 +780,129 @@ class LLMRoleRouting(BaseModel):
         description="Capability role: chat, multimodal, synthesis, classifier, code, da, knowledge, structured_output",
         title="Role",
     )
+
+
+class LLMSpendPercentiles(BaseModel):
+    max: int | None = Field(..., title="Max")
+    p50: int | None = Field(..., title="P50")
+    p95: int | None = Field(..., title="P95")
+
+
+class LLMTurnBudget(BaseModel):
+    ceiling: int = Field(..., description="PROMPT_TURN_TOKEN_CEILING", title="Ceiling")
+    soft: int | None = Field(
+        ..., description="PROMPT_TURN_TOKEN_BUDGET; null when it is 0 (disabled)", title="Soft"
+    )
+
+
+class LLMTurnHistogramBin(BaseModel):
+    count: int = Field(..., title="Count")
+    lower: int = Field(..., title="Lower")
+    upper: int | None = Field(..., description="null: no upper bound", title="Upper")
+
+
+class LLMTurnSpendSummary(BaseModel):
+    budget: LLMTurnBudget
+    count: int = Field(..., title="Count")
+    heaviest: list[LLMHeavyTurn] = Field(
+        ..., description="The ten heaviest, heaviest first", title="Heaviest"
+    )
+    histogram: list[LLMTurnHistogramBin] = Field(
+        ...,
+        description="Edges 0, soft/2, soft, ceiling, then open-ended; the soft edges are dropped when the budget is disabled, and the edges are sorted and de-duplicated",
+        title="Histogram",
+    )
+    over_ceiling: int = Field(
+        ..., description="Turns whose spend exceeded `budget.ceiling`", title="Over Ceiling"
+    )
+    over_soft: int = Field(
+        ..., description="Turns whose spend exceeded `budget.soft`", title="Over Soft"
+    )
+    spend_weighted_tokens: LLMSpendPercentiles
+
+
+class LLMUnpricedModel(BaseModel):
+    calls: int = Field(..., description="Its stored `unpriced_calls` in the window", title="Calls")
+    model: str = Field(..., title="Model")
+    provider: str = Field(..., title="Provider")
+
+
+class LLMUsageCalls(BaseModel):
+    kept: int = Field(
+        ..., description="Calls whose answer was returned to the caller", title="Kept"
+    )
+    low_confidence: int = Field(
+        ...,
+        description="Calls billed and then discarded by the fallback chain",
+        title="Low Confidence",
+    )
+    total: int = Field(..., title="Total")
+
+
+class LLMUsageCoverage(BaseModel):
+    metering_since: date_aliased | None = Field(
+        ...,
+        description="The earliest day with recorded spend for this enterprise; null when none is recorded. Not when metering began: days before it have no recorded spend, either before the ledger was deployed, metered with nothing spent, or pruned past LLM_USAGE_DAILY_RETENTION_DAYS.",
+        title="Metering Since",
+    )
+    turns_fully_covered: bool = Field(
+        ...,
+        description="True when the turn-retention horizon reaches the window's first day",
+        title="Turns Fully Covered",
+    )
+    turns_since: date_aliased = Field(
+        ...,
+        description="The first day `turns` reads: the later of the window's first day and the turn-retention horizon (today minus LLM_USAGE_TURN_RETENTION_DAYS, plus one). Turn rows before it are pruned, or will be, so `turns` never reads them and can cover less of the window than `totals`.",
+        title="Turns Since",
+    )
+    window_fully_covered: bool = Field(
+        ...,
+        description="True when `metering_since` is on or before the window's first day",
+        title="Window Fully Covered",
+    )
+
+
+class RateStatus(Enum):
+    priced = "priced"
+    zero_cost = "zero_cost"
+    unpriced = "unpriced"
+
+
+class Deployment(Enum):
+    standalone = "standalone"
+    cloud = "cloud"
+
+
+class Tenancy(Enum):
+    single = "single"
+    multi = "multi"
+
+
+class LLMUsageScope(BaseModel):
+    deployment: Deployment = Field(..., title="Deployment")
+    enterprise_id: str = Field(..., title="Enterprise Id")
+    tenancy: Tenancy = Field(
+        ...,
+        description="`multi`: the figures are this enterprise's only, never the deployment's. `single`: the enterprise is the whole deployment.",
+        title="Tenancy",
+    )
+
+
+class LLMUsageTokens(BaseModel):
+    cache_read: int = Field(..., title="Cache Read")
+    cache_write: int = Field(..., title="Cache Write")
+    input: int = Field(..., title="Input")
+    output: int = Field(..., title="Output")
+    total: int = Field(..., title="Total")
+
+
+class LLMUsageWindow(BaseModel):
+    days: int = Field(..., description="Days in the window", title="Days")
+    from_: date_aliased = Field(
+        ..., alias="from", description="First day of the window (UTC)", title="From"
+    )
+    timezone: Literal["UTC"] = Field("UTC", title="Timezone")
+    to: date_aliased = Field(..., description="Last day of the window: today (UTC)", title="To")
 
 
 class LinkCaseRequest(BaseModel):
@@ -1320,6 +1458,46 @@ class TokenResponse(BaseModel):
     username: str = Field(..., description="Username", title="Username")
 
 
+class ServerConnection(Enum):
+    connected = "connected"
+    disconnected = "disconnected"
+    no_client = "no_client"
+    unknown = "unknown"
+
+
+class TraceBackendStatus(BaseModel):
+    capture_content: bool = Field(
+        ...,
+        description="Whether spans carry prompts and responses (OPIK_CAPTURE_CONTENT). False in every process this release starts: true is refused at startup until a retention bound for the trace store is verified (#2616 K0). An exception's message and traceback are not recorded either way, only its class.",
+        title="Capture Content",
+    )
+    parked_messages: int | None = Field(
+        ...,
+        description="Traces the serving worker process holds in the SDK's local replay database, unsent; null when it has built no client, its database is not open, or the SDK's internals could not be read. Other workers and replicas are not counted.",
+        title="Parked Messages",
+    )
+    ping_interval_s: int | None = Field(
+        ...,
+        description="Seconds between the SDK's connection pings. After a failed send the SDK parks every later trace until a ping succeeds or a delete replays them, so this bounds how long a parked trace waits. Null when no trace backend is configured.",
+        title="Ping Interval S",
+    )
+    project: str | None = Field(
+        ...,
+        description="The Opik project traces are written to and the case delete searches; null when configuration did not resolve one.",
+        title="Project",
+    )
+    sentry_reporting: bool = Field(
+        ...,
+        description="Whether the trace SDK's crash reporting (Comet's Sentry) is active in this process. Off unless OPIK_SENTRY_ENABLE=true is set in the environment or .env.",
+        title="Sentry Reporting",
+    )
+    server_connection: ServerConnection = Field(
+        ...,
+        description="The serving worker's SDK client's view of its backend: 'connected'; 'disconnected' after a failed send, while it parks traces locally; 'no_client' when that worker process has built none; 'unknown' when the SDK's internals could not be read. Other workers and replicas are not reported.",
+        title="Server Connection",
+    )
+
+
 class TurnTimingStatus(BaseModel):
     chat_provider: str | None = Field(
         ...,
@@ -1586,6 +1764,11 @@ class CaseDetail(BaseModel):
         description="The MESSAGE clock: every persisted exchange advances it, asides included. It is what `Message.turn_number`, evidence `uploaded_at_turn` and the conversation anchors are keyed on, so keep using it to ADDRESS a turn — and prefer `investigation_turn` to DISPLAY one.",
         title="Current Turn",
     )
+    deleting: bool | None = Field(
+        False,
+        description="True while a delete of this case runs (#2510). Show the case read-only and read it again, backing off from 2 s to at most every 10 s for at most 60 s, until it is gone (404) or this clears; then keep it read-only until the next user action reads it again. Best-effort both ways: it reports the delete's tombstone, which a delete writes before it checks for in-flight work and which lapses 30 s after its last renewal unless removed, so true can stand for up to 30 s with no delete running, and false means no delete is known to run. A turn can still meet 409 `CASE_DELETE_IN_PROGRESS` or 404. Set on `GET /cases/{case_id}`; false on every other surface that embeds `CaseDetail`.",
+        title="Deleting",
+    )
     description: str = Field(..., title="Description")
     driver_display_name: str | None = Field(None, title="Driver Display Name")
     driver_id: str | None = Field(None, title="Driver Id")
@@ -1731,6 +1914,10 @@ class EnvConfigStatusResponse(BaseModel):
         title="Session Ttl Seconds",
     )
     timestamp: AwareDatetime = Field(..., title="Timestamp")
+    trace_backend: TraceBackendStatus = Field(
+        ...,
+        description="The LLM trace SDK's process policy (crash reporting, content capture, project, ping interval) and the serving worker's trace client: whether its last send reached the backend, and how many traces it holds unsent.",
+    )
     turn_timing: TurnTimingStatus = Field(
         ...,
         description="The resolved turn ceiling and response bound for the chat provider in force, as clients read them on GET /api/v1/meta/capabilities.",
@@ -1826,6 +2013,112 @@ class LLMConfigResponse(BaseModel):
     timestamp: AwareDatetime = Field(..., title="Timestamp")
 
 
+class LLMUsageBucket(BaseModel):
+    cache_hit_rate: float | None = Field(
+        ...,
+        description="cache_read / (input + cache_read); null when that is 0",
+        title="Cache Hit Rate",
+    )
+    calls: LLMUsageCalls
+    cost_complete: bool = Field(
+        ...,
+        description="False whenever `unpriced_calls` > 0: the cost is a lower bound",
+        title="Cost Complete",
+    )
+    estimated_cost_usd: float = Field(
+        ...,
+        description="Priced calls only, estimated at call time from the price table then in force. Not a bill.",
+        title="Estimated Cost Usd",
+    )
+    tokens: LLMUsageTokens
+    unpriced_calls: int = Field(
+        ...,
+        description="Calls that had no price entry when made: left out of the cost",
+        title="Unpriced Calls",
+    )
+
+
+class LLMUsageDay(BaseModel):
+    cache_hit_rate: float | None = Field(
+        ...,
+        description="cache_read / (input + cache_read); null when that is 0",
+        title="Cache Hit Rate",
+    )
+    calls: LLMUsageCalls
+    cost_complete: bool = Field(
+        ...,
+        description="False whenever `unpriced_calls` > 0: the cost is a lower bound",
+        title="Cost Complete",
+    )
+    date: date_aliased = Field(..., title="Date")
+    estimated_cost_usd: float = Field(
+        ...,
+        description="Priced calls only, estimated at call time from the price table then in force. Not a bill.",
+        title="Estimated Cost Usd",
+    )
+    tokens: LLMUsageTokens
+    unpriced_calls: int = Field(
+        ...,
+        description="Calls that had no price entry when made: left out of the cost",
+        title="Unpriced Calls",
+    )
+
+
+class LLMUsageGroup(BaseModel):
+    cache_hit_rate: float | None = Field(
+        ...,
+        description="cache_read / (input + cache_read); null when that is 0",
+        title="Cache Hit Rate",
+    )
+    calls: LLMUsageCalls
+    cost_complete: bool = Field(
+        ...,
+        description="False whenever `unpriced_calls` > 0: the cost is a lower bound",
+        title="Cost Complete",
+    )
+    estimated_cost_usd: float = Field(
+        ...,
+        description="Priced calls only, estimated at call time from the price table then in force. Not a bill.",
+        title="Estimated Cost Usd",
+    )
+    key: dict[str, str | None] = Field(
+        ...,
+        description='`provider_model`: {provider, model}. `user`: {user_id}, where "" is no actor. `billing_subject`: {kind, id}, kind one of `organization | account | none` and id "" for `none`. Under multi-tenancy every `account` subject is one group with id null: an account\'s id is a user id, shown in standalone only.',
+        title="Key",
+    )
+    rate_status: RateStatus | None = Field(
+        ...,
+        description="`provider_model` groups only, null otherwise: how the RUNNING price table prices the model now. `zero_cost` is a declared-free self-hosted provider, not an unpriced one.",
+        title="Rate Status",
+    )
+    tokens: LLMUsageTokens
+    unpriced_calls: int = Field(
+        ...,
+        description="Calls that had no price entry when made: left out of the cost",
+        title="Unpriced Calls",
+    )
+
+
+class LLMUsageReport(BaseModel):
+    as_of: AwareDatetime = Field(..., title="As Of")
+    by_day: list[LLMUsageDay] = Field(
+        ..., description="Every day in the window, zeros included", title="By Day"
+    )
+    coverage: LLMUsageCoverage
+    groups: list[LLMUsageGroup] = Field(
+        ..., description="Shaped by `group_by`; largest token total first", title="Groups"
+    )
+    scope: LLMUsageScope
+    totals: LLMUsageBucket
+    turns: LLMTurnSpendSummary
+    unpriced: list[LLMUnpricedModel] = Field(
+        ...,
+        description="Models the running price table cannot price that have unpriced calls in the window. Non-empty: cost is under-reported.",
+        title="Unpriced",
+    )
+    window: LLMUsageWindow
+
+
 class ReportGenerationRequest(BaseModel):
     report_types: list[ReportType] = Field(
         ...,
@@ -1897,7 +2190,7 @@ class Source(BaseModel):
     metadata: dict[str, Any] | None = Field(None, title="Metadata")
     new_this_turn: bool | None = Field(
         None,
-        description="For a knowledge-base source in a turn's `sources`: true when this runbook excerpt was not in the prompt of the case's previous turn that carried knowledge-base context. That context stands in every prompt from the turn it is fetched until the next fetch replaces it, so a client shows the list where something is new rather than under every answer. Null on any other source.",
+        description="For a knowledge-base source in a turn's `sources`: true when this runbook excerpt was not in the prompt of the case's previous turn that carried pre-fetched knowledge-base context. That context stands in every prompt from the turn it is fetched until the next fetch replaces it, so a client shows the list where something is new rather than under every answer. Always true on a source whose `metadata.trigger` is `question` (the runbooks a lookup found for the user's own question about the knowledge base) or `kb_qa` (a section the assistant's own knowledge-base search answered from): those answer that turn. Null on any other source.",
         title="New This Turn",
     )
     type: SourceType
@@ -1934,7 +2227,7 @@ class TurnResponse(BaseModel):
     )
     sources: list[Source] | None = Field(
         None,
-        description="Knowledge the engine put in front of the model for this turn: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED) that the prompt the model answered from actually carried, after the section budget. A pre-fetch that fires while the turn's response is applied first reaches the NEXT turn's prompt, and is listed there. The context stands in every prompt until a pre-fetch replaces it, so it repeats turn to turn; `new_this_turn` marks the excerpts the previous turn's prompt did not carry. Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when nothing was pre-fetched — including when the push is disabled. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary. The turn retrieves with the case driver's knowledge; each excerpt is checked against the requester when returned, and one of a runbook the requester cannot open (no longer shared with them, or never was), or one with no `metadata.document_id`, is returned redacted: `type` and `new_this_turn` kept, `content` empty, `confidence` null, and `metadata` of only `{\"access\": \"restricted\"}`.",
+        description="Knowledge the engine put in front of the model for this turn, as the prompt the model answered from actually carried it, after the section budget. Two origins, told apart by `metadata.trigger`. `symptom` / `root_cause`: the runbooks the KB pre-fetch admitted (the PUSH channel, governed by KB_PREFETCH_ENABLED). A pre-fetch that fires while the turn's response is applied (the case transitions, the root-cause edge) first reaches the NEXT turn's prompt, and is listed there; INQUIRY's symptom search runs before the prompt is built, so it reaches its own turn. The context stands in every prompt until a pre-fetch replaces it, so it repeats turn to turn; `new_this_turn` marks the excerpts the previous pre-fetched context did not carry. `question`: the runbooks a lookup found for the user's own question about the knowledge base on this turn — present whatever KB_PREFETCH_ENABLED says, and always `new_this_turn`. Each entry carries the matched excerpt as `content`, the retrieval score as `confidence`, and the runbook's `document_id`/`title` under `metadata` so a client can link to it. Empty when the prompt carried neither — the push disabled or nothing pre-fetched, and no question about the knowledge base. Runbooks the model fetched itself via the kb_qa tool are NOT represented: that tool returns a formatted answer string, so per-turn identity is not available at the tool boundary. The turn retrieves with the case driver's knowledge; each excerpt is checked against the requester when returned, and one of a runbook the requester cannot open (no longer shared with them, or never was), or one with no `metadata.document_id`, is returned redacted: `type` and `new_this_turn` kept, `content` empty, `confidence` null, and `metadata` of only `{\"access\": \"restricted\"}`.",
         title="Sources",
     )
     suggested_actions: list[SuggestedActionResponse] | None = Field(None, title="Suggested Actions")
@@ -2186,7 +2479,7 @@ class Message(BaseModel):
     role: Role = Field(..., title="Role")
     sources: list[Source] | None = Field(
         None,
-        description='On an assistant row: the knowledge-base runbooks that turn\'s prompt carried, exactly as the live `TurnResponse.sources` returned them, `new_this_turn` included, and gated the same way for the reader making this request: an excerpt of a runbook the reader cannot open, or one with no `metadata.document_id`, is returned with empty `content`, null `confidence` and `metadata` of only `{"access": "restricted"}`. Null on a row whose prompt carried none (and on every user or system row).',
+        description='On an assistant row: the knowledge-base runbooks that turn\'s prompt carried — pre-fetched, or found for the user\'s question about the knowledge base (`metadata.trigger`) — exactly as the live `TurnResponse.sources` returned them, `new_this_turn` included, and gated the same way for the reader making this request: an excerpt of a runbook the reader cannot open, or one with no `metadata.document_id`, is returned with empty `content`, null `confidence` and `metadata` of only `{"access": "restricted"}`. Null on a row whose prompt carried none (and on every user or system row).',
         title="Sources",
     )
     token_count: int | None = Field(
