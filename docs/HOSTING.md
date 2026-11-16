@@ -110,9 +110,11 @@ The agent also sets `PGGSSENCMODE=disable` unless its environment names one
 (ruled 2026-11-15, FaultMaven #2788). Under libpq's default `prefer`, a process
 with Kerberos credentials negotiates GSSAPI encryption in place of TLS, and
 then no `sslmode` applies. A URL `gssencmode=`, or an inherited
-`PGGSSENCMODE`, is kept and does exactly that: it replaces TLS with GSSAPI
-encryption. A Kerberos deployment that wants GSS encryption sets
-`PGGSSENCMODE=prefer` (or names `gssencmode` in the URL) explicitly. Without
+`PGGSSENCMODE`, other than `disable` is kept and can replace TLS with GSSAPI
+encryption when Kerberos credentials are present. A Kerberos deployment that
+wants GSS encryption sets `PGGSSENCMODE=prefer` in the agent's process
+environment (the agent reads no `PG*` variable from `.env`), or names
+`gssencmode` in the URL, explicitly. Without
 it, a connection with `sslmode=disable` that GSSAPI used to encrypt now runs
 in plaintext.
 
