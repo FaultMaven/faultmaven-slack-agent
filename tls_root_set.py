@@ -12,7 +12,11 @@ It also sets ``PGSSLMODE=verify-full`` unless the environment names a mode
 (ruled 2026-11-13, FaultMaven #2733): libpq applies it only when neither the
 URL nor a service file names ``sslmode`` (a service is refused here, and in the
 URL by ``oauth_store``), so a database URL that names none verifies the chain
-against the set and the host name, and an explicit choice is never lowered.
+against the set and the host name, and an explicit choice is never lowered. And
+it sets ``PGGSSENCMODE=disable`` unless the environment names one (ruled
+2026-11-15, FaultMaven #2788): libpq's default ``prefer`` negotiates GSSAPI
+encryption in place of TLS when Kerberos credentials are present, and then no
+``sslmode`` applies.
 
 libpq also loads a CRL file or directory into its trust store, CA certificates
 in it included: ``sslcrl``/``sslcrldir``, ``PGSSLCRL``/``PGSSLCRLDIR``, and by
@@ -40,9 +44,9 @@ A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
 - ``PGSSLMODE`` defaults to ``verify-full`` (core keeps libpq's ``prefer``);
 - the shipped empty capath is checked: a hashed entry in it refuses the start;
 - ``PGSSLCRL`` is exported as ``/dev/null``, and an inherited ``PGSSLCRL`` or
-  ``PGSSLCRLDIR`` naming anything else refuses the start (core leaves libpq's
-  CRL sources alone);
-- an inherited ``PGSERVICE``, of any value, refuses the start;
+  ``PGSSLCRLDIR`` naming anything else refuses the start (core exports none and
+  refuses either with any value, and a ``root.crl`` in the home directory,
+  because asyncpg cannot load an empty CRL file; FaultMaven #2787);
 - the set directory is ``faultmaven-slack-tls-<uid>``.
 
 A certificate is a PEM block labelled ``CERTIFICATE``. When a set file is
@@ -106,6 +110,9 @@ DIRECTORY_VARIABLE = "SSL_CERT_DIR"
 OWNED_VARIABLES = FILE_VARIABLES + (DIRECTORY_VARIABLE,)
 #: libpq's default ``sslmode`` for a URL that names none; an inherited one is kept.
 PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
+#: libpq negotiates GSSAPI encryption, not TLS, under its default ``prefer`` when
+#: Kerberos credentials are present; ``disable`` unless set (FaultMaven #2788).
+PG_GSSENCMODE_VARIABLE = "PGGSSENCMODE"
 #: Names a libpq service, whose options libpq applies before the environment's;
 #: refused. ``PGSERVICEFILE`` and ``PGSYSCONFDIR`` alone name no service.
 PG_SERVICE_VARIABLE = "PGSERVICE"
@@ -186,6 +193,7 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
         os.environ[name] = path
     os.environ[DIRECTORY_VARIABLE] = EMPTY_CAPATH
     os.environ.setdefault(PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT)
+    os.environ.setdefault(PG_GSSENCMODE_VARIABLE, "disable")  # exact case
     os.environ[PG_CRL_VARIABLES[0]] = EMPTY_CRL
     sources = (os_source,) + ((extra,) if extra else ())
     root_set = RootSet(path, sources, extra, len(pem_digests(pem)))
