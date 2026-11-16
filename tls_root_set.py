@@ -12,7 +12,13 @@ It also sets ``PGSSLMODE=verify-full`` unless the environment names a mode
 (ruled 2026-11-13, FaultMaven #2733): libpq applies it only when neither the
 URL nor a service file names ``sslmode`` (a service is refused here, and in the
 URL by ``oauth_store``), so a database URL that names none verifies the chain
-against the set and the host name, and an explicit choice is never lowered.
+against the set and the host name, and an explicit choice is never lowered. And
+it sets ``PGGSSENCMODE=disable`` unless the environment names one (ruled
+2026-11-15, FaultMaven #2788): libpq's default ``prefer`` negotiates GSSAPI
+encryption in place of TLS when Kerberos credentials are present, and then no
+``sslmode`` applies. libpq applies it only when the URL names no
+``gssencmode``, so a URL ``gssencmode`` or an inherited ``PGGSSENCMODE`` (kept)
+can still replace TLS with GSSAPI encryption.
 
 libpq also loads a CRL file or directory into its trust store, CA certificates
 in it included: ``sslcrl``/``sslcrldir``, ``PGSSLCRL``/``PGSSLCRLDIR``, and by
@@ -22,8 +28,9 @@ or ``PGSSLCRLDIR`` naming anything else refuses the start, as ``sslcrl`` or
 ``sslcrldir`` in the URL does. Postgres CRL revocation checking is therefore
 not available.
 
-A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
-(the agent does not depend on core). Deliberate differences:
+A ported copy of core's ``faultmaven/config/tls_root_set.py`` (the agent does
+not depend on core). Deliberate differences from core as of FaultMaven #2787
+(core PR #2839):
 
 - no Windows certificate store: a platform without ``os.getuid`` (Windows)
   refuses the start;
@@ -34,15 +41,22 @@ A ported copy of core's ``faultmaven/config/tls_root_set.py`` at ``b8e5ade7f``
   ``config.py`` anchors its store paths;
 - the resolved setting is exported by plain assignment to
   ``TLS_EXTRA_CA_FILE`` (core replaces every letter-case spelling);
-- owned variables are read from the process environment only: one written in
-  ``.env`` is neither seen nor refused (core loads ``.env`` into the
-  environment first), and no client reads it either;
+- owned variables, and the ``PG*`` variables it sets or refuses, are read from
+  the process environment only: one written in ``.env`` is neither seen nor
+  refused, and no client reads it either (core loads ``.env`` into the
+  environment first, so a ``PG*`` value there is kept or refused);
+- the database URL is checked where its engine is built (``oauth_store``), not
+  in ``apply_root_set`` (core checks ``DATABASE_URL`` there, and again where
+  its engine and migrations read it); the agent refuses a URL ``sslrootcert``,
+  which core keeps as an operator's explicit per-client roots; and the agent
+  reads through a URL ``dsn`` to the keys it carries, where core refuses
+  ``dsn`` itself;
 - ``PGSSLMODE`` defaults to ``verify-full`` (core keeps libpq's ``prefer``);
 - the shipped empty capath is checked: a hashed entry in it refuses the start;
 - ``PGSSLCRL`` is exported as ``/dev/null``, and an inherited ``PGSSLCRL`` or
-  ``PGSSLCRLDIR`` naming anything else refuses the start (core leaves libpq's
-  CRL sources alone);
-- an inherited ``PGSERVICE``, of any value, refuses the start;
+  ``PGSSLCRLDIR`` naming anything else refuses the start (core exports none and
+  refuses either with any value, and a ``root.crl`` in the home directory,
+  because asyncpg cannot load an empty CRL file; FaultMaven #2787);
 - the set directory is ``faultmaven-slack-tls-<uid>``.
 
 A certificate is a PEM block labelled ``CERTIFICATE``. When a set file is
@@ -106,6 +120,9 @@ DIRECTORY_VARIABLE = "SSL_CERT_DIR"
 OWNED_VARIABLES = FILE_VARIABLES + (DIRECTORY_VARIABLE,)
 #: libpq's default ``sslmode`` for a URL that names none; an inherited one is kept.
 PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT = "PGSSLMODE", "verify-full"
+#: libpq negotiates GSSAPI encryption, not TLS, under its default ``prefer`` when
+#: Kerberos credentials are present; ``disable`` unless set (FaultMaven #2788).
+PG_GSSENCMODE_VARIABLE = "PGGSSENCMODE"
 #: Names a libpq service, whose options libpq applies before the environment's;
 #: refused. ``PGSERVICEFILE`` and ``PGSYSCONFDIR`` alone name no service.
 PG_SERVICE_VARIABLE = "PGSERVICE"
@@ -186,6 +203,7 @@ def apply_root_set(extra_ca_file: str | None) -> RootSet:
         os.environ[name] = path
     os.environ[DIRECTORY_VARIABLE] = EMPTY_CAPATH
     os.environ.setdefault(PG_SSLMODE_VARIABLE, PG_SSLMODE_DEFAULT)
+    os.environ.setdefault(PG_GSSENCMODE_VARIABLE, "disable")  # exact case
     os.environ[PG_CRL_VARIABLES[0]] = EMPTY_CRL
     sources = (os_source,) + ((extra,) if extra else ())
     root_set = RootSet(path, sources, extra, len(pem_digests(pem)))

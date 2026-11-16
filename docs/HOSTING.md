@@ -56,7 +56,7 @@ the infra repo.
 | `SLACK_TRANSPORT=http` | config | selects the HTTP/OAuth runtime |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | secret | Basic Information → App Credentials |
 | `SLACK_SIGNING_SECRET` | secret | verifies inbound requests |
-| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. Naming no `sslmode`, it connects with `verify-full` ([TLS roots](#tls-roots-and-postgres)) |
+| `SLACK_DATABASE_URL` | secret | **required in http mode** — `postgresql://…` (a dedicated Slack DB). Boot fails fast if unset, so installs can never land in ephemeral storage. Naming no `sslmode`, it connects with `verify-full`, and naming no `gssencmode`, with GSSAPI encryption off unless `PGGSSENCMODE` is set ([TLS roots](#tls-roots-and-postgres)) |
 | `SLACK_OAUTH_REDIRECT_URI` | config | pinned to `https://slack.faultmaven.ai/slack/oauth_redirect` |
 | `FAULTMAVEN_API_URL=https://api.faultmaven.ai` | config | cluster backend |
 | `FAULTMAVEN_API_TOKEN` | secret | static FM bearer; cannot be renewed. Superseded by the refresh credential below wherever the backend runs `AUTH_MODE=oauth` |
@@ -105,6 +105,18 @@ With neither, the agent refuses the connection. An explicit `prefer` or
 `allow` is kept too, and against a server whose certificate is outside the set
 it falls back to plaintext: use `verify-full`, or `disable` for a server with
 no TLS.
+
+The agent also sets `PGGSSENCMODE=disable` unless its environment names one
+(ruled 2026-11-15, FaultMaven #2788). Under libpq's default `prefer`, a process
+with Kerberos credentials negotiates GSSAPI encryption in place of TLS, and
+then no `sslmode` applies. A URL `gssencmode=`, or an inherited
+`PGGSSENCMODE`, other than `disable` is kept and can replace TLS with GSSAPI
+encryption when Kerberos credentials are present. A Kerberos deployment that
+wants GSS encryption sets `PGGSSENCMODE=prefer` in the agent's process
+environment (the agent reads no `PG*` variable from `.env`), or names
+`gssencmode` in the URL, explicitly. Without
+it, a connection with `sslmode=disable` that GSSAPI used to encrypt now runs
+in plaintext.
 
 The agent writes a set file under `TMPDIR` (default `/tmp`) when
 `TLS_EXTRA_CA_FILE` is set, or when the OS bundle has no loadable file and is

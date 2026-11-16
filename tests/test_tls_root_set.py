@@ -86,7 +86,7 @@ def _isolated(tmp_path, monkeypatch):
     saved = dict(os.environ)
     for name in (
         *OWNED_VARIABLES, EXTRA_CA_FILE_SETTING, "PGSSLMODE", "PGSERVICE", "PGSSLCRL",
-        "PGSSLCRLDIR",
+        "PGSSLCRLDIR", "PGGSSENCMODE",
     ):  # fmt: skip
         os.environ.pop(name, None)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -587,6 +587,20 @@ def test_pgsslmode_defaults_to_verify_full_and_an_inherited_one_is_kept(
         os.environ["PGSSLMODE"] = inherited
     apply_root_set(None)
     assert os.environ["PGSSLMODE"] == (inherited or "verify-full")
+
+
+@pytest.mark.parametrize("inherited", [None, "require", ""])
+def test_pggssencmode_defaults_to_disable_and_an_inherited_one_is_kept(
+    os_bundle, inherited
+):
+    """Ruled 2026-11-15 (FaultMaven #2788): under libpq's default ``prefer``,
+    Kerberos credentials get GSSAPI encryption in place of TLS, and no sslmode
+    applies. An explicit value, empty included, is kept."""
+
+    if inherited is not None:
+        os.environ["PGGSSENCMODE"] = inherited
+    apply_root_set(None)
+    assert os.environ["PGGSSENCMODE"] == ("disable" if inherited is None else inherited)
 
 
 # --- the setting and the launchers -------------------------------------------
