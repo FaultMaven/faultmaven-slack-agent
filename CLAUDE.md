@@ -122,6 +122,15 @@ done when its check conclusions are green, not when local tests pass.
   included) or an uncoded 5xx keeps the loop going; a 429 is waited for its `Retry-After`, or ends the loop at once
   when that outlasts the bound (`turn_cap` set for `TENANT_TURN_CAP_EXCEEDED`),
   and a wait that would reach the bound is cut short for one last ask.
+- A turn with a Slack user carries `X-FaultMaven-Requester` (contract 15.6.0):
+  `listeners._turn.requester_for(context)`, an HMAC of
+  `<enterprise_id or team_id>:<user_id>` keyed by `Settings.requester_key`
+  (signing secret under http, app token under socket; installed by
+  `register_listeners`), never the raw Slack id. `submit_turn` takes only that
+  id, as a required `requester` (None sends none, as preflight does); the core
+  client holds neither the key nor the raw id. Core orders one account's
+  admission by it: workspaces sharing the default credential rotate together.
+  Core keeps a per-requester stamp in memory while busy; nothing persists it.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
   regenerated `faultmaven/api_generated.py` in the same PR.

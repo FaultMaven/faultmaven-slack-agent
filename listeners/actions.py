@@ -35,6 +35,7 @@ from rendering import (
 from store import CaseStore
 
 from ._turn import (
+    requester_for,
     SNIPPET_HOW_TO,
     case_gone_text,
     click_turn_key,
@@ -68,6 +69,7 @@ def apply_action(
     *,
     team_id: str,
     idempotency_key: str,
+    requester: str | None,
     on_waiting=None,
 ) -> TurnResult:
     """Submit the turn encoded in a button's ``value`` and return the result.
@@ -81,7 +83,8 @@ def apply_action(
 
     ``idempotency_key`` is required for the reason every turn's is (see
     :meth:`FaultMavenClient.submit_turn`): the click's
-    :func:`~listeners._turn.click_turn_key`.
+    :func:`~listeners._turn.click_turn_key`. ``requester`` is the click's
+    opaque ordering key (:func:`~listeners._turn.requester_for`).
     """
 
     value = json.loads(value_json)
@@ -92,6 +95,7 @@ def apply_action(
         intent_type=value.get("it"),
         intent_data=value.get("id"),
         team_id=team_id,
+        requester=requester,
         on_waiting=on_waiting,
     )
 
@@ -343,6 +347,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         idempotency_key=click_turn_key(
                             team_id, channel, action.get("action_ts")
                         ),
+                        requester=requester_for(context),
                         on_waiting=still_working,
                     )
                 except CaseNotFoundError:
@@ -537,6 +542,7 @@ def register_data_box(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 text="",
                 pasted_content=pasted,
                 idempotency_key=view_turn_key(team_id, view.get("id")),
+                requester=requester_for(context),
             )
 
         if not run_gated(

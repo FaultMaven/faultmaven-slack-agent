@@ -21,6 +21,7 @@ from slack_text import render_slack_text
 from store import CaseStore
 
 from ._turn import (
+    requester_for,
     SNIPPET_HOW_TO,
     UNREADABLE_FILES_TEXT,
     case_gone_text,
@@ -188,6 +189,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     ),
                     pasted_content=pasted_text,
                     files=files or None,
+                    requester=requester_for(context),
                     on_waiting=still_working,
                 )
             except Exception as exc:  # noqa: BLE001

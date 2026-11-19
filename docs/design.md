@@ -432,7 +432,12 @@ sharing scope is the workspace's *Team* (within the **enterprise**).
 > whoever uses **Copilot** as their frontend. From the server's perspective the
 > two are the same shape — a client sends a request, the server responds. The
 > difference is entirely client-side: this agent talks to many humans through
-> Slack's servers, and the API server has no visibility into them.
+> Slack's servers, and the API server sees none of them. Since contract 15.6.0
+> it sees one thing more and nothing else: an opaque per-person ordering key on
+> each turn (`X-FaultMaven-Requester`, §8.1 item 4), with which it takes the
+> account's people in turn for worker slots. The key is an HMAC no one can read
+> a Slack id out of, is not stable across a key change, and grants nothing: it
+> is no principal, no author and no identity.
 >
 > **Being a Slack user does not make you a FaultMaven principal.** A FaultMaven
 > account is a Copilot/dashboard identity; nothing about appearing in a Slack
@@ -453,7 +458,8 @@ sharing scope is the workspace's *Team* (within the **enterprise**).
 >
 > ADR-012 D2 states the same thing from the backend side ("no per-user Slack
 > attribution"), and `author_external_ref` was dropped for this structural
-> reason — not as a deferral. ADR-013 widening *visibility* does not change it:
+> reason — not as a deferral. The requester key does not reopen it: core uses
+> it to order admission and never records it on a message, a case or any row. ADR-013 widening *visibility* does not change it:
 > more readers of a transcript does not create an identity that never existed.
 
 ### 6.2 The thread is the scope; the agent supplies the lifecycle drivers
@@ -718,6 +724,19 @@ all — while `is_unlinked` preserves the memory:
    thread's gate is held throughout, so follow-ups get ⏭️.
    A terminal case is recognised by `x-error-code: CASE_TERMINAL` (contract
    12.3.0); an unlabelled 409 is not one and gets the generic handling.
+   Every attempt also carries `X-FaultMaven-Requester` when the turn has a
+   Slack user (contract 15.6.0, faultmaven#2852): HMAC-SHA256, domain-separated,
+   of `<namespace>:<context.user_id>` under the signing secret (http) or the app
+   token (socket), hex, 32 characters; never the raw Slack id
+   (`listeners._turn.requester_for`; the core client holds neither the key nor
+   the raw id). The namespace is `context.enterprise_id`, else `context.team_id`,
+   so an Enterprise Grid org-wide install gives one id per person on every
+   surface. Core orders one service account's worker jobs by it, round-robin
+   between that account's people, and authorizes nothing by it. Workspaces that
+   share the process-wide default credential are one account, so their people
+   rotate together. A key change gives everyone a new id. Core holds a
+   per-requester stamp in memory while the account is busy; nothing persists
+   it, here or there.
 
 5. **Async turns.** A turn may return `202 Accepted` with a `Location` URL; poll
    it (exponential backoff, ~1.5×, cap ~10 s, ~5 min ceiling) until the
@@ -815,7 +834,9 @@ Two OAuth flows, each doing a distinct job. Mapping (per **ADR-017 D6**):
 **FaultMaven enterprise** is the tenant/isolation boundary that *groups* Teams.
 There is **no Slack-user ↔ FaultMaven-user mapping** — individual Slack users
 hold no FaultMaven account (only Copilot users do), and the server's principal
-for every Slack turn is this agent's service account (§6.1). A single-workspace
+for every Slack turn is this agent's service account (§6.1). The opaque
+requester key a turn carries (§8.1 item 4) orders admission between that
+account's people; it maps no one to anything. A single-workspace
 customer collapses enterprise and Team 1:1; a multi-workspace (Slack Grid)
 customer is **one enterprise** containing several Teams (one per workspace).
 
@@ -1030,7 +1051,8 @@ never cross-tenant.
 > **⚠️ Unsettled: "attributed to the Slack user in metadata."** The backend does
 > not do this, and ADR-012 D2 deliberately says it should not — `case_messages.
 > author_external_ref` was dropped for the structural reason in §6.1 above, not
-> deferred. Today the agent sends `query=text` with no speaker label at all, so a
+> deferred. The requester key (§8.1 item 4) is not that attribution: core
+> orders admission by it and stores it with nothing. Today the agent sends `query=text` with no speaker label at all, so a
 > FaultMaven reader of a multi-person thread cannot tell participants apart in
 > the transcript body.
 >

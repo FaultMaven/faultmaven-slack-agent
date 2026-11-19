@@ -317,6 +317,8 @@ def check_turn_contract(fm: FaultMavenClient) -> bool:
         result = fm.submit_turn(
             case_id,
             idempotency_key=secrets.token_hex(32),
+            # The doctor's smoke turn is nobody's: it names no requester.
+            requester=None,
             query="Preflight ping — please ack.",
         )
     except FaultMavenError as exc:

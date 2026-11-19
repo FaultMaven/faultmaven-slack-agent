@@ -739,6 +739,12 @@ class _Credential:
         return f"workspace {self.key}" if self.key else "the default credential"
 
 
+#: The turn header naming who asked (contract 15.6.0): an opaque per-person
+#: ordering key (``listeners._turn.requester_for``). Core trusts it only from a
+#: Slack service account and orders that account's own worker jobs by it.
+REQUESTER_HEADER = "X-FaultMaven-Requester"
+
+
 class FaultMavenClient:
     """Sync facade over the FaultMaven core API."""
 
@@ -2318,6 +2324,7 @@ class FaultMavenClient:
         case_id: str,
         *,
         idempotency_key: str,
+        requester: str | None,
         query: str | None = None,
         pasted_content: str | None = None,
         files: list[tuple[str, bytes, str]] | None = None,
@@ -2337,6 +2344,13 @@ class FaultMavenClient:
         was observed — distinct from when it was submitted. The backend
         defaults to submission time when it is absent, which reads a
         two-hour-old alert as current.
+
+        ``requester`` is the turn's opaque ordering key
+        (``listeners._turn.requester_for``), sent as :data:`REQUESTER_HEADER`
+        on every attempt, the re-auth re-POST included; None sends no header.
+        Required, with no default, so a caller says which it means: a new
+        surface that forgets it fails at once rather than sending turns that
+        name nobody.
 
         ``idempotency_key`` names this ONE logical turn (one Slack message,
         click or shortcut invocation) and rides on every attempt at it. It is
@@ -2461,7 +2475,11 @@ class FaultMavenClient:
             )
 
         cred = self._credential_for(team_id)
+        # The one headers dict every attempt and ``_post``'s re-auth re-POST
+        # send, so the requester rides on all of them.
         headers = {"Idempotency-Key": idempotency_key}
+        if requester:
+            headers[REQUESTER_HEADER] = requester
         # Checked before the capabilities probe, and again after the probe and
         # the token, either of which can take a request's timeout; see
         # :meth:`_refuse_if_stopping`.

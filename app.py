@@ -384,7 +384,11 @@ def build_app() -> tuple[App, CaseStore, FaultMavenClient, Settings, OAuthStores
             signing_secret=settings.slack_signing_secret or None,
         )
     register_listeners(
-        app, fm, store, stores.workspace_credentials if stores else None
+        app,
+        fm,
+        store,
+        stores.workspace_credentials if stores else None,
+        requester_key=settings.requester_key,
     )
 
     # Returned rather than attached to the Bolt app: the callback route needs

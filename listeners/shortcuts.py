@@ -21,6 +21,7 @@ from slack_text import message_to_text
 from store import CaseStore
 
 from ._turn import (
+    requester_for,
     Dedup,
     post_placeholder,
     RESTARTED_AFTER_MISSING_CASE,
@@ -200,6 +201,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 observed_at=slack_ts_to_iso(message_ts),
                 files=files or None,
                 placeholder_ts=placeholder_ts,
+                requester=requester_for(context),
                 mention_user=context.user_id,
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
             )

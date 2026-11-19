@@ -83,7 +83,7 @@ def test_submit_turn_sends_form_fields():
         )
 
     client = make_client(handler, token="tok")
-    result = client.submit_turn("c1", query="why down", pasted_content="ERR x", idempotency_key="test-turn-key")
+    result = client.submit_turn("c1", query="why down", pasted_content="ERR x", requester=None, idempotency_key="test-turn-key")
 
     assert isinstance(result, TurnResult)
     assert result.case_state == "investigating"
@@ -106,7 +106,7 @@ def test_submit_turn_sends_observed_at_when_given():
         "c1",
         query="investigate",
         pasted_content="[FIRING:1] etcdInsufficientMembers",
-        observed_at="2026-08-04T17:36:17+00:00", idempotency_key="test-turn-key",
+        observed_at="2026-08-04T17:36:17+00:00", requester=None, idempotency_key="test-turn-key",
     )
     assert "observed_at" in seen["body"]
     assert "2026-08-04T17" in seen["body"]
@@ -123,7 +123,7 @@ def test_submit_turn_omits_observed_at_when_unknown():
         return httpx.Response(200, json={"agent_response": "ok", "turn_number": 1})
 
     client = make_client(handler, token="tok")
-    client.submit_turn("c1", query="investigate", pasted_content="x", idempotency_key="test-turn-key")
+    client.submit_turn("c1", query="investigate", pasted_content="x", requester=None, idempotency_key="test-turn-key")
     assert "observed_at" not in seen["body"]
 
 
@@ -136,7 +136,7 @@ def test_submit_turn_multipart_when_files_present():
         return httpx.Response(200, json={"agent_response": "ok"})
 
     client = make_client(handler, token="tok")
-    client.submit_turn("c1", query="see log", files=[("err.log", b"boom", "text/plain")], idempotency_key="test-turn-key")
+    client.submit_turn("c1", query="see log", files=[("err.log", b"boom", "text/plain")], requester=None, idempotency_key="test-turn-key")
 
     assert seen["ct"].startswith("multipart/form-data")
     assert b"err.log" in seen["body"] and b"boom" in seen["body"]
@@ -145,7 +145,7 @@ def test_submit_turn_multipart_when_files_present():
 def test_submit_turn_requires_at_least_one_input():
     client = make_client(lambda req: httpx.Response(200, json={}), token="tok")
     with pytest.raises(FaultMavenError, match="at least one"):
-        client.submit_turn("c1", idempotency_key="test-turn-key")
+        client.submit_turn("c1", requester=None, idempotency_key="test-turn-key")
 
 
 def test_submit_turn_sends_an_explicit_empty_query():
@@ -159,7 +159,7 @@ def test_submit_turn_sends_an_explicit_empty_query():
         return httpx.Response(200, json={})
 
     client = make_client(handler, token="tok")
-    client.submit_turn("c1", query="", idempotency_key="test-turn-key")
+    client.submit_turn("c1", query="", requester=None, idempotency_key="test-turn-key")
     assert b"query" in seen["body"]
 
 
@@ -173,7 +173,7 @@ def test_submit_turn_connection_lost_after_send_is_indeterminate():
 
     client = make_client(handler, token="tok")
     with pytest.raises(FaultMavenTimeoutError):
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
 
 
 def test_submit_turn_connect_error_stays_retryable():
@@ -185,7 +185,7 @@ def test_submit_turn_connect_error_stays_retryable():
 
     client = make_client(handler, token="tok")
     with pytest.raises(FaultMavenError) as exc_info:
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert not isinstance(exc_info.value, FaultMavenTimeoutError)
 
 
@@ -200,7 +200,7 @@ def test_submit_turn_write_error_stays_retryable():
 
     client = make_client(handler, token="tok")
     with pytest.raises(FaultMavenError) as exc_info:
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert not isinstance(exc_info.value, FaultMavenTimeoutError)
 
 
@@ -214,7 +214,7 @@ def test_submit_turn_gateway_timeout_is_indeterminate():
             lambda req, c=code: httpx.Response(c, text="gateway"), token="tok"
         )
         with pytest.raises(FaultMavenTimeoutError):
-            client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+            client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
 
 
 def test_submit_turn_409_terminal_case_is_its_own_class():
@@ -231,7 +231,7 @@ def test_submit_turn_409_terminal_case_is_its_own_class():
         token="tok",
     )
     with pytest.raises(CaseTerminalError) as exc:
-        client.submit_turn("c1", query="x", pasted_content="log", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", pasted_content="log", requester=None, idempotency_key="test-turn-key")
     assert exc.value.status_code == 409
     # A terminal case still EXISTS — misclassifying it as gone would evict the
     # thread→case mapping and strand the concluded investigation.
@@ -257,7 +257,7 @@ def test_submit_turn_409_version_conflict_is_not_mistaken_for_terminal():
         token="tok",
     )
     with pytest.raises(CaseVersionConflictError) as exc:
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert not isinstance(exc.value, CaseTerminalError)
 
 
@@ -275,7 +275,7 @@ def test_unlabelled_409_off_the_poll_path_is_not_claimed_terminal(no_poll_sleep)
 
     client = make_client(handler, token="tok")
     with pytest.raises(FaultMavenAPIError) as exc:
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert not isinstance(exc.value, CaseTerminalError)
     assert exc.value.status_code == 409
 
@@ -296,7 +296,7 @@ def test_labelled_version_conflict_is_honored_even_when_polled(no_poll_sleep):
 
     client = make_client(handler, token="tok")
     with pytest.raises(CaseVersionConflictError):
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
 
 
 def test_409_labelled_with_some_other_code_is_never_called_terminal():
@@ -315,7 +315,7 @@ def test_409_labelled_with_some_other_code_is_never_called_terminal():
         token="tok",
     )
     with pytest.raises(FaultMavenAPIError) as exc:
-        client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert not isinstance(exc.value, CaseTerminalError)
     assert not isinstance(exc.value, CaseVersionConflictError)
     assert not isinstance(exc.value, CaseDeleteInProgressError)
@@ -337,7 +337,7 @@ def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
         token="tok",
     )
     with pytest.raises(CaseVersionConflictError):
-        conflict.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        conflict.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
 
     terminal = make_client(
         lambda req: httpx.Response(
@@ -348,7 +348,7 @@ def test_submit_turn_409_discrimination_does_not_read_the_detail_prose():
         token="tok",
     )
     with pytest.raises(CaseTerminalError):
-        terminal.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+        terminal.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
 
 
 def test_submit_turn_200_non_json_body_degrades_not_raises():
@@ -358,7 +358,7 @@ def test_submit_turn_200_non_json_body_degrades_not_raises():
     client = make_client(
         lambda req: httpx.Response(200, text="<html>proxy</html>"), token="tok"
     )
-    result = client.submit_turn("c1", query="x", idempotency_key="test-turn-key")
+    result = client.submit_turn("c1", query="x", requester=None, idempotency_key="test-turn-key")
     assert isinstance(result, TurnResult)
     assert result.agent_response  # non-empty fallback, no exception
 

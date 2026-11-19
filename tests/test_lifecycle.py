@@ -289,7 +289,7 @@ def test_socket_mode_registers_no_lifecycle_listeners():
     registrars legitimately subscribe to ``app_mention``, ``message`` and
     ``app_home_opened`` on this transport too."""
     app = MagicMock()
-    register_listeners(app, MagicMock(), MagicMock(), None)
+    register_listeners(app, MagicMock(), MagicMock(), None, requester_key="")
     subscribed = [c.args[0] for c in app.event.call_args_list if c.args]
     assert "app_uninstalled" not in subscribed
     assert "tokens_revoked" not in subscribed
