@@ -2016,7 +2016,7 @@ class LLMConfigResponse(BaseModel):
 class LLMUsageBucket(BaseModel):
     cache_hit_rate: float | None = Field(
         ...,
-        description="cache_read / (input + cache_read); null when that is 0",
+        description="cache_read / (input + cache_read + cache_write): the share of prompt tokens read from a provider prompt cache; null when the sum is 0",
         title="Cache Hit Rate",
     )
     calls: LLMUsageCalls
@@ -2041,7 +2041,7 @@ class LLMUsageBucket(BaseModel):
 class LLMUsageDay(BaseModel):
     cache_hit_rate: float | None = Field(
         ...,
-        description="cache_read / (input + cache_read); null when that is 0",
+        description="cache_read / (input + cache_read + cache_write): the share of prompt tokens read from a provider prompt cache; null when the sum is 0",
         title="Cache Hit Rate",
     )
     calls: LLMUsageCalls
@@ -2067,7 +2067,7 @@ class LLMUsageDay(BaseModel):
 class LLMUsageGroup(BaseModel):
     cache_hit_rate: float | None = Field(
         ...,
-        description="cache_read / (input + cache_read); null when that is 0",
+        description="cache_read / (input + cache_read + cache_write): the share of prompt tokens read from a provider prompt cache; null when the sum is 0",
         title="Cache Hit Rate",
     )
     calls: LLMUsageCalls

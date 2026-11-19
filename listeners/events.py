@@ -360,6 +360,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 prior_context=prior_context,
                 files=files or None,
                 placeholder_ts=placeholder_ts,
+                requester=event.get("user"),
                 mention_user=event.get("user"),
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
                 empty_turn_fallback=SUMMONS_TEXT,
@@ -435,6 +436,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     pasted_content=snippet_text,
                     files=files or None,
                     placeholder_ts=placeholder_ts,
+                    requester=event.get("user"),
                     intro_note=_DM_INTRO,
                 )
 
@@ -504,6 +506,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 pasted_content=snippet_text,
                 files=files or None,
                 prior_context=prior_context,
+                requester=event.get("user"),
                 mention_user=event.get("user"),
             )
 

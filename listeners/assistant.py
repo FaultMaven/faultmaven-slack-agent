@@ -188,6 +188,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     ),
                     pasted_content=pasted_text,
                     files=files or None,
+                    requester=payload.get("user"),
                     on_waiting=still_working,
                 )
             except Exception as exc:  # noqa: BLE001

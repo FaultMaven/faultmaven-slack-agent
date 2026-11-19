@@ -200,6 +200,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 observed_at=slack_ts_to_iso(message_ts),
                 files=files or None,
                 placeholder_ts=placeholder_ts,
+                requester=context.user_id,
                 mention_user=context.user_id,
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
             )

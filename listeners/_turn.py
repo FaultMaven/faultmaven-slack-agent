@@ -1040,6 +1040,7 @@ def run_turn(
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
+    requester: str | None = None,
     on_waiting=None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
@@ -1070,6 +1071,9 @@ def run_turn(
       the message that asked for it, or :func:`shortcut_turn_key`) and
       ``on_waiting`` is the surface's "still working" notice; both go to :meth:`FaultMavenClient.submit_turn`,
       whose recovery loop holds the thread's gate for as long as it waits.
+    - ``requester`` is the Slack user id of whoever asked for this turn, for
+      :meth:`FaultMavenClient.submit_turn`, which sends only an opaque id
+      derived from it; None (a user-less event) sends none.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -1111,6 +1115,7 @@ def run_turn(
                 files=files or None,
                 input_type="paste" if pasted_content else None,
                 team_id=team_id,
+                requester=requester,
                 on_waiting=on_waiting,
             )
         else:
@@ -1119,6 +1124,7 @@ def run_turn(
                 idempotency_key=idempotency_key,
                 query=text,
                 team_id=team_id,
+                requester=requester,
                 on_waiting=on_waiting,
             )
     except CaseNotFoundError:
@@ -1227,6 +1233,7 @@ def run_turn_and_post(
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
     placeholder_ts: str | None = None,
+    requester: str | None = None,
     mention_user: str | None = None,
     intro_note: str | None = None,
     empty_turn_fallback: str | None = None,
@@ -1253,7 +1260,9 @@ def run_turn_and_post(
     slow file download). ``idempotency_key`` is the turn's key
     (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
     waits on a slow turn under it, the placeholder is updated once to
-    :data:`STILL_WORKING_TEXT`.
+    :data:`STILL_WORKING_TEXT`. ``requester`` is the Slack user id of whoever
+    asked for the turn, passed to :func:`run_turn`; it is separate from
+    ``mention_user`` because a DM or a data-box reply names nobody.
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise
@@ -1302,6 +1311,7 @@ def run_turn_and_post(
                 # The same key on the fallback re-send too: the backend refused
                 # the first with a 400, so nothing committed under it.
                 idempotency_key=idempotency_key,
+                requester=requester,
                 on_waiting=lambda: update(STILL_WORKING_TEXT),
             )
 

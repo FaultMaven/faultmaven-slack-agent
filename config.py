@@ -238,6 +238,19 @@ class Settings(BaseSettings):
 
         return bool(self.faultmaven_dashboard_url and self.faultmaven_oauth_redirect_uri)
 
+    @property
+    def requester_key(self) -> str:
+        """The HMAC key of the turn's opaque requester id (``requester_id``).
+
+        A secret this transport already holds and never sends: the signing
+        secret under ``http``, the app token under ``socket``. ``""`` when it is
+        unset, and then no turn names its requester.
+        """
+
+        if self.slack_transport == "http":
+            return self.slack_signing_secret
+        return self.slack_app_token
+
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     # A PEM file of CA certificates added to the OS CA bundle, the one root set

@@ -718,6 +718,13 @@ all — while `is_unlinked` preserves the memory:
    thread's gate is held throughout, so follow-ups get ⏭️.
    A terminal case is recognised by `x-error-code: CASE_TERMINAL` (contract
    12.3.0); an unlabelled 409 is not one and gets the generic handling.
+   Every attempt also carries `X-FaultMaven-Requester` when the turn has a
+   Slack user (contract 15.6.0, faultmaven#2852): HMAC-SHA256 of
+   `team_id:user_id` under the signing secret (http) or the app token (socket),
+   domain-separated, hex, 32 characters; never the raw Slack id
+   (`faultmaven.client.requester_id`). Core orders one service account's worker
+   jobs by it, round-robin between the workspace's people, and authorizes
+   nothing by it. A key change gives everyone a new id; nothing stores it.
 
 5. **Async turns.** A turn may return `202 Accepted` with a `Location` URL; poll
    it (exponential backoff, ~1.5×, cap ~10 s, ~5 min ceiling) until the

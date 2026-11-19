@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -739,6 +741,36 @@ class _Credential:
         return f"workspace {self.key}" if self.key else "the default credential"
 
 
+#: The turn header naming who asked (contract 15.6.0). Core trusts it only from
+#: a Slack service account, and it orders that account's own worker jobs only.
+REQUESTER_HEADER = "X-FaultMaven-Requester"
+
+#: Domain separation: the key is a Slack secret with its own use (the signing
+#: secret signs Slack's requests), so this id is never a value Slack computes.
+_REQUESTER_DOMAIN = b"faultmaven-requester\0"
+
+
+def requester_id(key: str, team_id: str | None, slack_user_id: str | None) -> str | None:
+    """The opaque id a turn sends as :data:`REQUESTER_HEADER`, or None.
+
+    ``HMAC-SHA256(key, b"faultmaven-requester\\0" + b"<team_id>:<user>")``, hex,
+    cut to 32 characters: inside core's published ``[A-Za-z0-9_-]{16,64}``, and
+    never the raw Slack id. ``key`` is ``Settings.requester_key`` (the signing
+    secret under http, the app token under socket). None, so no header, when
+    there is no user or no key.
+
+    It keys fairness only: core orders one service account's worker jobs
+    between the people behind it, and authorizes nothing by it. It is not an
+    identity and not stable: a rotated key gives every user a new id, which
+    costs nothing, because nothing stores it.
+    """
+
+    if not key or not slack_user_id:
+        return None
+    message = _REQUESTER_DOMAIN + f"{team_id or ''}:{slack_user_id}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()[:32]
+
+
 class FaultMavenClient:
     """Sync facade over the FaultMaven core API."""
 
@@ -757,6 +789,7 @@ class FaultMavenClient:
         oauth_client_id: str = "faultmaven-slack-agent",
         workspace_credentials: Any = None,
         require_workspace_binding: bool = False,
+        requester_key: str = "",
     ) -> None:
         # --- refresh-grant credential (ADR-012 D10) ---------------------------
         # The persisted credential wins over the configured one: rotation makes
@@ -808,6 +841,8 @@ class FaultMavenClient:
         # Workspaces already warned about falling back to the default principal,
         # so a busy unbound workspace says it once rather than once per turn.
         self._warned_unbound: set[str] = set()
+        # The HMAC key of :func:`requester_id`; "" sends no requester.
+        self._requester_key = requester_key
 
         # ``timeout`` serves every request that is not a turn (renewals,
         # create_case), and is the per-attempt cap for a turn unless
@@ -2327,6 +2362,7 @@ class FaultMavenClient:
         source_url: str | None = None,
         observed_at: str | None = None,
         team_id: str | None = None,
+        requester: str | None = None,
         on_waiting: Callable[[], None] | None = None,
     ) -> TurnResult:
         """Submit one turn (multipart) and return the normalized result.
@@ -2337,6 +2373,12 @@ class FaultMavenClient:
         was observed — distinct from when it was submitted. The backend
         defaults to submission time when it is absent, which reads a
         two-hour-old alert as current.
+
+        ``requester`` is the Slack user id of whoever asked for the turn, or
+        None. It is never sent as is: :func:`requester_id` derives the opaque
+        id under this client's requester key, which travels as
+        :data:`REQUESTER_HEADER` on every attempt, the re-auth re-POST
+        included. No user or no key sends no header.
 
         ``idempotency_key`` names this ONE logical turn (one Slack message,
         click or shortcut invocation) and rides on every attempt at it. It is
@@ -2461,7 +2503,12 @@ class FaultMavenClient:
             )
 
         cred = self._credential_for(team_id)
+        # The one headers dict every attempt and ``_post``'s re-auth re-POST
+        # send, so the requester rides on all of them.
         headers = {"Idempotency-Key": idempotency_key}
+        opaque_requester = requester_id(self._requester_key, team_id, requester)
+        if opaque_requester:
+            headers[REQUESTER_HEADER] = opaque_requester
         # Checked before the capabilities probe, and again after the probe and
         # the token, either of which can take a request's timeout; see
         # :meth:`_refuse_if_stopping`.

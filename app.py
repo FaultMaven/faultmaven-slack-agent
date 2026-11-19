@@ -137,6 +137,7 @@ def make_fault_client(
         oauth_client_id=settings.faultmaven_oauth_client_id,
         workspace_credentials=workspace_credentials,
         require_workspace_binding=settings.faultmaven_require_workspace_binding,
+        requester_key=settings.requester_key,
     )
 
 

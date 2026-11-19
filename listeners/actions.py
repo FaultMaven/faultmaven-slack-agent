@@ -68,6 +68,7 @@ def apply_action(
     *,
     team_id: str,
     idempotency_key: str,
+    requester: str | None = None,
     on_waiting=None,
 ) -> TurnResult:
     """Submit the turn encoded in a button's ``value`` and return the result.
@@ -81,7 +82,8 @@ def apply_action(
 
     ``idempotency_key`` is required for the reason every turn's is (see
     :meth:`FaultMavenClient.submit_turn`): the click's
-    :func:`~listeners._turn.click_turn_key`.
+    :func:`~listeners._turn.click_turn_key`. ``requester`` is the Slack user
+    id of whoever clicked (see :meth:`FaultMavenClient.submit_turn`).
     """
 
     value = json.loads(value_json)
@@ -92,6 +94,7 @@ def apply_action(
         intent_type=value.get("it"),
         intent_data=value.get("id"),
         team_id=team_id,
+        requester=requester,
         on_waiting=on_waiting,
     )
 
@@ -343,6 +346,7 @@ def register_actions(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         idempotency_key=click_turn_key(
                             team_id, channel, action.get("action_ts")
                         ),
+                        requester=(body.get("user") or {}).get("id"),
                         on_waiting=still_working,
                     )
                 except CaseNotFoundError:
@@ -537,6 +541,7 @@ def register_data_box(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 text="",
                 pasted_content=pasted,
                 idempotency_key=view_turn_key(team_id, view.get("id")),
+                requester=user_id,
             )
 
         if not run_gated(

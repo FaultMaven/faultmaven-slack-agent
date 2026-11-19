@@ -511,6 +511,7 @@ def test_make_fault_client_derives_only_the_unset_knobs(
         faultmaven_turn_recovery_seconds=rec,
         faultmaven_oauth_client_id="x",
         faultmaven_require_workspace_binding=False,
+        requester_key="",
     )
     client = app.make_fault_client(settings)
     assert client._derive_attempt is derive_attempt
