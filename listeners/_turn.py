@@ -17,6 +17,7 @@ thread with :func:`try_begin_turn` and release it with :func:`end_turn`.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import secrets
 import threading
@@ -1001,6 +1002,49 @@ def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+#: Domain separation: the key is a Slack secret with a use of its own (the
+#: signing secret signs Slack's requests), so the id is never a value computed
+#: for that use.
+_REQUESTER_DOMAIN = b"faultmaven-requester\0"
+#: ``Settings.requester_key``, installed once by ``register_listeners``.
+_requester_key = ""
+
+
+def configure_requester_key(key: str) -> None:
+    """Install the HMAC key of :func:`requester_for` (``Settings.requester_key``:
+    the signing secret under http, the app token under socket)."""
+
+    global _requester_key
+    _requester_key = key
+
+
+def requester_for(context) -> str | None:
+    """The turn's opaque requester id, from Bolt's ``context``, or None.
+
+    ``HMAC-SHA256(key, b"faultmaven-requester\\0" + b"<namespace>:<user>")``,
+    hex, cut to 32 characters: inside core's ``[A-Za-z0-9_-]{16,64}``. The user
+    is ``context.user_id`` on every surface. The namespace is
+    ``context.enterprise_id``, else ``context.team_id``: on an Enterprise Grid
+    org-wide install an event arrives with no team while a click carries the
+    workspace's, so keying on the team would give one person two ids.
+
+    It is an ordering key and nothing more: core orders one service account's
+    worker jobs between the people behind it, and authorizes nothing by it.
+    Workspaces that share the process-wide default credential are one account,
+    so their people rotate together. It is not stable (a rotated key gives
+    everyone a new id) and not an identity. Core holds a per-requester stamp in
+    memory while the account is busy; nothing persists it. None, so no header,
+    when there is no user or no key.
+    """
+
+    user = getattr(context, "user_id", None)
+    if not _requester_key or not user:
+        return None
+    namespace = getattr(context, "enterprise_id", None) or getattr(context, "team_id", None)
+    message = _REQUESTER_DOMAIN + f"{namespace or ''}:{user}".encode("utf-8")
+    return hmac.new(_requester_key.encode("utf-8"), message, hashlib.sha256).hexdigest()[:32]
+
+
 def slack_ts_to_iso(ts: str | None) -> str | None:
     """Slack's ``"1754336177.123456"`` → an ISO-8601 UTC instant, or None.
 
@@ -1035,12 +1079,12 @@ def run_turn(
     thread_ts: str,
     text: str,
     idempotency_key: str,
+    requester: str | None,
     pasted_content: str | None = None,
     source_url: str | None = None,
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
-    requester: str | None = None,
     on_waiting=None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
@@ -1071,9 +1115,9 @@ def run_turn(
       the message that asked for it, or :func:`shortcut_turn_key`) and
       ``on_waiting`` is the surface's "still working" notice; both go to :meth:`FaultMavenClient.submit_turn`,
       whose recovery loop holds the thread's gate for as long as it waits.
-    - ``requester`` is the Slack user id of whoever asked for this turn, for
-      :meth:`FaultMavenClient.submit_turn`, which sends only an opaque id
-      derived from it; None (a user-less event) sends none.
+    - ``requester`` is the turn's opaque ordering key (:func:`requester_for`),
+      for :meth:`FaultMavenClient.submit_turn`; None sends none. Required, as
+      the key is, so a new surface cannot forget it silently.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -1227,13 +1271,13 @@ def run_turn_and_post(
     team_id: str,
     text: str,
     idempotency_key: str,
+    requester: str | None,
     pasted_content: str | None = None,
     source_url: str | None = None,
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
     placeholder_ts: str | None = None,
-    requester: str | None = None,
     mention_user: str | None = None,
     intro_note: str | None = None,
     empty_turn_fallback: str | None = None,
@@ -1260,9 +1304,8 @@ def run_turn_and_post(
     slow file download). ``idempotency_key`` is the turn's key
     (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
     waits on a slow turn under it, the placeholder is updated once to
-    :data:`STILL_WORKING_TEXT`. ``requester`` is the Slack user id of whoever
-    asked for the turn, passed to :func:`run_turn`; it is separate from
-    ``mention_user`` because a DM or a data-box reply names nobody.
+    :data:`STILL_WORKING_TEXT`. ``requester`` is the turn's opaque ordering
+    key (:func:`requester_for`), passed to :func:`run_turn`.
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise

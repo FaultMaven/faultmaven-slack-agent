@@ -67,7 +67,7 @@ class FakeStore:
 def test_first_turn_creates_case_without_initial_message_and_routes_text():
     fm, store = FakeFM(), FakeStore()
     big = "x" * 9000
-    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text=big, idempotency_key="test-turn-key")
+    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text=big, requester=None, idempotency_key="test-turn-key")
 
     assert fm.creates == [(None, None)]  # no initial_message seeded
     case_id, kwargs = fm.turns[0]
@@ -82,20 +82,20 @@ def test_prior_context_merged_whenever_the_caller_provides_it():
 
     fm, store = FakeFM(), FakeStore()
     run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1",
-             text="now", prior_context="earlier discussion", idempotency_key="test-turn-key")
+             text="now", prior_context="earlier discussion", requester=None, idempotency_key="test-turn-key")
     assert fm.turns[0][1]["pasted_content"] == "earlier discussion"
     assert store.is_seeded("T", "C", "t1")  # landed → callers stop passing it
 
     run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1",
-             text="again", idempotency_key="test-turn-key")
+             text="again", requester=None, idempotency_key="test-turn-key")
     assert len(fm.creates) == 1  # reuses the existing case
     assert fm.turns[1][1].get("pasted_content") is None
 
 
 def test_existing_thread_reuses_case():
     fm, store = FakeFM(), FakeStore()
-    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text="one", idempotency_key="test-turn-key")
-    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text="two", idempotency_key="test-turn-key")
+    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text="one", requester=None, idempotency_key="test-turn-key")
+    run_turn(fm, store, team_id="T", channel_id="C", thread_ts="t1", text="two", requester=None, idempotency_key="test-turn-key")
     assert len(fm.creates) == 1
     assert fm.turns[0][0] == fm.turns[1][0] == "case1"
 
@@ -110,7 +110,7 @@ def test_committed_turn_survives_a_mark_seeded_failure():
 
     fm, store = FakeFM(), BoomSeedStore()
     result = run_turn(
-        fm, store, team_id="T", channel_id="C", thread_ts="t1", text="hi", idempotency_key="test-turn-key"
+        fm, store, team_id="T", channel_id="C", thread_ts="t1", text="hi", requester=None, idempotency_key="test-turn-key"
     )
     assert result.agent_response == "r"  # committed reply returned regardless
 
@@ -428,7 +428,7 @@ def test_run_turn_sends_the_empty_query_to_the_backend():
             calls.append((case_id, kw))
             return _result()
 
-    run_turn(FakeFM(), _FakeStore(), team_id="T", channel_id="C", thread_ts="th", text="", idempotency_key="test-turn-key")
+    run_turn(FakeFM(), _FakeStore(), team_id="T", channel_id="C", thread_ts="th", text="", requester=None, idempotency_key="test-turn-key")
     assert calls and calls[0][0] == "case_1"
     assert calls[0][1]["query"] == ""
 
@@ -451,7 +451,7 @@ def test_empty_turn_falls_back_to_the_summons_on_a_pre_2_8_backend():
     client.chat_postMessage.return_value = {"ts": "p1"}
     run_turn_and_post(
         client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
-        text="", empty_turn_fallback=SUMMONS_TEXT, idempotency_key="test-turn-key",
+        text="", empty_turn_fallback=SUMMONS_TEXT, requester=None, idempotency_key="test-turn-key",
     )
     assert calls == ["", SUMMONS_TEXT]
     posted = client.chat_update.call_args.kwargs.get("text", "")
@@ -472,6 +472,6 @@ def test_a_non_400_error_on_an_empty_turn_is_not_retried():
     client.chat_postMessage.return_value = {"ts": "p1"}
     run_turn_and_post(
         client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
-        text="", empty_turn_fallback=SUMMONS_TEXT, idempotency_key="test-turn-key",
+        text="", empty_turn_fallback=SUMMONS_TEXT, requester=None, idempotency_key="test-turn-key",
     )
     assert calls == [""]

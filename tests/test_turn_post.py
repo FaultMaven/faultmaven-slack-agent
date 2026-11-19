@@ -123,7 +123,7 @@ def _context_texts(update) -> list[str]:
 def test_posts_a_placeholder_then_updates_it():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
-    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON, idempotency_key="test-turn-key")
+    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON, requester=None, idempotency_key="test-turn-key")
     assert len(client.posts) == 1
     assert client.updates[0]["ts"] == "PH1"
 
@@ -132,7 +132,7 @@ def test_reuses_an_existing_placeholder():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
     _turn.run_turn_and_post(
-        client, fm, FakeStore(), text="hi", placeholder_ts="PH_PRE", **_COMMON, idempotency_key="test-turn-key"
+        client, fm, FakeStore(), text="hi", placeholder_ts="PH_PRE", **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
     assert client.posts == []
     assert client.updates[0]["ts"] == "PH_PRE"
@@ -141,7 +141,7 @@ def test_reuses_an_existing_placeholder():
 def test_bails_without_running_when_it_cannot_post():
     _turn = _load_turn()
     client, fm = FakeClient(fail_post=True), FakeFM()
-    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON, idempotency_key="test-turn-key")
+    _turn.run_turn_and_post(client, fm, FakeStore(), text="hi", **_COMMON, requester=None, idempotency_key="test-turn-key")
     assert fm.turns == []
     assert client.updates == []
 
@@ -150,7 +150,7 @@ def test_addresses_the_replier_and_warns_on_first_turn():
     _turn = _load_turn()
     client, fm = FakeClient(), FakeFM()
     _turn.run_turn_and_post(
-        client, fm, FakeStore(), text="hi", mention_user="U42", **_COMMON, idempotency_key="test-turn-key"
+        client, fm, FakeStore(), text="hi", mention_user="U42", **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
     update = client.updates[0]
     assert _first_section_text(update).startswith("<@U42> ")  # addressed
@@ -163,7 +163,7 @@ def test_no_warning_on_later_turns():
     client, fm, store = FakeClient(), FakeFM(), FakeStore()
     store.put("T", "C", "TS", "case_1")  # case already exists → not the first turn
     _turn.run_turn_and_post(
-        client, fm, store, text="again", mention_user="U42", **_COMMON, idempotency_key="test-turn-key"
+        client, fm, store, text="again", mention_user="U42", **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
     assert _turn._INTRO_WARNING not in _context_texts(client.updates[0])
 
@@ -173,7 +173,7 @@ def test_forwards_files_to_submit_turn():
     client, fm = FakeClient(), FakeFM()
     files = [("app.log", b"boom", "text/plain")]
     _turn.run_turn_and_post(
-        client, fm, FakeStore(), text="hi", files=files, **_COMMON, idempotency_key="test-turn-key"
+        client, fm, FakeStore(), text="hi", files=files, **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
     _, kw = fm.turns[0]
     assert kw["files"] == files
@@ -225,7 +225,7 @@ def test_disables_previous_turn_actions_when_new_turn_runs():
     store = FakeStore()
     _with_buttons(store)
 
-    _turn.run_turn_and_post(client, FakeFM(), store, text="next turn query", **_COMMON, idempotency_key="test-turn-key")
+    _turn.run_turn_and_post(client, FakeFM(), store, text="next turn query", **_COMMON, requester=None, idempotency_key="test-turn-key")
 
     assert len(client.updates) >= 2
     prev_update = client.updates[0]
@@ -249,7 +249,7 @@ def test_records_the_posted_turn_when_it_has_decide_buttons():
         store,
         text="hello",
         placeholder_ts="PH_ACTION",
-        **_COMMON, idempotency_key="test-turn-key",
+        **_COMMON, requester=None, idempotency_key="test-turn-key",
     )
 
     assert store.get_last_action_ts("T", "C", "TS") == "PH_ACTION"
@@ -267,7 +267,7 @@ def test_records_the_turn_even_when_it_carries_no_buttons():
     _with_buttons(store)
 
     _turn.run_turn_and_post(
-        client, FakeFM(), store, text="hello", placeholder_ts="PH_PLAIN", **_COMMON, idempotency_key="test-turn-key"
+        client, FakeFM(), store, text="hello", placeholder_ts="PH_PLAIN", **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
 
     assert store.get_last_turn_ts("T", "C", "TS") == "PH_PLAIN"
@@ -291,7 +291,7 @@ def test_a_failed_turn_leaves_the_previous_choice_buttons_alone():
     store = FakeStore()
     _with_buttons(store)
 
-    _turn.run_turn_and_post(client, _FailingFM(), store, text="next", **_COMMON, idempotency_key="test-turn-key")
+    _turn.run_turn_and_post(client, _FailingFM(), store, text="next", **_COMMON, requester=None, idempotency_key="test-turn-key")
 
     assert all(u["ts"] != "PREV_ACTION_TS" for u in client.updates)
     assert store.get_last_action_ts("T", "C", "TS") == "PREV_ACTION_TS"
@@ -307,7 +307,7 @@ def test_null_blocks_on_the_tracked_message_do_not_break_the_strip():
     _with_buttons(store)
 
     _turn.run_turn_and_post(
-        client, FakeFM(), store, text="next", placeholder_ts="PH", **_COMMON, idempotency_key="test-turn-key"
+        client, FakeFM(), store, text="next", placeholder_ts="PH", **_COMMON, requester=None, idempotency_key="test-turn-key"
     )
 
     assert all(u["ts"] != "PREV_ACTION_TS" for u in client.updates)
@@ -322,6 +322,7 @@ def test_case_opening_reply_says_where_data_goes_exactly_once():
     client, fm = FakeClient(), FakeFM()
     _turn.run_turn_and_post(
         client, fm, FakeStore(), text="hi", mention_user="U42", **_COMMON,
+        requester=None,
         idempotency_key="test-turn-key",
     )
     hints = _context_texts(client.updates[0]).count(_turn.DATA_CHANNEL_HINT)
@@ -338,7 +339,7 @@ def test_where_data_goes_rides_every_opening_surface():
     client, fm = FakeClient(), FakeFM()
     _turn.run_turn_and_post(
         client, fm, FakeStore(), text="hi", intro_note="reply in thread",
-        **_COMMON, idempotency_key="test-turn-key",
+        **_COMMON, requester=None, idempotency_key="test-turn-key",
     )
     texts = _context_texts(client.updates[0])
     assert texts.count(_turn.DATA_CHANNEL_HINT) == 1
@@ -350,10 +351,12 @@ def test_where_data_goes_is_not_repeated_on_a_continuing_turn():
     client, fm, store = FakeClient(), FakeFM(), FakeStore()
     _turn.run_turn_and_post(
         client, fm, store, text="first", mention_user="U42", **_COMMON,
+        requester=None,
         idempotency_key="key-1",
     )
     _turn.run_turn_and_post(
         client, fm, store, text="second", mention_user="U42", **_COMMON,
+        requester=None,
         idempotency_key="key-2",
     )
     assert len(client.updates) == 2

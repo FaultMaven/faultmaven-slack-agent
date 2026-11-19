@@ -240,7 +240,7 @@ class Settings(BaseSettings):
 
     @property
     def requester_key(self) -> str:
-        """The HMAC key of the turn's opaque requester id (``requester_id``).
+        """The HMAC key of the turn's opaque requester id (``listeners._turn.requester_for``).
 
         A secret this transport already holds and never sends: the signing
         secret under ``http``, the app token under ``socket``. ``""`` when it is

@@ -27,6 +27,7 @@ from slack_files import download_message_content
 from store import CaseStore
 
 from ._turn import (
+    requester_for,
     case_gone_text,
     Dedup,
     RESTARTED_AFTER_MISSING_CASE,
@@ -360,7 +361,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 prior_context=prior_context,
                 files=files or None,
                 placeholder_ts=placeholder_ts,
-                requester=event.get("user"),
+                requester=requester_for(context),
                 mention_user=event.get("user"),
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
                 empty_turn_fallback=SUMMONS_TEXT,
@@ -436,7 +437,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     pasted_content=snippet_text,
                     files=files or None,
                     placeholder_ts=placeholder_ts,
-                    requester=event.get("user"),
+                    requester=requester_for(context),
                     intro_note=_DM_INTRO,
                 )
 
@@ -506,7 +507,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 pasted_content=snippet_text,
                 files=files or None,
                 prior_context=prior_context,
-                requester=event.get("user"),
+                requester=requester_for(context),
                 mention_user=event.get("user"),
             )
 

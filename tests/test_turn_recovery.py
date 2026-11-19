@@ -246,7 +246,7 @@ def test_the_key_rides_on_the_401_re_auth_post_too():
 
     backend = _Backend(httpx.Response(401, json={"detail": "expired"}), _ok())
     client, _ = _client(backend, token="", dev_login_username="admin")
-    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert backend.keys == [_KEY, _KEY]
 
 
@@ -257,7 +257,7 @@ def test_a_timed_out_turn_is_recovered_from_its_receipt():
     waiting: list = []
 
     result = client.submit_turn(
-        "c1", idempotency_key=_KEY, query="why is the disk full",
+        "c1", requester=None, idempotency_key=_KEY, query="why is the disk full",
         files=[("df.txt", b"/dev/sda1 100%", "text/plain")],
         on_waiting=lambda: waiting.append(1),
     )
@@ -284,7 +284,7 @@ def test_a_timed_out_turn_is_recovered_from_its_receipt():
 def test_every_unknown_outcome_enters_recovery(first):
     backend = _Backend(first, _ok(replayed=True))
     client, _ = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY, _KEY]
 
 
@@ -298,7 +298,7 @@ def test_the_answer_is_posted_once_after_recovery():
 
     _turn.run_turn_and_post(
         slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
-        team_id="T1", text="why", idempotency_key=_KEY,
+        team_id="T1", text="why", requester=None, idempotency_key=_KEY,
     )
 
     texts = [u["text"] for u in slack.updates]
@@ -315,7 +315,7 @@ def test_turn_in_progress_waits_retry_after_then_replays():
     )
     client, clock = _client(backend)
 
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
 
     # One backoff after the timeout, then exactly the server's Retry-After.
     assert clock.waits == [1.0, 3.0]
@@ -332,7 +332,7 @@ def test_retry_after_is_clamped_to_a_poll_interval(retry_after, waited):
     headers = {"Retry-After": retry_after} if retry_after is not None else {}
     backend = _Backend(_conflict("TURN_IN_PROGRESS", **headers), _ok(replayed=True))
     client, clock = _client(backend)
-    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert clock.waits == [waited]
 
 
@@ -342,7 +342,7 @@ def test_an_exhausted_bound_raises_the_timeout():
     client, clock = _client(backend, recovery=300.0)
     start = clock.now
     with pytest.raises(FaultMavenTimeoutError):
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert clock.now - start <= 300.0
     # At 0, 60, 120, 180, 240 s, then the last wait is cut short for one last
     # ask at 290 s (#98); made once, and none at 300.
@@ -361,7 +361,7 @@ def test_a_turn_that_commits_during_the_last_wait_is_replayed():
     )
     client, clock = _client(backend, recovery=300.0)
     start = clock.now
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert len(backend.requests) == 6
     assert clock.now - start == 290.0  # the last ask fits inside the bound
     # ...with what is left of the bound as its timeout.
@@ -377,7 +377,7 @@ def test_the_last_ask_is_made_at_once_when_little_is_left():
         _ok(replayed=True),
     )
     client, clock = _client(backend, recovery=5.0)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert clock.waits == [1.0]  # the backoff; the 60 s wait was skipped
 
 
@@ -388,7 +388,7 @@ def test_an_exhausted_bound_tells_the_thread_once():
 
     _turn.run_turn_and_post(
         slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
-        team_id="T1", text="why", idempotency_key=_KEY,
+        team_id="T1", text="why", requester=None, idempotency_key=_KEY,
     )
 
     texts = [u["text"] for u in slack.updates]
@@ -409,7 +409,7 @@ def test_key_reuse_is_not_retried():
     backend = _Backend(_read_timeout, _conflict("IDEMPOTENCY_KEY_REUSE"), _ok())
     client, _ = _client(backend)
     with pytest.raises(IdempotencyKeyReuseError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert _turn.turn_error_text(err.value) == _turn.KEY_REUSE_TEXT
     # F4: whatever the key committed may be this turn, sent with other bytes,
@@ -439,7 +439,7 @@ def test_replay_unavailable_is_not_retried():
     backend = _Backend(_read_timeout, _conflict("IDEMPOTENCY_REPLAY_UNAVAILABLE"), _ok())
     client, _ = _client(backend)
     with pytest.raises(IdempotencyReplayUnavailableError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert _turn.turn_error_text(err.value) == _turn.REPLAY_UNAVAILABLE_TEXT
     # The turn DID commit, so neither the text nor a button invites a re-send.
@@ -457,7 +457,7 @@ def test_replay_unavailable_still_records_the_turn_as_landed():
 
     _turn.run_turn_and_post(
         slack, client, store, channel="C1", thread_ts="TS1", team_id="T1",
-        text="why", idempotency_key=_KEY, prior_context="earlier discussion",
+        text="why", requester=None, idempotency_key=_KEY, prior_context="earlier discussion",
     )
 
     assert store.seeded == [("T1", "C1", "TS1")]
@@ -472,7 +472,7 @@ def test_a_version_conflict_in_the_loop_is_re_sent_once():
         _read_timeout, _conflict("CASE_VERSION_CONFLICT"), _ok(replayed=True)
     )
     client, _ = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
 
 
@@ -483,7 +483,7 @@ def test_a_second_version_conflict_in_the_loop_is_the_ordinary_conflict():
     )
     client, _ = _client(backend)
     with pytest.raises(CaseVersionConflictError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 3
     assert _turn.turn_error_text(err.value) == _turn.CASE_BUSY_TEXT
 
@@ -495,7 +495,7 @@ def test_a_version_conflict_on_the_first_attempt_is_not_re_sent():
     backend = _Backend(_conflict("CASE_VERSION_CONFLICT"), _ok())
     client, _ = _client(backend)
     with pytest.raises(CaseVersionConflictError):
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 1
 
 
@@ -505,7 +505,7 @@ def test_a_refused_connection_on_the_first_attempt_stays_retryable():
     backend = _Backend(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused", request=r)))
     client, _ = _client(backend)
     with pytest.raises(FaultMavenError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert len(backend.requests) == 1
 
@@ -517,7 +517,7 @@ def test_a_refused_connection_while_recovering_keeps_recovering():
     refused = lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused", request=r))  # noqa: E731
     backend = _Backend(_read_timeout, refused, refused, _ok(replayed=True))
     client, _ = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 4
 
 
@@ -534,7 +534,7 @@ def test_a_request_timeout_is_one_post_then_the_nothing_committed_outcome():
     backend = _Backend(timed_out, _ok())
     client, _ = _client(backend)
     with pytest.raises(FaultMavenNothingCommittedError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 1
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert _turn.turn_error_text(err.value) == _turn.NOTHING_COMMITTED_NARROW_TEXT
@@ -557,7 +557,7 @@ def test_an_overloaded_backend_mid_recovery_is_waited_out():
 
     _turn.run_turn_and_post(
         slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
-        team_id="T1", text="why", idempotency_key=_KEY,
+        team_id="T1", text="why", requester=None, idempotency_key=_KEY,
     )
 
     assert [u["text"] for u in slack.updates] == [
@@ -619,7 +619,7 @@ def test_a_500_that_may_have_committed_is_recovered_under_its_key(code):
 
     backend = _Backend(_server_error(code), _ok(replayed=True))
     client, clock = _client(backend)
-    result = client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    result = client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert result.replayed and result.agent_response == _ANSWER["agent_response"]
     assert backend.keys == [_KEY] * 2
     assert clock.waits == [1.0]  # no Retry-After: the backoff
@@ -635,7 +635,7 @@ def test_a_coded_500_on_a_first_attempt_committed_nothing(code):
     backend = _Backend(_server_error(code, retry_after="10"), _ok())
     client, clock = _client(backend)
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert (err.value.status_code, err.value.code) == (500, code)
     assert len(backend.requests) == 1 and clock.waits == []
@@ -653,7 +653,7 @@ def test_a_coded_500_while_recovering_keeps_the_recovery_going():
         _read_timeout, _server_error("SERVICE_ERROR", retry_after="10"), _ok(replayed=True)
     )
     client, clock = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
     assert clock.waits == [1.0, 10.0]
 
@@ -665,7 +665,7 @@ def test_a_500_reaches_the_thread_as_the_recovered_answer():
 
     _turn.run_turn_and_post(
         slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
-        team_id="T1", text="why", idempotency_key=_KEY,
+        team_id="T1", text="why", requester=None, idempotency_key=_KEY,
     )
 
     texts = [u["text"] for u in slack.updates]
@@ -686,7 +686,7 @@ def test_a_500_that_repeats_ends_as_the_unknown_outcome_without_a_reclick(code):
     backend = _Backend(_server_error(code))
     client, clock = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert backend.keys == [_KEY] * (1 + fm_client._SERVER_ERROR_RESENDS)
     assert clock.waits == [1.0, 2.0]  # the backoff, doubling
     assert err.value.server_error
@@ -704,7 +704,7 @@ def test_a_500_then_a_timeout_ends_as_the_timeout():
     backend = _Backend(_server_error(), _read_timeout)
     client, _ = _client(backend, recovery=30.0)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not err.value.server_error
     assert _turn.turn_error_text(err.value) == _turn.TURN_TIMEOUT_TEXT
 
@@ -715,7 +715,7 @@ def test_a_500_while_recovering_keeps_the_recovery_going():
 
     backend = _Backend(_read_timeout, _server_error(), _ok(replayed=True))
     client, clock = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
     assert clock.waits == [1.0, 2.0]
 
@@ -731,7 +731,7 @@ def test_a_500_then_a_labelled_504_is_nothing_committed():
     )
     client, _ = _client(backend)
     with pytest.raises(FaultMavenNothingCommittedError):
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert backend.keys == [_KEY] * 2
 
 
@@ -747,7 +747,7 @@ def test_a_coded_503_mid_recovery_is_waited_out(code):
 
     backend = _Backend(_server_error(), _unavailable(code), _ok(replayed=True))
     client, clock = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert backend.keys == [_KEY] * 3
     assert clock.waits == [1.0, 5.0]
 
@@ -758,7 +758,7 @@ def test_a_coded_503_on_a_first_attempt_is_the_answer():
     backend = _Backend(_unavailable())
     client, clock = _client(backend)
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert (err.value.status_code, err.value.code) == (503, "DATABASE_UNAVAILABLE")
     assert len(backend.requests) == 1 and clock.waits == []
@@ -779,7 +779,7 @@ def test_a_rate_limit_mid_recovery_ends_as_the_unknown_outcome():
     )
     client, clock = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert clock.waits == [1.0]  # the backoff after the timeout; nothing after
     assert err.value.turn_cap is None
@@ -797,7 +797,7 @@ def test_a_rate_limit_mid_recovery_is_waited_as_stated():
         _ok(replayed=True),
     )
     client, clock = _client(backend)
-    assert client.submit_turn("c1", idempotency_key=_KEY, query="x").replayed
+    assert client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x").replayed
     assert clock.waits == [1.0, 120.0]
 
 
@@ -828,7 +828,7 @@ def test_the_turn_cap_mid_recovery_ends_at_once_with_the_cap_message():
     backend = _Backend(_read_timeout, _turn_cap())
     client, clock = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert clock.waits == [1.0]
     assert isinstance(err.value.turn_cap, TurnCapExceededError)
@@ -848,7 +848,7 @@ def test_the_turn_cap_on_a_first_attempt_says_so():
     backend = _Backend(_turn_cap())
     client, clock = _client(backend)
     with pytest.raises(TurnCapExceededError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert isinstance(err.value, FaultMavenRateLimitError)
     assert len(backend.requests) == 1 and clock.waits == []
     text = _turn.turn_error_text(err.value)
@@ -863,7 +863,7 @@ def test_the_turn_cap_mid_recovery_reaches_the_thread():
 
     _turn.run_turn_and_post(
         slack, client, _Store(case_id="c1"), channel="C1", thread_ts="TS1",
-        team_id="T1", text="why", idempotency_key=_KEY,
+        team_id="T1", text="why", requester=None, idempotency_key=_KEY,
     )
 
     texts = [u["text"] for u in slack.updates]
@@ -887,7 +887,7 @@ def test_a_later_refusal_is_reported_as_the_unknown_outcome(later):
     backend = _Backend(_read_timeout, later)
     client, _ = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert err.value.__cause__ is not None  # the later refusal, kept for the log
 
@@ -918,7 +918,7 @@ def test_answers_about_the_turn_still_end_a_recovery(later, expected):
     backend = _Backend(_read_timeout, later)
     client, _ = _client(backend)
     with pytest.raises(getattr(fm_client, expected)) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert len(backend.requests) == 2
 
@@ -944,7 +944,7 @@ def test_a_coded_502_is_the_apps_answer_not_a_gateway_timeout():
     backend = _Backend(_provider_error(), _ok())
     client, _ = _client(backend)
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert not isinstance(err.value, FaultMavenTimeoutError)
     assert (err.value.status_code, err.value.code) == (502, "LLM_PROVIDER_ERROR")
     assert len(backend.requests) == 1  # no recovery: nothing to recover
@@ -961,7 +961,7 @@ def test_a_coded_502_while_recovering_is_still_the_unknown_outcome():
     backend = _Backend(_read_timeout, _provider_error())
     client, _ = _client(backend)
     with pytest.raises(FaultMavenTimeoutError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == 2
     assert isinstance(err.value.__cause__, FaultMavenAPIError)
 
@@ -1005,7 +1005,7 @@ def test_shutdown_is_observed_on_the_paths_that_do_not_wait(script):
     client, _ = _client(backend)
     box[0] = client
     with pytest.raises((FaultMavenTimeoutError, FaultMavenNothingCommittedError)):
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert len(backend.requests) == len(steps)  # nothing sent after shutdown
 
 
@@ -1027,7 +1027,7 @@ def test_the_last_attempt_is_clamped_to_what_is_left_of_the_bound():
     backend = _Backend(slow, answer)
     client, clock = _client(backend, recovery=200.0, timeout=150.0)
     box[0] = clock
-    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     # 150 s, then a 1 s backoff: 49 s of the 200 s bound remain.
     assert timeouts == [150.0, 49.0]
 
@@ -1051,7 +1051,7 @@ def test_the_re_auth_re_post_gets_only_what_the_attempt_has_left():
     backend = _Backend(expired, answer)
     client, clock = _client(backend, token="", dev_login_username="admin", timeout=150.0)
     box[0] = clock
-    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert timeouts == [150.0, 50.0]
 
 
@@ -1062,7 +1062,7 @@ def test_the_backoff_doubles_and_caps():
     gateway = httpx.Response(502, text="bad gateway")
     backend = _Backend(*([gateway] * 8), _ok(replayed=True))
     client, clock = _client(backend)
-    client.submit_turn("c1", idempotency_key=_KEY, query="x")
+    client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert clock.waits == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
 
 
@@ -1079,7 +1079,7 @@ def test_a_labelled_terminal_case_is_closed():
     )
     client, _ = _client(backend)
     with pytest.raises(CaseTerminalError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x", pasted_content="log")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x", pasted_content="log")
     assert _turn.turn_error_text(err.value) == _turn.CASE_CLOSED_TEXT
     assert len(backend.requests) == 1
 
@@ -1088,7 +1088,7 @@ def test_an_unlabelled_409_is_not_a_terminal_case():
     backend = _Backend(httpx.Response(409, json={"detail": "something else"}))
     client, _ = _client(backend)
     with pytest.raises(FaultMavenAPIError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x", pasted_content="log")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x", pasted_content="log")
     assert not isinstance(err.value, CaseTerminalError)
     assert err.value.status_code == 409
     assert _turn.turn_error_text(err.value) != _turn.CASE_CLOSED_TEXT
@@ -1103,7 +1103,7 @@ def test_a_case_being_deleted_gets_its_own_reply():
     backend = _Backend(_conflict("CASE_DELETE_IN_PROGRESS"))
     client, _ = _client(backend)
     with pytest.raises(CaseDeleteInProgressError) as err:
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
     assert err.value.status_code == 409
     assert _turn.turn_error_text(err.value) == _turn.CASE_DELETING_TEXT
     assert len(backend.requests) == 1
@@ -1119,7 +1119,7 @@ def test_the_terminal_label_is_honored_on_the_poll_path(no_poll_sleep):
     client._http = httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler))
     FakeClock().install(client)
     with pytest.raises(CaseTerminalError):
-        client.submit_turn("c1", idempotency_key=_KEY, query="x")
+        client.submit_turn("c1", requester=None, idempotency_key=_KEY, query="x")
 
 
 # -- A4: shutdown ----------------------------------------------------------------
@@ -1137,6 +1137,7 @@ def test_shutdown_during_a_wait_ends_the_turn_with_the_timeout_text():
         args=(slack, client, _Store(case_id="c1")),
         kwargs=dict(
             channel="C1", thread_ts="TS1", team_id="T1", text="why",
+            requester=None,
             idempotency_key=_KEY,
         ),
         daemon=True,
