@@ -1146,7 +1146,8 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
     [
         (403, BindFailureReason.FORBIDDEN),
         (409, BindFailureReason.OTHER_REFUSAL),
-        (503, BindFailureReason.UNAVAILABLE),
+        (503, BindFailureReason.UNAVAILABLE_AT_BIND),
+        (429, BindFailureReason.UNAVAILABLE),
         (500, BindFailureReason.SERVER_ERROR),
         (400, BindFailureReason.OTHER_REFUSAL),
     ],
