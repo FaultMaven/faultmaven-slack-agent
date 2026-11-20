@@ -516,6 +516,10 @@ class BindStage(Enum):
 
 
 _ASK_FOR_LOGS = "Ask a FaultMaven administrator to check the server logs for the reason."
+_UNAVAILABLE = (
+    "FaultMaven is unavailable right now. Try again in a few minutes; if it "
+    "keeps failing, ask your FaultMaven administrator."
+)
 
 
 class BindFailureReason(Enum):
@@ -535,12 +539,10 @@ class BindFailureReason(Enum):
         "FaultMaven did not accept the sign-in for this connection. Re-run the "
         "installation to sign in again.",
     )
-    UNAVAILABLE = (
-        BindStage.BEFORE_BIND,
-        True,
-        "FaultMaven is unavailable right now. Try again in a few minutes; if it "
-        "keeps failing, ask your FaultMaven administrator.",
-    )
+    UNAVAILABLE = (BindStage.BEFORE_BIND, True, _UNAVAILABLE)
+    #: A 503 from the bind POST with no published code: a gateway can answer
+    #: it after it forwarded the request, so the bind may have been written.
+    UNAVAILABLE_AT_BIND = (BindStage.UNKNOWN, True, _UNAVAILABLE)
     NOT_SET_UP = (
         BindStage.BEFORE_BIND,
         False,
@@ -660,7 +662,9 @@ def _bind_refusal(status: int, code: str | None) -> BindFailureReason:
         return known
     if status == 403:
         return BindFailureReason.FORBIDDEN
-    if status in (429, 503):
+    if status == 503:
+        return BindFailureReason.UNAVAILABLE_AT_BIND
+    if status == 429:
         return BindFailureReason.UNAVAILABLE
     if status >= 500:
         # The bind may have been written before the error: a gateway's 502 or

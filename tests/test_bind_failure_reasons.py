@@ -4,7 +4,9 @@
 Every raise site, and every published ``x-error-code``, is driven through the
 real ``/faultmaven/callback`` route, client and ``complete_bind``. Each asserts
 the exact message and footer: no status alone picks a specific claim, and no
-failure after the bind, or of unknown outcome, says nothing was changed.
+failure after the bind, or of unknown outcome, says nothing was changed. A
+503 from the bind POST without a published code is of unknown outcome: a
+gateway can answer it after it forwarded the request.
 """
 
 from __future__ import annotations
@@ -41,13 +43,17 @@ PUBLISHED_CODES = {
 }
 
 LOGS = "Ask a FaultMaven administrator to check the server logs for the reason."
+UNAVAILABLE = (
+    "FaultMaven is unavailable right now. Try again in a few minutes; if it keeps "
+    "failing, ask your FaultMaven administrator."
+)
 MESSAGE = {
     "unreachable": "FaultMaven could not be reached. Try again in a few minutes; if it "
     "keeps failing, ask your FaultMaven administrator to check that FaultMaven is up.",
     "sign-in": "FaultMaven did not accept the sign-in for this connection. Re-run the "
     "installation to sign in again.",
-    "unavailable": "FaultMaven is unavailable right now. Try again in a few minutes; if "
-    "it keeps failing, ask your FaultMaven administrator.",
+    "unavailable": UNAVAILABLE,
+    "unavailable-at-bind": UNAVAILABLE,
     "not-set-up": "This FaultMaven deployment is not set up to connect Slack workspaces "
     "yet. Ask your FaultMaven administrator to finish its setup.",
     "403": f"FaultMaven refused to let your account connect this workspace. {LOGS}",
@@ -83,6 +89,7 @@ FOOTER = {
 }
 ROW = {  # message -> footer, one per row of the table
     "unreachable": "retry", "sign-in": "retry", "unavailable": "retry",
+    "unavailable-at-bind": "unknown",
     "not-set-up": "fix-first", "403": "fix-first", "other-name": "fix-first",
     "not-admin": "fix-first", "name-taken": "fix-first", "not-here": "fix-first",
     "other": "fix-first", "interrupted": "unknown", "server-error": "unknown",
@@ -148,8 +155,8 @@ BIND = [
         ("403", _status(403), "403"),
         ("409", _status(409, json={"detail": "SENTINEL"}), "other"),
         ("409-unknown-code", _status(409, code="IDEMPOTENCY_IN_FLIGHT"), "other"),
-        ("503", _status(503), "unavailable"),
-        ("503-unknown-code", _status(503, code="SOMETHING_ELSE"), "unavailable"),
+        ("503", _status(503), "unavailable-at-bind"),
+        ("503-unknown-code", _status(503, code="SOMETHING_ELSE"), "unavailable-at-bind"),
         ("429", _status(429), "unavailable"),
         ("400", _status(400, json={"detail": "SENTINEL"}), "other"),
         ("422", _status(422), "other"),
