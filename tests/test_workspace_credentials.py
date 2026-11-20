@@ -38,6 +38,7 @@ from sqlalchemy import create_engine
 
 from binding import bind_failure_message
 from faultmaven.client import (
+    BindFailureReason,
     FaultMavenClient,
     FaultMavenCredentialError,
     FaultMavenWorkspaceUnlinkedError,
@@ -987,8 +988,8 @@ def test_the_code_exchange_returns_each_token_as_a_string(body, expected):
     [pytest.param('[{"access_token": "admin-at"}]', id="list"), pytest.param("null", id="null")],
 )
 def test_a_json_exchange_body_that_is_not_an_object_is_a_typed_failure(body):
-    """Typed like the non-JSON arm, not a bare ``AttributeError``; not
-    browser-safe, and the body stays out of the message."""
+    """Typed like the non-JSON arm, not a bare ``AttributeError``, and the body
+    stays out of the message."""
     client = bind_client_for(lambda r: httpx.Response(200, text=body))
 
     with pytest.raises(WorkspaceBindError, match="not an object") as refused:
@@ -996,7 +997,7 @@ def test_a_json_exchange_body_that_is_not_an_object_is_a_typed_failure(body):
             code="c", code_verifier="v", redirect_uri="https://x/cb"
         )
 
-    assert refused.value.page_message is None
+    assert refused.value.reason is BindFailureReason.OTHER_REFUSAL
     assert "admin-at" not in str(refused.value)
 
 
@@ -1141,22 +1142,18 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
 
 
 @pytest.mark.parametrize(
-    ("status", "fragment", "retryable", "page"),
+    ("status", "reason"),
     [
-        # ``page`` is what the bind page shows: None means the message itself,
-        # which only a raise site that wrote it for the admin may ask for.
-        (403, "connect a workspace", False, None),
-        (409, "already bound", False, "already connected"),
-        (503, "not configured", True, None),
-        (500, "refused the bind", True, "could not connect this workspace"),
-        (400, "refused the bind", False, "could not connect this workspace"),
+        (403, BindFailureReason.FORBIDDEN),
+        (409, BindFailureReason.OTHER_REFUSAL),
+        (503, BindFailureReason.UNAVAILABLE),
+        (500, BindFailureReason.SERVER_ERROR),
+        (400, BindFailureReason.OTHER_REFUSAL),
     ],
 )
-def test_each_bind_refusal_is_typed_and_advises_correctly(
-    status, fragment, retryable, page
-):
-    """`retryable` decides whether a person is told to try again — wrong on the
-    403 (the likeliest failure) would send an admin round a loop forever."""
+def test_each_bind_refusal_is_typed_and_advises_correctly(status, reason):
+    """An uncoded status picks only its own row; ``retryable`` is the reason's.
+    The backend's body stays in the log."""
     client = bind_client_for(
         lambda r: httpx.Response(status, json={"detail": "because"})
     )
@@ -1166,22 +1163,17 @@ def test_each_bind_refusal_is_typed_and_advises_correctly(
             admin_access_token="a", slack_team_id="T1", team_name="Ops"
         )
 
-    assert fragment in str(caught.value)
+    assert "because" in str(caught.value)
     assert caught.value.status_code == status
-    assert caught.value.retryable is retryable
-    shown = bind_failure_message(caught.value)
-    if page is None:
-        assert shown == str(caught.value)
-    else:
-        assert page in shown
-        assert "because" not in shown  # the backend's body stays in the log
+    assert caught.value.reason is reason
+    assert caught.value.retryable is reason.retryable
+    assert "because" not in "".join(bind_failure_message(caught.value))
 
 
 @pytest.mark.parametrize("missing", ["refresh_token", "team_id"])
 def test_an_incomplete_bind_response_is_reported_as_unrecoverable(missing):
-    """The server has already created the account and team by now, and the
-    credential is issued once — so a retry is refused as already-bound. The
-    message must not invite one."""
+    """The server has already created the account and team by now, and a re-run
+    would get the same unusable answer, so the advice is a re-issue."""
     full = {
         "slack_team_id": "T1",
         "team_id": "fmteam", "refresh_token": jwt_with_enterprise("ent-a"),

@@ -50,7 +50,7 @@ from urllib.parse import urlencode
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from faultmaven import FaultMavenClient, WorkspaceBindError
+from faultmaven import BindFailureReason, FaultMavenClient, WorkspaceBindError
 from pending_binds import PendingBind
 
 logger = logging.getLogger("faultmaven.slack.binding")
@@ -136,7 +136,10 @@ def complete_bind(
             exc.issued = ("", "")
             raise
         if not access:
-            raise WorkspaceBindError("code exchange returned no access_token")
+            raise WorkspaceBindError(
+                "code exchange returned no access_token",
+                reason=BindFailureReason.OTHER_REFUSAL,
+            )
         binding = fm.bind_workspace(
             admin_access_token=access,
             slack_team_id=record.team_id,
@@ -160,26 +163,26 @@ def complete_bind(
             )
         except Exception as exc:
             # The server-side bind already succeeded and its credential is
-            # issued once, so this is not a retryable failure: the next attempt
-            # is refused as already-bound. Say exactly that, loudly, instead of
+            # issued once, so it is lost. A re-run of the install, once the
+            # store works again, issues a fresh one. Say so, loudly, instead of
             # letting the caller tell an admin "nothing was changed".
             logger.error(
                 "Workspace %s was bound in FaultMaven (enterprise %s, team %s) "
-                "but its credential could not be stored locally: %s. The "
-                "credential is issued once and is now lost; re-issue it for "
-                "service account %s.",
+                "but its credential could not be stored locally (%s). The "
+                "credential is issued once and is now lost; re-run the install "
+                "once the store works, or re-issue it for service account %s.",
                 record.team_id,
                 binding.fm_enterprise_id,
                 binding.team_id,
-                exc,
+                # The class only: a database error's text quotes its bound
+                # parameters, the credential among them.
+                type(exc).__name__,
                 binding.service_account_username,
             )
             raise WorkspaceBindError(
-                "This workspace was connected in FaultMaven, but the agent could "
-                "not store its credential — so it cannot be used yet, and "
-                "re-installing will not fix it. Ask a FaultMaven administrator "
-                "to re-issue the workspace credential.",
-                browser_safe=True,
+                "the bound workspace's credential could not be stored: "
+                f"{type(exc).__name__}",
+                reason=BindFailureReason.CREDENTIAL_NOT_STORED,
             ) from exc
 
         # The client caches a credential per workspace, and a re-bind replaces
@@ -234,39 +237,21 @@ def _revoke(fm: FaultMavenClient, token: str, *, hint: str) -> bool:
         return False
 
 
-def bind_failure_message(exc: Exception) -> str:
-    """What to show the admin in the browser when a bind fails.
+def bind_failure_message(exc: Exception) -> tuple[str, str]:
+    """The ``(message, footer)`` the admin's page shows when a bind fails.
 
-    Deliberately says what to do next rather than what went wrong internally:
-    the reader is an administrator in a browser, not an operator with logs. The
-    detail is not lost — the caller logs the exception itself.
-
-    A bind failure's own message is shown only when its raise site declared it
-    written for a browser (``page_message``). Every other one may carry library
-    or backend text, so it gets fixed text here. The exception's string is never
-    read: that would put whatever it carries back on the page.
+    Both come from the failure's declared reason, never from its status or its
+    string, which may carry library or backend text and stays in the log. An
+    exception that is not a bind failure has no declared stage, so its footer
+    claims nothing about what FaultMaven did.
     """
 
-    if isinstance(exc, WorkspaceBindError):
-        if exc.page_message is not None:
-            return exc.page_message
-        if exc.status_code == 409:
-            # Its message embeds up to 300 characters of the backend's raw
-            # response, which on a cross-tenant conflict can name another
-            # tenant: right for the log, wrong on a page.
-            return (
-                "This Slack workspace is already connected to FaultMaven. If "
-                "that is not the connection you expect, a FaultMaven "
-                "administrator has to disconnect it first."
-            )
-        return (
-            "FaultMaven could not connect this workspace. Ask a FaultMaven "
-            "administrator to check the server logs for the reason."
-        )
-    return (
-        "Something went wrong finishing the connection to FaultMaven. "
-        "Re-install the app to try again."
+    reason = (
+        exc.reason
+        if isinstance(exc, WorkspaceBindError)
+        else BindFailureReason.UNEXPLAINED
     )
+    return reason.message, reason.footer
 
 
 class InstallerAuthority(Enum):

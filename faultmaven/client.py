@@ -46,6 +46,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Callable
 
 import httpx
@@ -471,20 +472,210 @@ class _CredentialRejected(FaultMavenCredentialError):
     """
 
 
+class BindStage(Enum):
+    """How far a failed bind got in FaultMaven, which the page's footer reports."""
+
+    #: FaultMaven changed nothing: the bind was refused or never sent.
+    BEFORE_BIND = "before_bind"
+    #: FaultMaven created the workspace; the agent failed after it answered.
+    AFTER_BIND = "after_bind"
+    #: Either could be true: sent with no answer, a server error, or an answer
+    #: that is not the route's own.
+    UNKNOWN = "unknown"
+
+    def footer(self, *, retryable: bool) -> str:
+        """The page's footer for a failure at this stage.
+
+        After the bind, the one failure a re-run recovers is a credential the
+        agent could not store: a re-run issues a fresh one.
+        """
+
+        if self is BindStage.UNKNOWN:
+            return (
+                "FaultMaven may or may not have connected the workspace. "
+                "Re-running the installation is safe: it either finishes the "
+                "connection or says what is in the way."
+            )
+        if self is BindStage.AFTER_BIND:
+            if retryable:
+                return (
+                    "The workspace was created in FaultMaven. Once the agent can "
+                    "store credentials again, re-run the installation: it issues "
+                    "a fresh credential."
+                )
+            return (
+                "The workspace was created in FaultMaven, so re-running the "
+                "installation will not fix this."
+            )
+        if retryable:
+            return "Nothing was changed in FaultMaven. Re-run the installation to try again."
+        return (
+            "Nothing was changed in FaultMaven. Re-running the installation won't "
+            "change this until it's fixed."
+        )
+
+
+_ASK_FOR_LOGS = "Ask a FaultMaven administrator to check the server logs for the reason."
+
+
+class BindFailureReason(Enum):
+    """Why a bind failed: the one table of its stage, whether a re-run can help,
+    and what the admin is told. The page shows only this, never a status or
+    backend text."""
+
+    UNREACHABLE = (
+        BindStage.BEFORE_BIND,
+        True,
+        "FaultMaven could not be reached. Try again in a few minutes; if it keeps "
+        "failing, ask your FaultMaven administrator to check that FaultMaven is up.",
+    )
+    SIGN_IN_REFUSED = (
+        BindStage.BEFORE_BIND,
+        True,
+        "FaultMaven did not accept the sign-in for this connection. Re-run the "
+        "installation to sign in again.",
+    )
+    UNAVAILABLE = (
+        BindStage.BEFORE_BIND,
+        True,
+        "FaultMaven is unavailable right now. Try again in a few minutes; if it "
+        "keeps failing, ask your FaultMaven administrator.",
+    )
+    NOT_SET_UP = (
+        BindStage.BEFORE_BIND,
+        False,
+        "This FaultMaven deployment is not set up to connect Slack workspaces yet. "
+        "Ask your FaultMaven administrator to finish its setup.",
+    )
+    FORBIDDEN = (
+        BindStage.BEFORE_BIND,
+        False,
+        f"FaultMaven refused to let your account connect this workspace. {_ASK_FOR_LOGS}",
+    )
+    BOUND_UNDER_OTHER_NAME = (
+        BindStage.BEFORE_BIND,
+        False,
+        "This Slack workspace is already connected to one of your FaultMaven teams, "
+        "under a different name. Rename that team to match, or disconnect it, then "
+        "re-run the installation.",
+    )
+    BOUND_TO_TEAM_NOT_ADMINISTERED = (
+        BindStage.BEFORE_BIND,
+        False,
+        "This Slack workspace is already connected to a FaultMaven team you don't "
+        "administer. Ask that team's administrator to change it.",
+    )
+    NAME_TAKEN = (
+        BindStage.BEFORE_BIND,
+        False,
+        "FaultMaven already has a team or account with the name this workspace "
+        "needs. Ask a FaultMaven administrator to free the name.",
+    )
+    #: Neutral on purpose: FaultMaven does not confirm another tenant holds it.
+    NOT_BINDABLE_HERE = (
+        BindStage.BEFORE_BIND,
+        False,
+        f"This workspace can't be connected here. {_ASK_FOR_LOGS}",
+    )
+    OTHER_REFUSAL = (
+        BindStage.BEFORE_BIND,
+        False,
+        f"FaultMaven could not connect this workspace. {_ASK_FOR_LOGS}",
+    )
+    INTERRUPTED = (
+        BindStage.UNKNOWN,
+        True,
+        "The connection to FaultMaven was interrupted before it finished.",
+    )
+    SERVER_ERROR = (
+        BindStage.UNKNOWN,
+        True,
+        "FaultMaven hit an error while connecting this workspace.",
+    )
+    CREDENTIAL_NOT_STORED = (
+        BindStage.AFTER_BIND,
+        True,
+        "This workspace was connected in FaultMaven, but the agent could not store "
+        "its credential, so it can't be used yet.",
+    )
+    RESPONSE_UNUSABLE = (
+        BindStage.AFTER_BIND,
+        False,
+        "This workspace was connected in FaultMaven, but the agent could not keep "
+        "its credential, so it can't be used yet. Ask a FaultMaven administrator "
+        "to re-issue the workspace credential.",
+    )
+    #: An answer that is not the route's own (a redirect, or a 2xx no route
+    #: would send), or an exception other than a bind failure.
+    UNEXPLAINED = (
+        BindStage.UNKNOWN,
+        True,
+        "Something went wrong finishing the connection to FaultMaven.",
+    )
+
+    def __init__(self, stage: BindStage, retryable: bool, message: str) -> None:
+        self.stage = stage
+        self.retryable = retryable
+        self.message = message
+
+    @property
+    def footer(self) -> str:
+        return self.stage.footer(retryable=self.retryable)
+
+
+#: The bind route's published ``x-error-code`` values, each at its status. A
+#: code missing here, or none, falls to its status's row, which makes no
+#: specific claim: such a response may not have come from the route at all.
+_BIND_ERROR_CODES: dict[tuple[int, str], BindFailureReason] = {
+    (403, "INSTALLER_NOT_IN_ENTERPRISE"): BindFailureReason.FORBIDDEN,
+    (409, "WORKSPACE_BOUND_UNDER_OTHER_TEAM_NAME"): BindFailureReason.BOUND_UNDER_OTHER_NAME,
+    (409, "NOT_ADMIN_OF_BOUND_TEAM"): BindFailureReason.BOUND_TO_TEAM_NOT_ADMINISTERED,
+    (409, "TEAM_NAME_TAKEN"): BindFailureReason.NAME_TAKEN,
+    (409, "WORKSPACE_NOT_BINDABLE_HERE"): BindFailureReason.NOT_BINDABLE_HERE,
+    (500, "CREDENTIAL_NOT_MINTED"): BindFailureReason.SERVER_ERROR,
+    (500, "TEAM_MEMBERSHIP_NOT_WRITTEN"): BindFailureReason.SERVER_ERROR,
+    (500, "BIND_AUDIT_NOT_WRITTEN"): BindFailureReason.SERVER_ERROR,
+    (500, "BIND_FAILED"): BindFailureReason.SERVER_ERROR,
+    (503, "MULTI_TENANCY_NOT_ENABLED"): BindFailureReason.NOT_SET_UP,
+    (503, "USER_STORE_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
+    (503, "OAUTH_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
+}
+
+
+#: The transport failures that prove the request never reached FaultMaven.
+_NEVER_SENT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+    httpx.ProxyError,
+)
+
+
+def _bind_refusal(status: int, code: str | None) -> BindFailureReason:
+    """The reason for a bind POST's error status, from its code where known."""
+
+    known = _BIND_ERROR_CODES.get((status, code or ""))
+    if known is not None:
+        return known
+    if status == 403:
+        return BindFailureReason.FORBIDDEN
+    if status in (429, 503):
+        return BindFailureReason.UNAVAILABLE
+    if status >= 500:
+        # The bind may have been written before the error: a gateway's 502 or
+        # 504 says nothing of what happened behind it.
+        return BindFailureReason.SERVER_ERROR
+    return BindFailureReason.OTHER_REFUSAL
+
+
 class WorkspaceBindError(FaultMavenError):
     """The workspace could not be bound to a FaultMaven Team.
 
-    ``retryable`` is False for the refusals a person cannot fix by trying again
-    — chiefly the authority one. The bind needs BOTH ``ORG_MANAGE_USERS`` and
-    ``ORG_MANAGE_SETTINGS`` (the second because it creates a Team), and an admin
-    holding only the first completes the OAuth consent happily and is refused
-    here. That path has to be told what is wrong, not offered a retry.
-
-    ``browser_safe`` is declared by the raise site, never inferred: True means
-    the message was written for the admin in a browser and carries no backend
-    or library text. Only then is it kept as ``page_message``, the text the bind
-    page may show; otherwise ``page_message`` is None and the page shows fixed
-    text. ``str()`` is the full message either way, for the log.
+    ``reason`` is declared by the raise site, never inferred from a status or a
+    message: the page's advice and footer come from it alone, and ``retryable``
+    is the reason's. ``str()`` is the full message, for the log only: it may
+    carry backend or library text.
 
     ``issued`` is the ``(access, refresh)`` a refused code exchange parsed, for
     ``complete_bind`` to revoke; it clears them once read. It is kept out of
@@ -495,16 +686,18 @@ class WorkspaceBindError(FaultMavenError):
         self,
         message: str,
         *,
+        reason: BindFailureReason,
         status_code: int = 0,
-        retryable: bool = False,
-        browser_safe: bool = False,
         issued: tuple[str, str] = ("", ""),
     ) -> None:
         super().__init__(message)
+        self.reason = reason
         self.status_code = status_code
-        self.retryable = retryable
-        self.page_message = message if browser_safe else None
         self.issued = issued
+
+    @property
+    def retryable(self) -> bool:
+        return self.reason.retryable
 
 
 @dataclass(frozen=True, slots=True)
@@ -2080,21 +2273,27 @@ class FaultMavenClient:
                     "client_id": self._oauth_client_id,
                 },
             )
-        except httpx.HTTPError as exc:
+        except _NEVER_SENT as exc:
             raise WorkspaceBindError(
                 f"could not reach FaultMaven to exchange the code: {exc}",
-                retryable=True,
+                reason=BindFailureReason.UNREACHABLE,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WorkspaceBindError(
+                f"the code exchange got no answer from FaultMaven: {exc}",
+                reason=BindFailureReason.INTERRUPTED,
             ) from exc
         if resp.status_code != 200:
             try:
-                issued = self._issued_tokens(resp.json())
+                refusal = resp.json()
             except ValueError:
-                issued = ("", "")
+                refusal = None
             raise WorkspaceBindError(
                 f"FaultMaven refused the authorization code "
                 f"({resp.status_code}): {self._error_detail(resp)}",
+                reason=self._exchange_refusal(resp.status_code, refusal),
                 status_code=resp.status_code,
-                issued=issued,
+                issued=self._issued_tokens(refusal),
             )
         try:
             body = resp.json()
@@ -2103,14 +2302,28 @@ class FaultMavenClient:
             # token endpoint. Typed like every other failure here so the caller
             # renders a page instead of a bare ValueError.
             raise WorkspaceBindError(
-                f"code exchange returned a non-JSON body: {exc}"
+                f"code exchange returned a non-JSON body: {exc}",
+                reason=BindFailureReason.OTHER_REFUSAL,
             ) from exc
         if not isinstance(body, dict):
             # Valid JSON, but not a token response: a list, a string, a null.
             raise WorkspaceBindError(
-                "code exchange returned a JSON body that is not an object"
+                "code exchange returned a JSON body that is not an object",
+                reason=BindFailureReason.OTHER_REFUSAL,
             )
         return self._issued_tokens(body)
+
+    @staticmethod
+    def _exchange_refusal(status: int, body: Any) -> BindFailureReason:
+        """The reason for a refused code exchange. Only RFC 6749's
+        ``invalid_grant`` says the sign-in itself was not accepted."""
+
+        grant_error = body.get("error") if isinstance(body, dict) else None
+        if status in (400, 401) and grant_error == "invalid_grant":
+            return BindFailureReason.SIGN_IN_REFUSED
+        if status == 429 or status >= 500:
+            return BindFailureReason.UNAVAILABLE
+        return BindFailureReason.OTHER_REFUSAL
 
     @staticmethod
     def _issued_tokens(body: Any) -> tuple[str, str]:
@@ -2159,66 +2372,56 @@ class FaultMavenClient:
                 json=payload,
                 headers=self._auth_header(admin_access_token),
             )
-        except httpx.HTTPError as exc:
+        except _NEVER_SENT as exc:
             raise WorkspaceBindError(
                 f"could not reach FaultMaven to bind the workspace: {exc}",
-                retryable=True,
+                reason=BindFailureReason.UNREACHABLE,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WorkspaceBindError(
+                f"the bind request got no answer from FaultMaven: {exc}",
+                reason=BindFailureReason.INTERRUPTED,
             ) from exc
 
-        if resp.status_code == 403:
-            raise WorkspaceBindError(
-                "Your FaultMaven account can sign in but is not allowed to "
-                "connect a workspace. Ask a FaultMaven administrator to do it, "
-                "or to grant you the permission.",
-                status_code=403,
-                browser_safe=True,
-            )
-        if resp.status_code == 409:
-            raise WorkspaceBindError(
-                f"This Slack workspace is already bound elsewhere: "
-                f"{self._error_detail(resp)}",
-                status_code=409,
-            )
-        if resp.status_code == 503:
-            raise WorkspaceBindError(
-                "FaultMaven is not configured for team management, so this "
-                "workspace cannot be bound yet.",
-                status_code=503,
-                retryable=True,
-                browser_safe=True,
-            )
         if resp.status_code >= 400:
+            code = resp.headers.get("x-error-code") or None
             raise WorkspaceBindError(
-                f"FaultMaven refused the bind ({resp.status_code}): "
+                f"FaultMaven refused the bind ({resp.status_code}, code {code}): "
                 f"{self._error_detail(resp)}",
+                reason=_bind_refusal(resp.status_code, code),
                 status_code=resp.status_code,
-                retryable=resp.status_code >= 500,
             )
 
-        # Past this point the server has ALREADY created the account, the team
-        # and the memberships, and minted a once-only credential. Anything we
-        # reject from here is unrecoverable by retry — the next attempt gets a
-        # 409 — so every field the caller depends on is checked here, where the
-        # error can still name what happened, rather than deeper where it would
-        # surface as an AttributeError on a half-built binding.
+        # A redirect, or a 2xx that is not a JSON object carrying either field
+        # the route returns, is not the route's answer (a proxy's page): it
+        # proves nothing about whether the bind ran behind it.
         try:
-            body = resp.json()
-        except ValueError as exc:
+            body = resp.json() if 200 <= resp.status_code < 300 else None
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not {"refresh_token", "team_id"} & body.keys():
             raise WorkspaceBindError(
-                "The workspace was created in FaultMaven, but its response could "
-                "not be read, so the credential is lost. An administrator must "
-                "re-issue it.",
+                f"the bind got a {resp.status_code} that is not the route's answer",
+                reason=BindFailureReason.UNEXPLAINED,
                 status_code=resp.status_code,
-            ) from exc
+            )
 
+        # Past this point the server has created the account, the team and the
+        # memberships, and minted a once-only credential. A re-run of the
+        # install issues a fresh one, but an answer this agent cannot use would
+        # come back the same, so every field the caller depends on is checked
+        # here, where the error can still name what happened.
         missing = [
-            name for name in ("refresh_token", "team_id") if not body.get(name)
+            name
+            for name in ("refresh_token", "team_id")
+            if not (isinstance(body.get(name), str) and body[name])
         ]
         if missing:
             raise WorkspaceBindError(
                 "The workspace was created in FaultMaven, but its response was "
-                f"missing {', '.join(missing)}, so it cannot be used here. An "
-                "administrator must re-issue the workspace credential.",
+                f"missing {', '.join(missing)} (or not a string), so it cannot be "
+                "used here. An administrator must re-issue the workspace credential.",
+                reason=BindFailureReason.RESPONSE_UNUSABLE,
                 status_code=resp.status_code,
             )
         refresh = body["refresh_token"]
@@ -2238,6 +2441,7 @@ class FaultMavenClient:
                 "issued names no enterprise, so this agent cannot tell which "
                 "tenant the workspace was admitted to — and will not guess. An "
                 "administrator must re-issue the workspace credential.",
+                reason=BindFailureReason.RESPONSE_UNUSABLE,
                 status_code=resp.status_code,
             )
         return WorkspaceBinding(

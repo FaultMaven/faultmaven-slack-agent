@@ -37,6 +37,7 @@ from starlette.concurrency import run_in_threadpool
 import install_pages
 from app import build_app, shutdown_runtime
 from binding import bind_failure_message, complete_bind
+from faultmaven import BindStage
 from config import get_settings
 from pending_binds import BIND_COOKIE_NAME
 
@@ -191,7 +192,9 @@ def create_fastapi_app() -> FastAPI:
             return _html(
                 install_pages.error_page(
                     "This connection link is no longer valid. Re-install "
-                    "FaultMaven in Slack to start again."
+                    "FaultMaven in Slack to start again.",
+                    # A used link may be this bind's own, already finished.
+                    BindStage.UNKNOWN.footer(retryable=True),
                 ),
                 status=400,
                 clear_cookie=True,
@@ -202,7 +205,8 @@ def create_fastapi_app() -> FastAPI:
             return _html(
                 install_pages.error_page(
                     "The workspace was not connected, because access was not "
-                    "granted in FaultMaven."
+                    "granted in FaultMaven.",
+                    BindStage.BEFORE_BIND.footer(retryable=True),
                 ),
                 status=200,
                 clear_cookie=True,
@@ -221,7 +225,7 @@ def create_fastapi_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001 — every failure is a page, not a 500
             logger.warning("Workspace bind failed for %s: %s", record.team_id, exc)
             return _html(
-                install_pages.error_page(bind_failure_message(exc)),
+                install_pages.error_page(*bind_failure_message(exc)),
                 status=200,
                 clear_cookie=True,
             )

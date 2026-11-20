@@ -41,7 +41,12 @@ from binding import (
     complete_bind,
     installer_authority,
 )
-from faultmaven import FaultMavenClient, WorkspaceBindError, WorkspaceBinding
+from faultmaven import (
+    BindFailureReason,
+    FaultMavenClient,
+    WorkspaceBindError,
+    WorkspaceBinding,
+)
 from pending_binds import BIND_COOKIE_NAME, PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
 
@@ -255,7 +260,11 @@ def test_the_admin_tokens_are_revoked_even_when_the_bind_is_refused(tmp_path):
     pending, creds = make_stores(tmp_path)
     r = open_bind(pending)
     record = pending.consume(state=r.state, bind_id=r.bind_id)
-    fm = FakeFM(bind_error=WorkspaceBindError("needs manage settings", status_code=403))
+    fm = FakeFM(
+        bind_error=WorkspaceBindError(
+            "refused", reason=BindFailureReason.FORBIDDEN, status_code=403
+        )
+    )
 
     with pytest.raises(WorkspaceBindError):
         complete_bind(
@@ -368,6 +377,8 @@ def test_the_callback_refuses_a_forwarded_link_with_no_cookie(bind_client):
 
     assert resp.status_code == 400
     assert "no longer valid" in resp.text
+    # A used link may be this bind's own, finished: claim nothing either way.
+    assert "may or may not have connected" in resp.text
 
 
 def test_the_callback_refuses_an_unknown_cookie(bind_client):
@@ -394,6 +405,7 @@ def test_a_declined_consent_reports_plainly_and_spends_the_link(bind_client, tmp
 
     assert resp.status_code == 200
     assert "access was not granted" in resp.text
+    assert "Nothing was changed in FaultMaven." in resp.text
     # The link is spent: declining must not leave a redeemable record behind.
     assert pending.consume(state=record.state, bind_id=record.bind_id) is None
 
@@ -465,11 +477,10 @@ def test_a_rebind_drops_the_cached_credential(tmp_path):
     assert fm.forgotten == ["T-REBOUND"]
 
 
-def test_a_local_store_failure_after_the_server_bind_is_reported_as_final(tmp_path):
+def test_a_local_store_failure_after_the_server_bind_is_reported_as_after_it(tmp_path):
     """The server-side bind already succeeded and its credential is issued once,
-    so this is NOT retryable — the next attempt is refused as already-bound.
-    Telling the admin 'nothing was changed, try again' would be false and a dead
-    end."""
+    so it is lost. Telling the admin 'nothing was changed' would be false; a
+    re-run of the install, once the store works, issues a fresh credential."""
     pending, creds = make_stores(tmp_path)
     r = open_bind(pending, team_id="T-LOST")
     record = pending.consume(state=r.state, bind_id=r.bind_id)
@@ -486,11 +497,7 @@ def test_a_local_store_failure_after_the_server_bind_is_reported_as_final(tmp_pa
             code="c", redirect_uri="https://x/cb",
         )
 
-    message = str(caught.value)
-    assert "re-installing will not fix it" in message
-    assert "re-issue" in message
-    # Written for the admin, so the page shows it as raised.
-    assert bind_failure_message(caught.value) == message
+    assert caught.value.reason is BindFailureReason.CREDENTIAL_NOT_STORED
     # And the borrowed admin authority is still given back.
     assert ("admin-refresh", "refresh_token") in fm.revoked
 
@@ -502,14 +509,15 @@ def test_a_409_does_not_leak_another_tenants_details_into_the_page(tmp_path):
     exc = WorkspaceBindError(
         "This Slack workspace is already bound elsewhere: enterprise "
         "ent-someone-else team 'Their Secret Project'",
+        reason=BindFailureReason.NOT_BINDABLE_HERE,
         status_code=409,
     )
 
-    message = bind_failure_message(exc)
+    message, footer = bind_failure_message(exc)
 
-    assert "ent-someone-else" not in message
-    assert "Their Secret Project" not in message
-    assert "already connected" in message
+    assert "ent-someone-else" not in message + footer
+    assert "Their Secret Project" not in message + footer
+    assert "can't be connected here" in message
 
 
 #: Stands in for whatever a library or the backend puts in an error: a cluster
@@ -547,7 +555,7 @@ def _tokens(request):
             False,
             id="exchange-non-json",
         ),
-        pytest.param(_tokens, _timed_out, BIND_PATH, True, id="bind-unreachable"),
+        pytest.param(_tokens, _timed_out, BIND_PATH, True, id="bind-no-answer"),
         pytest.param(
             lambda r: httpx.Response(200, json={"refresh_token": "admin-rt"}),
             None,
@@ -620,7 +628,6 @@ def test_the_bind_page_shows_no_library_or_backend_text(
     assert SENTINEL not in resp.text
     assert "Expecting value" not in resp.text  # json's decode error
     assert "access_token" not in resp.text  # complete_bind's own wording
-    assert "could not connect this workspace" in resp.text
 
 
 def _refused_through_real_client(tmp_path, token_response, bind_response=None):
@@ -722,12 +729,13 @@ def test_a_refresh_token_httpx_cannot_send_still_lets_the_access_token_be_revoke
     assert "admin-at" not in caplog.text and "ud800" not in caplog.text
 
 
-def test_a_bind_failure_whose_raise_site_vouched_for_nothing_shows_fixed_text():
-    """Fail closed: a raise site that declares nothing gets fixed text, whatever
-    its status. The default status 0 used to mean "show it verbatim"."""
-    page = bind_failure_message(WorkspaceBindError("internal detail"))
+def test_a_bind_failure_page_never_shows_the_exceptions_own_text():
+    """The page reads the declared reason only; the message is for the log."""
+    page = bind_failure_message(
+        WorkspaceBindError("internal detail", reason=BindFailureReason.OTHER_REFUSAL)
+    )
 
-    assert "internal detail" not in page
+    assert "internal detail" not in "".join(page)
 
 
 def test_the_consent_scope_names_what_the_grant_actually_does():

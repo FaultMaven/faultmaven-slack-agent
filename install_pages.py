@@ -90,14 +90,17 @@ def bound_page(*, workspace_name: str, fm_enterprise_id: str) -> str:
     return _page("Workspace connected", body)
 
 
-def error_page(message: str) -> str:
-    """A refusal or failure, in terms an administrator can act on."""
+def error_page(message: str, footer: str) -> str:
+    """A refusal or failure, in terms an administrator can act on.
+
+    ``footer`` says what FaultMaven did; each caller declares it, because a
+    failure after the bind, or one whose outcome is unknown, changed something.
+    """
 
     body = f"""
 <h1 class="bad">Couldn't connect the workspace</h1>
 <p>{escape(message)}</p>
-<p class="muted">Nothing was changed in FaultMaven. Slack still has the app
-   installed — re-run the installation to try again.</p>"""
+<p class="muted">{escape(footer)}</p>"""
     return _page("Couldn't connect", body)
 
 

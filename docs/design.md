@@ -977,7 +977,7 @@ obtained, used once, and revoked inside a single handler.
 
 **The admin's token is borrowed, not held.** Whether the account may connect a
 workspace at all is the server's decision, taken from that token's own claims —
-an admin who lacks the permission consents happily and is refused at the bind,
+an admin the server refuses consents happily and is refused at the bind,
 which is the *likeliest* path through this code and so the one the revocation
 has to cover. Both tokens are revoked on every path, that one included. What is
 persisted is only the workspace service account's own refresh token.
