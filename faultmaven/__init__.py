@@ -1,6 +1,8 @@
 """FaultMaven core API integration for the Slack agent."""
 
 from .client import (
+    BindFailureReason,
+    BindStage,
     CaseDeleteInProgressError,
     CaseNotFoundError,
     CaseTerminalError,
@@ -22,6 +24,8 @@ from .client import (
 )
 
 __all__ = [
+    "BindFailureReason",
+    "BindStage",
     "CaseDeleteInProgressError",
     "CaseNotFoundError",
     "CaseTerminalError",
