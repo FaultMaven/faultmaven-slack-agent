@@ -168,17 +168,20 @@ def complete_bind(
             # letting the caller tell an admin "nothing was changed".
             logger.error(
                 "Workspace %s was bound in FaultMaven (enterprise %s, team %s) "
-                "but its credential could not be stored locally: %s. The "
+                "but its credential could not be stored locally (%s). The "
                 "credential is issued once and is now lost; re-run the install "
                 "once the store works, or re-issue it for service account %s.",
                 record.team_id,
                 binding.fm_enterprise_id,
                 binding.team_id,
-                exc,
+                # The class only: a database error's text quotes its bound
+                # parameters, the credential among them.
+                type(exc).__name__,
                 binding.service_account_username,
             )
             raise WorkspaceBindError(
-                f"the bound workspace's credential could not be stored: {exc}",
+                "the bound workspace's credential could not be stored: "
+                f"{type(exc).__name__}",
                 reason=BindFailureReason.CREDENTIAL_NOT_STORED,
             ) from exc
 

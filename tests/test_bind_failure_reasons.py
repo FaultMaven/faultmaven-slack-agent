@@ -116,7 +116,8 @@ EXCHANGE = [
     pytest.param(handler, None, row, id=f"exchange-{name}")
     for name, handler, row in [
         ("connect-error", _raise(httpx.ConnectError), "unreachable"),
-        ("read-timeout", _raise(httpx.ReadTimeout), "unreachable"),
+        ("pool-timeout", _raise(httpx.PoolTimeout), "unreachable"),
+        ("read-timeout", _raise(httpx.ReadTimeout), "interrupted"),
         ("400-invalid-grant", _status(400, json={"error": "invalid_grant"}), "sign-in"),
         ("401-invalid-grant", _status(401, json={"error": "invalid_grant"}), "sign-in"),
         ("400-invalid-request", _status(400, json={"error": "invalid_request"}), "other"),
@@ -135,6 +136,9 @@ BIND = [
     for name, handler, row in [
         ("connect-error", _raise(httpx.ConnectError), "unreachable"),
         ("connect-timeout", _raise(httpx.ConnectTimeout), "unreachable"),
+        ("pool-timeout", _raise(httpx.PoolTimeout), "unreachable"),
+        ("unsupported-protocol", _raise(httpx.UnsupportedProtocol), "unreachable"),
+        ("proxy-error", _raise(httpx.ProxyError), "unreachable"),
         ("read-timeout", _raise(httpx.ReadTimeout), "interrupted"),
         ("read-error", _raise(httpx.ReadError), "interrupted"),
         ("protocol-error", _raise(httpx.RemoteProtocolError), "interrupted"),
@@ -149,12 +153,14 @@ BIND = [
         ("429", _status(429), "unavailable"),
         ("400", _status(400, json={"detail": "SENTINEL"}), "other"),
         ("422", _status(422), "other"),
-        ("302", _status(302), "interrupted"),
-        ("200-html", _status(200, text="<html>SENTINEL</html>"), "interrupted"),
-        ("200-list", _status(200, json=["SENTINEL"]), "unusable"),
-        ("200-null", _status(200, text="null"), "unusable"),
+        ("302", _status(302), "unexplained"),
+        ("200-html", _status(200, text="<html>SENTINEL</html>"), "unexplained"),
+        ("200-list", _status(200, json=["SENTINEL"]), "unexplained"),
+        ("200-null", _status(200, text="null"), "unexplained"),
+        ("200-neither-field", _status(200, json={"status": "SENTINEL"}), "unexplained"),
         ("no-refresh-token", _bound(refresh_token=None), "unusable"),
         ("no-team-id", _bound(team_id=None), "unusable"),
+        ("refresh-token-not-a-string", _bound(refresh_token=12345), "unusable"),
         ("no-enterprise", _bound(refresh_token=jwt_with_enterprise(None)), "unusable"),
     ]
 ]
@@ -234,14 +240,18 @@ def test_each_failure_shows_its_reasons_message_and_footer(
 
 
 def test_a_credential_the_agent_could_not_store_advises_a_re_run_once_it_can(
-    bind_client, tmp_path, monkeypatch
+    bind_client, tmp_path, monkeypatch, caplog
 ):
-    """A re-run of the install issues a fresh credential: it is the recovery."""
+    """A re-run of the install issues a fresh credential: it is the recovery.
+    The store's error is logged by class only: a database error's text quotes
+    its bound parameters, the credential among them."""
     resp = _callback(
         bind_client, tmp_path, monkeypatch, _routes(TOKENS, _bound()), store=_BrokenStore()
     )
 
     _assert_row(resp, "not-stored")
+    assert "OSError" in caplog.text
+    assert "SENTINEL" not in caplog.text
 
 
 def test_an_exception_that_is_not_a_bind_failure_claims_nothing_about_faultmaven(
@@ -258,8 +268,9 @@ def test_an_exception_that_is_not_a_bind_failure_claims_nothing_about_faultmaven
 
 
 def test_every_published_code_has_its_own_row():
-    """The vocabulary is shared with the backend: a code it adds, or one this
-    table drops, fails here instead of falling silently to its status's row."""
+    """Pins this repository's copy of the published vocabulary: every code in
+    it has its own row, and a code dropped from the table fails here instead of
+    falling silently to its status's row. It cannot see a backend change."""
     assert set(_BIND_ERROR_CODES) == PUBLISHED_CODES
     for reason in _BIND_ERROR_CODES.values():
         assert reason not in (BindFailureReason.OTHER_REFUSAL, BindFailureReason.UNEXPLAINED)

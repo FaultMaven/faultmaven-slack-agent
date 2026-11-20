@@ -555,7 +555,7 @@ def _tokens(request):
             False,
             id="exchange-non-json",
         ),
-        pytest.param(_tokens, _timed_out, BIND_PATH, True, id="bind-unreachable"),
+        pytest.param(_tokens, _timed_out, BIND_PATH, True, id="bind-no-answer"),
         pytest.param(
             lambda r: httpx.Response(200, json={"refresh_token": "admin-rt"}),
             None,

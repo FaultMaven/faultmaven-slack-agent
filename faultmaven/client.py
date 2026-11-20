@@ -479,7 +479,8 @@ class BindStage(Enum):
     BEFORE_BIND = "before_bind"
     #: FaultMaven created the workspace; the agent failed after it answered.
     AFTER_BIND = "after_bind"
-    #: Either could be true: sent with no usable answer, or a server error.
+    #: Either could be true: sent with no answer, a server error, or an answer
+    #: that is not the route's own.
     UNKNOWN = "unknown"
 
     def footer(self, *, retryable: bool) -> str:
@@ -604,7 +605,8 @@ class BindFailureReason(Enum):
         "its credential, so it can't be used yet. Ask a FaultMaven administrator "
         "to re-issue the workspace credential.",
     )
-    #: Not raised: an exception other than a bind failure reaching the page.
+    #: An answer that is not the route's own (a redirect, or a 2xx no route
+    #: would send), or an exception other than a bind failure.
     UNEXPLAINED = (
         BindStage.UNKNOWN,
         True,
@@ -638,6 +640,16 @@ _BIND_ERROR_CODES: dict[tuple[int, str], BindFailureReason] = {
     (503, "USER_STORE_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
     (503, "OAUTH_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
 }
+
+
+#: The transport failures that prove the request never reached FaultMaven.
+_NEVER_SENT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+    httpx.ProxyError,
+)
 
 
 def _bind_refusal(status: int, code: str | None) -> BindFailureReason:
@@ -2261,12 +2273,15 @@ class FaultMavenClient:
                     "client_id": self._oauth_client_id,
                 },
             )
-        except httpx.HTTPError as exc:
-            # Nothing is bound before the exchange, so any transport failure
-            # here leaves FaultMaven unchanged.
+        except _NEVER_SENT as exc:
             raise WorkspaceBindError(
                 f"could not reach FaultMaven to exchange the code: {exc}",
                 reason=BindFailureReason.UNREACHABLE,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WorkspaceBindError(
+                f"the code exchange got no answer from FaultMaven: {exc}",
+                reason=BindFailureReason.INTERRUPTED,
             ) from exc
         if resp.status_code != 200:
             try:
@@ -2357,8 +2372,7 @@ class FaultMavenClient:
                 json=payload,
                 headers=self._auth_header(admin_access_token),
             )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            # The only transport failures that prove the request was not sent.
+        except _NEVER_SENT as exc:
             raise WorkspaceBindError(
                 f"could not reach FaultMaven to bind the workspace: {exc}",
                 reason=BindFailureReason.UNREACHABLE,
@@ -2378,40 +2392,35 @@ class FaultMavenClient:
                 status_code=resp.status_code,
             )
 
-        # A redirect, or a 2xx that is not JSON, is a proxy's page: it proves
-        # nothing about whether the bind ran behind it.
+        # A redirect, or a 2xx that is not a JSON object carrying either field
+        # the route returns, is not the route's answer (a proxy's page): it
+        # proves nothing about whether the bind ran behind it.
         try:
-            if not 200 <= resp.status_code < 300:
-                raise ValueError("not a 2xx")
-            body = resp.json()
-        except ValueError as exc:
+            body = resp.json() if 200 <= resp.status_code < 300 else None
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not {"refresh_token", "team_id"} & body.keys():
             raise WorkspaceBindError(
                 f"the bind got a {resp.status_code} that is not the route's answer",
-                reason=BindFailureReason.INTERRUPTED,
+                reason=BindFailureReason.UNEXPLAINED,
                 status_code=resp.status_code,
-            ) from exc
+            )
 
         # Past this point the server has created the account, the team and the
         # memberships, and minted a once-only credential. A re-run of the
         # install issues a fresh one, but an answer this agent cannot use would
         # come back the same, so every field the caller depends on is checked
         # here, where the error can still name what happened.
-        if not isinstance(body, dict):
-            raise WorkspaceBindError(
-                "The workspace was created in FaultMaven, but its response was "
-                "JSON that is not an object. An administrator must re-issue the "
-                "workspace credential.",
-                reason=BindFailureReason.RESPONSE_UNUSABLE,
-                status_code=resp.status_code,
-            )
         missing = [
-            name for name in ("refresh_token", "team_id") if not body.get(name)
+            name
+            for name in ("refresh_token", "team_id")
+            if not (isinstance(body.get(name), str) and body[name])
         ]
         if missing:
             raise WorkspaceBindError(
                 "The workspace was created in FaultMaven, but its response was "
-                f"missing {', '.join(missing)}, so it cannot be used here. An "
-                "administrator must re-issue the workspace credential.",
+                f"missing {', '.join(missing)} (or not a string), so it cannot be "
+                "used here. An administrator must re-issue the workspace credential.",
                 reason=BindFailureReason.RESPONSE_UNUSABLE,
                 status_code=resp.status_code,
             )
