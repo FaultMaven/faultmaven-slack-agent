@@ -1023,7 +1023,8 @@ def test_the_bind_carries_the_admin_bearer_and_names_no_tenant():
 
     client = bind_client_for(handler)
     binding = client.bind_workspace(
-        admin_access_token="admin-at", slack_team_id="T1", team_name="Ops"
+        admin_access_token="admin-at", slack_team_id="T1", team_name="Ops",
+        assertion="x.y.z",
     )
 
     assert seen["auth"] == "Bearer admin-at"
@@ -1057,7 +1058,7 @@ def test_the_bind_reads_the_enterprise_from_the_credential_it_was_issued():
         )
 
     binding = bind_client_for(handler).bind_workspace(
-        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
     )
 
     assert binding.fm_enterprise_id == "ent-from-the-token"
@@ -1083,7 +1084,7 @@ def test_a_bind_needs_no_organization_at_all():
         )
 
     binding = bind_client_for(handler).bind_workspace(
-        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
     )
 
     assert binding.fm_enterprise_id == "ent-a"
@@ -1116,7 +1117,7 @@ def test_a_bind_whose_credential_names_no_enterprise_is_refused(credential):
 
     with pytest.raises(WorkspaceBindError, match="re-issue"):
         bind_client_for(handler).bind_workspace(
-            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+            admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
         )
 
 
@@ -1135,7 +1136,7 @@ def test_the_bind_stores_our_workspace_id_not_the_servers_echo():
         )
 
     binding = bind_client_for(handler).bind_workspace(
-        admin_access_token="a", slack_team_id="T1", team_name="Ops"
+        admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
     )
 
     assert binding.slack_team_id == "T1"
@@ -1161,7 +1162,7 @@ def test_each_bind_refusal_is_typed_and_advises_correctly(status, reason):
 
     with pytest.raises(WorkspaceBindError) as caught:
         client.bind_workspace(
-            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+            admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
         )
 
     assert "because" in str(caught.value)
@@ -1184,7 +1185,7 @@ def test_an_incomplete_bind_response_is_reported_as_unrecoverable(missing):
 
     with pytest.raises(WorkspaceBindError, match="re-issue"):
         client.bind_workspace(
-            admin_access_token="a", slack_team_id="T1", team_name="Ops"
+            admin_access_token="a", slack_team_id="T1", team_name="Ops", assertion="x.y.z"
         )
 
 

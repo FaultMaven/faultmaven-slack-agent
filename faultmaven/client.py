@@ -630,6 +630,9 @@ class BindFailureReason(Enum):
 #: specific claim: such a response may not have come from the route at all.
 _BIND_ERROR_CODES: dict[tuple[int, str], BindFailureReason] = {
     (403, "INSTALLER_NOT_IN_ENTERPRISE"): BindFailureReason.FORBIDDEN,
+    # The Cloud API did not accept this agent's assertion (faultmaven-cloud#83).
+    # Not FORBIDDEN, whose text blames the admin's account.
+    (403, "SLACK_WORKSPACE_NOT_PROVEN"): BindFailureReason.OTHER_REFUSAL,
     (409, "WORKSPACE_BOUND_UNDER_OTHER_TEAM_NAME"): BindFailureReason.BOUND_UNDER_OTHER_NAME,
     (409, "NOT_ADMIN_OF_BOUND_TEAM"): BindFailureReason.BOUND_TO_TEAM_NOT_ADMINISTERED,
     (409, "TEAM_NAME_TAKEN"): BindFailureReason.NAME_TAKEN,
@@ -641,6 +644,7 @@ _BIND_ERROR_CODES: dict[tuple[int, str], BindFailureReason] = {
     (503, "MULTI_TENANCY_NOT_ENABLED"): BindFailureReason.NOT_SET_UP,
     (503, "USER_STORE_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
     (503, "OAUTH_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
+    (503, "SLACK_BIND_NOT_CONFIGURED"): BindFailureReason.NOT_SET_UP,
 }
 
 
@@ -2111,8 +2115,9 @@ class FaultMavenClient:
         return {"timeout": left}
 
     @staticmethod
-    def _error_detail(resp: httpx.Response) -> str:
+    def _error_detail(resp: httpx.Response, *, withhold: str = "") -> str:
         """The backend's error explanation, truncated — for logs and messages.
+        ``withhold`` (the bind's assertion) is cut from it before truncation.
 
         A JSON object is never quoted whole: at any status, it may be a token
         response or a gateway echoing the request, and its values, even its keys,
@@ -2134,7 +2139,10 @@ class FaultMavenClient:
                 or FaultMavenClient._validation_errors(body.get("detail"))
                 or "a JSON body with no error explanation"
             )
-        return " ".join((text or "").split())[:300]
+        text = " ".join((text or "").split())
+        if withhold:
+            text = text.replace(withhold, "<withheld>")
+        return text[:300]
 
     @staticmethod
     def _validation_errors(detail: Any) -> str:
@@ -2348,6 +2356,7 @@ class FaultMavenClient:
         admin_access_token: str,
         slack_team_id: str,
         team_name: str,
+        assertion: str,
         slack_enterprise_id: str | None = None,
     ) -> WorkspaceBinding:
         """Bind a Slack workspace to a team, as the authenticated admin.
@@ -2366,6 +2375,8 @@ class FaultMavenClient:
         payload: dict[str, Any] = {
             "slack_team_id": slack_team_id,
             "team_name": team_name,
+            # binding.sign_bind_assertion's, which the Cloud API verifies.
+            "slack_workspace_assertion": assertion,
         }
         if slack_enterprise_id:
             payload["slack_enterprise_id"] = slack_enterprise_id
@@ -2391,7 +2402,7 @@ class FaultMavenClient:
             code = resp.headers.get("x-error-code") or None
             raise WorkspaceBindError(
                 f"FaultMaven refused the bind ({resp.status_code}, code {code}): "
-                f"{self._error_detail(resp)}",
+                f"{self._error_detail(resp, withhold=assertion)}",
                 reason=_bind_refusal(resp.status_code, code),
                 status_code=resp.status_code,
             )

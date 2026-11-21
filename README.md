@@ -25,8 +25,9 @@ service account (`slack-<team id>`), anchored to one enterprise — the isolatio
 boundary — once it is *bound* by the install-time flow: a Workspace Owner or
 Admin authorizes on the FaultMaven dashboard (`binding.py`). `GET
 /slack/install` is served whenever the HTTP transport runs (`web.py`), but the
-install-time bind itself only runs when **both** `FAULTMAVEN_DASHBOARD_URL` and
-`FAULTMAVEN_OAUTH_REDIRECT_URI` are set (`config.install_binding_enabled`) —
+install-time bind itself only runs when `FAULTMAVEN_DASHBOARD_URL`,
+`FAULTMAVEN_OAUTH_REDIRECT_URI` and `SLACK_BIND_ASSERTION_KEY` (which signs the
+bind's assertion) are **all** set (`config.install_binding_enabled`) —
 otherwise a workspace can only be bound by an operator, out of band. What
 happens to a workspace that installs without being bound is decided by
 `FAULTMAVEN_REQUIRE_WORKSPACE_BINDING`: at its default, `false`, it's answered

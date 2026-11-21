@@ -220,6 +220,7 @@ def create_fastapi_app() -> FastAPI:
                     record=record,
                     code=code,
                     redirect_uri=settings.faultmaven_oauth_redirect_uri,
+                    assertion_key=settings.faultmaven_bind_assertion_key,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — every failure is a page, not a 500

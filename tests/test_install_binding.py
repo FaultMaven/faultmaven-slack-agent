@@ -20,6 +20,7 @@ obtained for.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -28,6 +29,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import create_engine
 
 import install_pages
@@ -49,6 +51,22 @@ from faultmaven import (
 )
 from pending_binds import BIND_COOKIE_NAME, PendingBindStore
 from workspace_credentials import WorkspaceCredentialStore
+
+
+#: The agent's SLACK_BIND_ASSERTION_KEY in these tests.
+BIND_KEY = SecretStr("slack-bind-assertion-key-for-tests-".ljust(64, "0"))
+
+
+def admin_access_token(sub: str = "fm-admin-1") -> str:
+    """A JWT-shaped admin access token: the bind's assertion names its ``sub``."""
+
+    def seg(data: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+    return f"{seg({'alg': 'HS256'})}.{seg({'sub': sub, 'exp': 4102444800})}.sig"
+
+
+ADMIN_ACCESS = admin_access_token()
 
 
 def make_stores(tmp_path):
@@ -78,16 +96,17 @@ class FakeFM:
 
     def exchange_authorization_code(self, *, code, code_verifier, redirect_uri):
         self.exchanged.append((code, code_verifier, redirect_uri))
-        return "admin-access", "admin-refresh"
+        return ADMIN_ACCESS, "admin-refresh"
 
     def bind_workspace(self, *, admin_access_token, slack_team_id, team_name,
-                       slack_enterprise_id=None):
+                       assertion, slack_enterprise_id=None):
         self.bound.append(
             {
                 "token": admin_access_token,
                 "slack_team_id": slack_team_id,
                 "team_name": team_name,
                 "slack_enterprise_id": slack_enterprise_id,
+                "assertion": assertion,
             }
         )
         if self.bind_error:
@@ -210,6 +229,7 @@ def test_the_workspace_comes_from_the_record_not_the_request(tmp_path):
     complete_bind(
         fm=fm, workspace_credentials=creds, record=claimed,
         code="c", redirect_uri="https://slack.faultmaven.ai/faultmaven/callback",
+        assertion_key=BIND_KEY,
     )
 
     assert fm.bound[0]["slack_team_id"] == "T-REAL"
@@ -246,11 +266,11 @@ def test_the_admin_tokens_are_revoked_after_a_successful_bind(tmp_path):
 
     complete_bind(
         fm=fm, workspace_credentials=creds, record=record,
-        code="c", redirect_uri="https://x/cb",
+        code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
     )
 
     assert ("admin-refresh", "refresh_token") in fm.revoked
-    assert ("admin-access", "access_token") in fm.revoked
+    assert (ADMIN_ACCESS, "access_token") in fm.revoked
 
 
 def test_the_admin_tokens_are_revoked_even_when_the_bind_is_refused(tmp_path):
@@ -269,11 +289,11 @@ def test_the_admin_tokens_are_revoked_even_when_the_bind_is_refused(tmp_path):
     with pytest.raises(WorkspaceBindError):
         complete_bind(
             fm=fm, workspace_credentials=creds, record=record,
-            code="c", redirect_uri="https://x/cb",
+            code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
         )
 
     assert ("admin-refresh", "refresh_token") in fm.revoked
-    assert ("admin-access", "access_token") in fm.revoked
+    assert (ADMIN_ACCESS, "access_token") in fm.revoked
     assert creds.get("T-ATTACKER") is None, "a refused bind stores no credential"
 
 
@@ -287,13 +307,13 @@ def test_only_the_service_account_credential_is_persisted(tmp_path):
 
     complete_bind(
         fm=fm, workspace_credentials=creds, record=record,
-        code="c", redirect_uri="https://x/cb",
+        code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
     )
 
     stored = creds.get("T-OK")
     assert stored.refresh_token == "sa-refresh"
     assert stored.fm_enterprise_id == "ent-victim"
-    assert stored.refresh_token not in ("admin-access", "admin-refresh")
+    assert stored.refresh_token not in (ADMIN_ACCESS, "admin-refresh")
 
 
 # -- the cookie ---------------------------------------------------------------
@@ -353,6 +373,7 @@ def bind_client(monkeypatch, tmp_path):
         "FAULTMAVEN_API_TOKEN": "preset-token",
         "FAULTMAVEN_DASHBOARD_URL": "https://app.faultmaven.ai",
         "FAULTMAVEN_OAUTH_REDIRECT_URI": "https://slack.faultmaven.ai/faultmaven/callback",
+        "SLACK_BIND_ASSERTION_KEY": BIND_KEY.get_secret_value(),
     }.items():
         monkeypatch.setenv(key, value)
     config.get_settings.cache_clear()
@@ -435,10 +456,11 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
 
     seen = {}
 
-    def fake_complete(*, fm, workspace_credentials, record, code, redirect_uri):
+    def fake_complete(*, fm, workspace_credentials, record, code, redirect_uri, assertion_key):
         seen["team_id"] = record.team_id
         seen["code"] = code
         seen["redirect_uri"] = redirect_uri
+        seen["assertion_key"] = assertion_key
         return "ent-acme"
 
     monkeypatch.setattr(web, "complete_bind", fake_complete)
@@ -457,6 +479,7 @@ def test_the_callback_binds_when_state_and_cookie_agree(bind_client, tmp_path, m
     assert seen["team_id"] == "T-REAL", "the workspace came from the record"
     assert seen["code"] == "good-code"
     assert seen["redirect_uri"] == "https://slack.faultmaven.ai/faultmaven/callback"
+    assert seen["assertion_key"] == BIND_KEY, "the configured key signs the bind"
 
 
 def test_a_rebind_drops_the_cached_credential(tmp_path):
@@ -471,7 +494,7 @@ def test_a_rebind_drops_the_cached_credential(tmp_path):
 
     complete_bind(
         fm=fm, workspace_credentials=creds, record=record,
-        code="c", redirect_uri="https://x/cb",
+        code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
     )
 
     assert fm.forgotten == ["T-REBOUND"]
@@ -494,7 +517,7 @@ def test_a_local_store_failure_after_the_server_bind_is_reported_as_after_it(tmp
     with pytest.raises(WorkspaceBindError) as caught:
         complete_bind(
             fm=fm, workspace_credentials=creds, record=record,
-            code="c", redirect_uri="https://x/cb",
+            code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
         )
 
     assert caught.value.reason is BindFailureReason.CREDENTIAL_NOT_STORED
@@ -538,7 +561,7 @@ def _timed_out(request):
 
 def _tokens(request):
     return httpx.Response(
-        200, json={"access_token": "admin-at", "refresh_token": "admin-rt"}
+        200, json={"access_token": ADMIN_ACCESS, "refresh_token": "admin-rt"}
     )
 
 
@@ -602,7 +625,7 @@ def test_the_bind_page_shows_no_library_or_backend_text(
             return on_bind(request)
         return httpx.Response(200)  # the revokes in complete_bind's finally
 
-    def real_complete(*, fm, workspace_credentials, record, code, redirect_uri):
+    def real_complete(*, fm, workspace_credentials, record, code, redirect_uri, assertion_key):
         client = FaultMavenClient("http://test")
         client._http.close()
         client._http = httpx.Client(
@@ -611,6 +634,7 @@ def test_the_bind_page_shows_no_library_or_backend_text(
         return complete_bind(
             fm=client, workspace_credentials=workspace_credentials,
             record=record, code=code, redirect_uri=redirect_uri,
+            assertion_key=assertion_key,
         )
 
     monkeypatch.setattr(web, "complete_bind", real_complete)
@@ -659,7 +683,7 @@ def _refused_through_real_client(tmp_path, token_response, bind_response=None):
     with pytest.raises(WorkspaceBindError) as refused:
         complete_bind(
             fm=client, workspace_credentials=creds, record=record,
-            code="c", redirect_uri="https://x/cb",
+            code="c", redirect_uri="https://x/cb", assertion_key=BIND_KEY,
         )
     client._http.close()
     return refused.value, seen, revokes
@@ -718,15 +742,17 @@ def test_a_refresh_token_httpx_cannot_send_still_lets_the_access_token_be_revoke
 
     refused, _, revokes = _refused_through_real_client(
         tmp_path,
-        httpx.Response(200, text=f'{{"access_token": "admin-at", "refresh_token": {refresh}}}'),
+        httpx.Response(
+            200, text=f'{{"access_token": "{ADMIN_ACCESS}", "refresh_token": {refresh}}}'
+        ),
         httpx.Response(403, json={"detail": "needs manage settings"}),
     )
 
     assert refused.status_code == 403, "the bind's own refusal is what surfaces"
-    assert revokes == [("admin-at", "access_token")]
+    assert revokes == [(ADMIN_ACCESS, "access_token")]
     errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
     assert bool(errors) is refresh_unrevoked  # a revoke that raised is reported
-    assert "admin-at" not in caplog.text and "ud800" not in caplog.text
+    assert ADMIN_ACCESS not in caplog.text and "ud800" not in caplog.text
 
 
 def test_a_bind_failure_page_never_shows_the_exceptions_own_text():

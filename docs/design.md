@@ -982,6 +982,13 @@ which is the *likeliest* path through this code and so the one the revocation
 has to cover. Both tokens are revoked on every path, that one included. What is
 persisted is only the workspace service account's own refresh token.
 
+**The bind carries this agent's assertion.** The API binds a workspace id its
+caller sends, so it accepts only one this agent vouches for: a compact JWS
+(HS256, valid one minute) over the admin's FaultMaven user id (the access
+token's `sub`) and the record's workspace and Grid ids, signed with
+`SLACK_BIND_ASSERTION_KEY`, a secret the agent and the API share
+(`binding.sign_bind_assertion`). Without the key the bind is not offered.
+
 **Slack-side authority is checked at install.** Both sides of the join have to
 consent: FaultMaven's side by the admin authenticating and authorizing, Slack's
 side by `installer_authority` (`users.info`, needing `users:read`), which offers
