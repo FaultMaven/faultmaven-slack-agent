@@ -239,7 +239,12 @@ class Settings(BaseSettings):
         raw = value.get_secret_value()
         if raw and raw != raw.strip():
             raise ValueError("SLACK_BIND_ASSERTION_KEY must not begin or end with whitespace")
-        if raw and len(raw.encode("utf-8")) < 32:
+        try:
+            encoded = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            # Its message names the character and its position.
+            raise ValueError("SLACK_BIND_ASSERTION_KEY must be valid UTF-8") from None
+        if raw and len(encoded) < 32:
             raise ValueError("SLACK_BIND_ASSERTION_KEY must be at least 32 bytes")
         return value
 

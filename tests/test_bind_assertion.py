@@ -22,6 +22,9 @@ from pydantic import SecretStr, ValidationError
 
 from binding import complete_bind, sign_bind_assertion
 from faultmaven import BindFailureReason, FaultMavenClient, WorkspaceBindError
+from sqlalchemy import create_engine
+
+from pending_binds import BIND_COOKIE_NAME, PendingBindStore
 from tests.test_install_binding import (
     ADMIN_ACCESS,
     BIND_KEY,
@@ -29,9 +32,13 @@ from tests.test_install_binding import (
     REVOKE_PATH,
     TOKEN_PATH,
     admin_access_token,
+    bind_client,
     make_stores,
+    open_bind,
 )
 from tests.test_workspace_credentials import jwt_with_enterprise
+
+__all__ = ["bind_client"]  # a fixture, used by name below
 
 BOUND = {"slack_team_id": "T1", "team_id": "fmteam", "refresh_token": jwt_with_enterprise("e")}
 
@@ -139,28 +146,109 @@ def test_an_access_token_without_a_readable_sub_is_refused_and_revoked(tmp_path,
     assert revokes == [("admin-rt", "refresh_token"), (token, "access_token")]
 
 
-def _echo_text(request):
-    return httpx.Response(400, text=f"<html>bad request: {request.content.decode()}</html>")
+def _echo(status, shape, *, as_json):
+    """A gateway or backend quoting ``shape(assertion)`` back."""
+
+    def on_bind(request):
+        quoted = shape(json.loads(request.content)["slack_workspace_assertion"])
+        if as_json:
+            return httpx.Response(status, json={"detail": f"rejected {quoted}"})
+        return httpx.Response(status, text=f"<html>bad request: {quoted}</html>")
+
+    return on_bind
 
 
-def _echo_detail(request):
-    sent = json.loads(request.content)["slack_workspace_assertion"]
-    return httpx.Response(403, json={"detail": f"rejected {sent}"})
+#: Each quote puts the piece it leaks inside the 300 characters an error keeps.
+ECHOES = [
+    pytest.param(_echo(403, lambda a: a, as_json=True), id="whole"),
+    pytest.param(_echo(400, lambda a: a[-120:], as_json=False), id="tail"),
+    pytest.param(_echo(403, lambda a: a.split(".")[1], as_json=True), id="payload"),
+    pytest.param(_echo(502, lambda a: a.split(".")[2], as_json=False), id="signature"),
+]
 
 
-@pytest.mark.parametrize("on_bind", [_echo_text, _echo_detail], ids=["page", "detail"])
+@pytest.mark.parametrize("on_bind", ECHOES)
 def test_an_echoed_assertion_reaches_no_error_text_or_log_line(tmp_path, caplog, on_bind):
-    """A3: a gateway or a backend quoting the request back."""
+    """A3: the payload and the signature are each withheld, whole or quoted alone."""
     caplog.set_level(logging.DEBUG)
 
     outcome, seen, _ = _run(tmp_path, on_bind=on_bind)
 
-    assertion = _sent_assertion(seen)
+    payload, signature = _sent_assertion(seen).split(".")[1:]
     assert isinstance(outcome, WorkspaceBindError)
     assert "<withheld>" in str(outcome), "the echo was there to withhold"
     for text in (str(outcome), repr(outcome), caplog.text):
-        assert assertion not in text and assertion.rsplit(".", 1)[1] not in text
+        assert payload not in text and signature not in text
     assert BIND_KEY.get_secret_value() not in caplog.text
+
+
+def test_the_routes_warning_withholds_an_echoed_signature(
+    bind_client, tmp_path, monkeypatch, caplog
+):
+    """Through the callback route, whose WARNING logs the refusal's text."""
+    import web
+
+    caplog.set_level(logging.DEBUG)
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TOKEN_PATH:
+            return httpx.Response(
+                200, json={"access_token": ADMIN_ACCESS, "refresh_token": "admin-rt"}
+            )
+        if request.url.path == BIND_PATH:
+            sent.append(json.loads(request.content)["slack_workspace_assertion"])
+            return httpx.Response(403, json={"detail": f"bad signature {sent[0].split('.')[2]}"})
+        return httpx.Response(200)
+
+    def real_complete(*, fm, **kwargs):
+        client = FaultMavenClient("http://test")
+        client._http.close()
+        client._http = httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler))
+        return complete_bind(fm=client, **kwargs)
+
+    monkeypatch.setattr(web, "complete_bind", real_complete)
+    record = open_bind(PendingBindStore(create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")))
+    bind_client.cookies.set(BIND_COOKIE_NAME, record.bind_id)
+    resp = bind_client.get(
+        "/faultmaven/callback", params={"code": "good-code", "state": record.state}
+    )
+
+    [assertion] = sent
+    warned = [r.getMessage() for r in caplog.records if "Workspace bind failed" in r.getMessage()]
+    assert len(warned) == 1 and "<withheld>" in warned[0]
+    for piece in assertion.split(".")[1:]:
+        assert piece not in caplog.text and piece not in resp.text
+
+
+@pytest.mark.parametrize("key,warned", [("", True), (BIND_KEY.get_secret_value(), False)])
+def test_two_urls_without_a_key_are_named_at_startup(monkeypatch, tmp_path, caplog, key, warned):
+    """Binding the operator asked for, turned off by a missing key, says so."""
+    import config
+    from web import create_fastapi_app
+
+    for name, value in {
+        "SLACK_TRANSPORT": "http",
+        "SLACK_CLIENT_ID": "123.456",
+        "SLACK_CLIENT_SECRET": "secret",
+        "SLACK_SIGNING_SECRET": "signsign",
+        "SLACK_DATABASE_URL": f"sqlite:///{tmp_path / 'oauth.db'}",
+        "CASE_STORE_PATH": str(tmp_path / "cases.db"),
+        "FAULTMAVEN_API_TOKEN": "preset-token",
+        "FAULTMAVEN_DASHBOARD_URL": "https://app.faultmaven.ai",
+        "FAULTMAVEN_OAUTH_REDIRECT_URI": "https://slack.faultmaven.ai/faultmaven/callback",
+        "SLACK_BIND_ASSERTION_KEY": key,
+    }.items():
+        monkeypatch.setenv(name, value)
+    config.get_settings.cache_clear()
+    caplog.set_level(logging.WARNING)
+    try:
+        create_fastapi_app()
+    finally:
+        config.get_settings.cache_clear()
+
+    named = [r for r in caplog.records if "SLACK_BIND_ASSERTION_KEY" in r.getMessage()]
+    assert bool(named) is warned
 
 
 #: The vector the Cloud API's tests hold, computed with PyJWT 2.15.1.
@@ -223,3 +311,16 @@ def test_an_unusable_key_fails_at_load_without_printing_it(http_env, monkeypatch
     with pytest.raises(ValidationError) as caught:
         Settings(_env_file=None)
     assert value.strip() not in str(caught.value)
+
+
+def test_a_key_that_is_not_utf8_fails_at_load_without_naming_its_bytes(http_env, monkeypatch):
+    """A non-UTF-8 environment value arrives as a lone surrogate, and encoding it
+    raises an error that names the character and its position."""
+    from config import Settings
+
+    monkeypatch.setenv("SLACK_BIND_ASSERTION_KEY", "k" * 20 + "\udcff" + "k" * 20)
+    with pytest.raises(ValidationError) as caught:
+        Settings(_env_file=None)
+    text = str(caught.value)
+    assert "must be valid UTF-8" in text
+    assert "udcff" not in text and "position" not in text and "k" * 20 not in text

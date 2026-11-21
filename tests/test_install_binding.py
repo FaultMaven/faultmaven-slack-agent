@@ -946,6 +946,26 @@ def test_an_unknown_authority_refuses_too_but_says_something_different(monkeypat
     assert binds.created == 0
 
 
+@pytest.mark.parametrize(
+    ("required", "said"),
+    [(True, "will not answer in this workspace"), (False, "Until then the app works")],
+)
+def test_a_deployment_that_cannot_bind_says_what_happens_until_bound(required, said):
+    """A keyless deployment lands here; under required binding the workspace is
+    refused every turn, so the page must not call the app ready."""
+    settings = SimpleNamespace(
+        install_binding_enabled=False, faultmaven_require_workspace_binding=required
+    )
+    binds = _RecordingPendingBinds()
+
+    response = app_module._install_callbacks(settings, binds).success(_success_args())
+
+    assert response.status == 200
+    assert said in response.body
+    assert "ready" not in response.body
+    assert binds.created == 0
+
+
 def test_an_enterprise_grid_org_owner_may_bind():
     """Slack's Grid reports Grid-organization authority under ``enterprise_user``.
 

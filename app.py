@@ -257,7 +257,9 @@ def _install_callbacks(
             return BoltResponse(
                 status=200,
                 headers=_install_html_headers(args),
-                body=install_pages.unavailable_page(),
+                body=install_pages.unavailable_page(
+                    binding_required=settings.faultmaven_require_workspace_binding
+                ),
             )
 
         # Both sides of the join must consent. The FaultMaven leg is the admin
