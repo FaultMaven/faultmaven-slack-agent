@@ -104,15 +104,15 @@ def error_page(message: str, footer: str) -> str:
     return _page("Couldn't connect", body)
 
 
-def unavailable_page() -> str:
+def unavailable_page(*, binding_required: bool) -> str:
     """Install succeeded, but this deployment cannot bind from the browser."""
 
-    body = """
+    body = f"""
 <h1>FaultMaven is installed</h1>
-<p>The Slack app is installed and ready.</p>
+<p>The Slack app is installed.</p>
 <p>Connecting this workspace to a FaultMaven enterprise is a step your
    FaultMaven administrator completes — this deployment doesn't offer it from
-   the browser.</p>
+   the browser. {escape(_until_then(binding_required))}</p>
 <p class="muted">You can close this page.</p>"""
     return _page("Installed", body)
 

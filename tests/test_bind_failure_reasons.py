@@ -21,7 +21,13 @@ from binding import complete_bind
 from faultmaven import BindFailureReason, FaultMavenClient
 from faultmaven.client import _BIND_ERROR_CODES
 from pending_binds import BIND_COOKIE_NAME, PendingBindStore
-from tests.test_install_binding import BIND_PATH, TOKEN_PATH, bind_client, open_bind
+from tests.test_install_binding import (
+    ADMIN_ACCESS,
+    BIND_PATH,
+    TOKEN_PATH,
+    bind_client,
+    open_bind,
+)
 from tests.test_workspace_credentials import jwt_with_enterprise
 
 __all__ = ["bind_client"]  # a fixture, used by name below
@@ -29,6 +35,7 @@ __all__ = ["bind_client"]  # a fixture, used by name below
 #: The codes the bind route publishes, each at its status.
 PUBLISHED_CODES = {
     (403, "INSTALLER_NOT_IN_ENTERPRISE"),
+    (403, "SLACK_WORKSPACE_NOT_PROVEN"),
     (409, "WORKSPACE_BOUND_UNDER_OTHER_TEAM_NAME"),
     (409, "NOT_ADMIN_OF_BOUND_TEAM"),
     (409, "TEAM_NAME_TAKEN"),
@@ -40,6 +47,7 @@ PUBLISHED_CODES = {
     (503, "MULTI_TENANCY_NOT_ENABLED"),
     (503, "USER_STORE_NOT_CONFIGURED"),
     (503, "OAUTH_NOT_CONFIGURED"),
+    (503, "SLACK_BIND_NOT_CONFIGURED"),
 }
 
 LOGS = "Ask a FaultMaven administrator to check the server logs for the reason."
@@ -110,7 +118,7 @@ def _status(status, *, code=None, **body):
     return lambda request: httpx.Response(status, headers=headers, **body)
 
 
-TOKENS = _status(200, json={"access_token": "admin-at", "refresh_token": "admin-rt"})
+TOKENS = _status(200, json={"access_token": ADMIN_ACCESS, "refresh_token": "admin-rt"})
 BOUND = {"slack_team_id": "T1", "team_id": "fmteam", "refresh_token": jwt_with_enterprise("e")}
 
 
@@ -176,6 +184,8 @@ CODED = [
     pytest.param(TOKENS, _status(status, code=code), row, id=f"bind-{status}-{code}")
     for (status, code), row in {
         (403, "INSTALLER_NOT_IN_ENTERPRISE"): "403",
+        # Not "403": that text blames the admin's account (faultmaven-cloud#83).
+        (403, "SLACK_WORKSPACE_NOT_PROVEN"): "other",
         (409, "WORKSPACE_BOUND_UNDER_OTHER_TEAM_NAME"): "other-name",
         (409, "NOT_ADMIN_OF_BOUND_TEAM"): "not-admin",
         (409, "TEAM_NAME_TAKEN"): "name-taken",
@@ -187,6 +197,7 @@ CODED = [
         (503, "MULTI_TENANCY_NOT_ENABLED"): "not-set-up",
         (503, "USER_STORE_NOT_CONFIGURED"): "not-set-up",
         (503, "OAUTH_NOT_CONFIGURED"): "not-set-up",
+        (503, "SLACK_BIND_NOT_CONFIGURED"): "not-set-up",
     }.items()
 ]
 
@@ -279,5 +290,10 @@ def test_every_published_code_has_its_own_row():
     it has its own row, and a code dropped from the table fails here instead of
     falling silently to its status's row. It cannot see a backend change."""
     assert set(_BIND_ERROR_CODES) == PUBLISHED_CODES
-    for reason in _BIND_ERROR_CODES.values():
-        assert reason not in (BindFailureReason.OTHER_REFUSAL, BindFailureReason.UNEXPLAINED)
+    # The one deliberate exception: an assertion the API did not accept is ours
+    # to explain from the logs, not the admin's (faultmaven-cloud#83).
+    proven = (403, "SLACK_WORKSPACE_NOT_PROVEN")
+    assert _BIND_ERROR_CODES[proven] is BindFailureReason.OTHER_REFUSAL
+    for code, reason in _BIND_ERROR_CODES.items():
+        if code != proven:
+            assert reason not in (BindFailureReason.OTHER_REFUSAL, BindFailureReason.UNEXPLAINED)

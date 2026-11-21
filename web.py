@@ -119,6 +119,18 @@ def create_fastapi_app() -> FastAPI:
 
     api = FastAPI(lifespan=lifespan)
     binding_enabled = stores is not None and settings.install_binding_enabled
+    if (
+        stores is not None
+        and settings.faultmaven_dashboard_url
+        and settings.faultmaven_oauth_redirect_uri
+        and not settings.faultmaven_bind_assertion_key.get_secret_value()
+    ):
+        # The two URLs say binding is wanted; without the key it is off.
+        logger.warning(
+            "Install-time workspace binding is off: FAULTMAVEN_DASHBOARD_URL and "
+            "FAULTMAVEN_OAUTH_REDIRECT_URI are set but SLACK_BIND_ASSERTION_KEY is "
+            "not, so a bind could not be signed"
+        )
     if binding_enabled:
         logger.info("Install-time workspace binding enabled")
         # Spent records hold a live PKCE verifier and a state secret. Nothing
@@ -175,7 +187,12 @@ def create_fastapi_app() -> FastAPI:
         """
 
         if not binding_enabled:
-            return _html(install_pages.unavailable_page(), status=404)
+            return _html(
+                install_pages.unavailable_page(
+                    binding_required=settings.faultmaven_require_workspace_binding
+                ),
+                status=404,
+            )
 
         code = req.query_params.get("code", "")
         state = req.query_params.get("state", "")
@@ -220,6 +237,7 @@ def create_fastapi_app() -> FastAPI:
                     record=record,
                     code=code,
                     redirect_uri=settings.faultmaven_oauth_redirect_uri,
+                    assertion_key=settings.faultmaven_bind_assertion_key,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — every failure is a page, not a 500

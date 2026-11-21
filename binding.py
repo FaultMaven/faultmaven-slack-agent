@@ -43,14 +43,20 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import json
 import logging
+import secrets
+import time
 from enum import Enum
 from urllib.parse import urlencode
 
+from pydantic import SecretStr
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from faultmaven import BindFailureReason, FaultMavenClient, WorkspaceBindError
+from faultmaven.client import _jwt_claims
 from pending_binds import PendingBind
 
 logger = logging.getLogger("faultmaven.slack.binding")
@@ -97,6 +103,48 @@ def authorize_url(
     return f"{dashboard_url.rstrip('/')}/auth/authorize?{query}"
 
 
+#: How long a bind assertion is signed for (the API accepts it with 30 seconds'
+#: clock leeway either side): it is sent the moment it is signed.
+BIND_ASSERTION_LIFETIME_SECONDS = 60
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def sign_bind_assertion(
+    *,
+    key: SecretStr,
+    subject: str,
+    slack_team_id: str,
+    slack_enterprise_id: str,
+    now: int | None = None,
+    jti: str | None = None,
+) -> str:
+    """The assertion the Cloud API requires to bind a workspace
+    (faultmaven-cloud#83): a compact JWS, HS256, saying this agent completed the
+    Slack install of ``slack_team_id`` and the FaultMaven sign-in of
+    ``subject``. Byte-identical to what PyJWT signs for the same claims, which a
+    known-answer test pins."""
+
+    issued = int(time.time()) if now is None else now
+    claims = {
+        "iss": "faultmaven-slack-agent",
+        "aud": "faultmaven-cloud:slack-workspace-bind",
+        "sub": subject,
+        "slack_team_id": slack_team_id,
+        "slack_enterprise_id": slack_enterprise_id,
+        "iat": issued,
+        "exp": issued + BIND_ASSERTION_LIFETIME_SECONDS,
+        "jti": secrets.token_urlsafe(16) if jti is None else jti,
+    }
+    header = _b64url(b'{"alg":"HS256","typ":"JWT"}')
+    payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode("ascii")
+    digest = hmac.new(key.get_secret_value().encode(), signing_input, hashlib.sha256).digest()
+    return f"{header}.{payload}.{_b64url(digest)}"
+
+
 def complete_bind(
     *,
     fm: FaultMavenClient,
@@ -104,10 +152,15 @@ def complete_bind(
     record: PendingBind,
     code: str,
     redirect_uri: str,
+    assertion_key: SecretStr,
 ) -> str:
     """Exchange the code, bind the workspace, persist the credential.
 
     Returns the FaultMaven enterprise id the workspace was bound to.
+
+    The bind carries an assertion signed with ``assertion_key`` for the admin's
+    FaultMaven user id (the access token's ``sub``) and the record's workspace.
+    Without a key nothing is exchanged: the Cloud API would refuse the bind.
 
     The admin's tokens are revoked in a ``finally``, so they do not outlive this
     call on any path — including the one where the bind is refused, which is the
@@ -123,6 +176,11 @@ def complete_bind(
     is not a string.
     """
 
+    if not assertion_key.get_secret_value():
+        raise WorkspaceBindError(
+            "SLACK_BIND_ASSERTION_KEY is not set, so the bind cannot be signed",
+            reason=BindFailureReason.NOT_SET_UP,
+        )
     access = refresh = ""
     try:
         try:
@@ -140,11 +198,23 @@ def complete_bind(
                 "code exchange returned no access_token",
                 reason=BindFailureReason.OTHER_REFUSAL,
             )
+        subject = (_jwt_claims(access) or {}).get("sub")
+        if not isinstance(subject, str) or not subject:
+            raise WorkspaceBindError(
+                "the admin access token carries no readable sub claim",
+                reason=BindFailureReason.OTHER_REFUSAL,
+            )
         binding = fm.bind_workspace(
             admin_access_token=access,
             slack_team_id=record.team_id,
             team_name=record.team_name,
             slack_enterprise_id=record.enterprise_id or None,
+            assertion=sign_bind_assertion(
+                key=assertion_key,
+                subject=subject,
+                slack_team_id=record.team_id,
+                slack_enterprise_id=record.enterprise_id or "",
+            ),
         )
         # Keyed on the RECORD's workspace id — the one the completed Slack
         # install established, and the one Slack events will present. Storing a

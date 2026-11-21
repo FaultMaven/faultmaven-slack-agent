@@ -12,7 +12,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Bot scopes requested at install time. Kept in lockstep with manifest.json's
@@ -53,6 +53,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # A refused value is not printed by the error that refuses it: several
+        # of these settings are secrets.
+        hide_input_in_errors=True,
     )
 
     # --- Transport ---------------------------------------------------------
@@ -224,19 +227,44 @@ class Settings(BaseSettings):
     faultmaven_oauth_redirect_uri: str = Field(
         default="", validation_alias="FAULTMAVEN_OAUTH_REDIRECT_URI"
     )
+    # Signs the assertion the bind sends (faultmaven-cloud#83): the same value as
+    # the Cloud API's SLACK_BIND_ASSERTION_KEY, at least 32 bytes.
+    faultmaven_bind_assertion_key: SecretStr = Field(
+        default=SecretStr(""), validation_alias="SLACK_BIND_ASSERTION_KEY"
+    )
+
+    @field_validator("faultmaven_bind_assertion_key")
+    @classmethod
+    def _bind_key_is_usable(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if raw and raw != raw.strip():
+            raise ValueError("SLACK_BIND_ASSERTION_KEY must not begin or end with whitespace")
+        try:
+            encoded = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            # Its message names the character and its position.
+            raise ValueError("SLACK_BIND_ASSERTION_KEY must be valid UTF-8") from None
+        if raw and len(encoded) < 32:
+            raise ValueError("SLACK_BIND_ASSERTION_KEY must be at least 32 bytes")
+        return value
 
     @property
     def install_binding_enabled(self) -> bool:
         """Whether an install can offer to bind the workspace itself.
 
-        Both halves are required, and neither has a safe default: without the
-        dashboard origin there is nowhere to send the admin, and without our
-        exact redirect the exchange cannot succeed. A deployment missing either
-        falls back to operator-provisioned binding rather than starting a flow
-        it cannot finish.
+        All three are required, and none has a safe default: without the
+        dashboard origin there is nowhere to send the admin, without our exact
+        redirect the exchange cannot succeed, and without the assertion key the
+        bind is refused. A deployment missing any falls back to
+        operator-provisioned binding rather than starting a flow it cannot
+        finish.
         """
 
-        return bool(self.faultmaven_dashboard_url and self.faultmaven_oauth_redirect_uri)
+        return bool(
+            self.faultmaven_dashboard_url
+            and self.faultmaven_oauth_redirect_uri
+            and self.faultmaven_bind_assertion_key.get_secret_value()
+        )
 
     @property
     def requester_key(self) -> str:
