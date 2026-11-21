@@ -221,11 +221,9 @@ def test_the_routes_warning_withholds_an_echoed_signature(
         assert piece not in caplog.text and piece not in resp.text
 
 
-@pytest.mark.parametrize("key,warned", [("", True), (BIND_KEY.get_secret_value(), False)])
-def test_two_urls_without_a_key_are_named_at_startup(monkeypatch, tmp_path, caplog, key, warned):
-    """Binding the operator asked for, turned off by a missing key, says so."""
+def _http_env(monkeypatch, tmp_path, **extra: str) -> None:
+    """The HTTP transport with both binding URLs, offline; ``extra`` on top."""
     import config
-    from web import create_fastapi_app
 
     for name, value in {
         "SLACK_TRANSPORT": "http",
@@ -237,10 +235,48 @@ def test_two_urls_without_a_key_are_named_at_startup(monkeypatch, tmp_path, capl
         "FAULTMAVEN_API_TOKEN": "preset-token",
         "FAULTMAVEN_DASHBOARD_URL": "https://app.faultmaven.ai",
         "FAULTMAVEN_OAUTH_REDIRECT_URI": "https://slack.faultmaven.ai/faultmaven/callback",
-        "SLACK_BIND_ASSERTION_KEY": key,
+        **extra,
     }.items():
         monkeypatch.setenv(name, value)
     config.get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("required", "said"),
+    [("true", "will not answer in this workspace"), ("false", "Until then the app works")],
+)
+def test_the_callback_with_binding_off_says_what_happens_until_bound(
+    monkeypatch, tmp_path, required, said
+):
+    """No key, so binding is off: the callback's page follows
+    FAULTMAVEN_REQUIRE_WORKSPACE_BINDING, as the install page does."""
+    import config
+    from fastapi.testclient import TestClient
+
+    from web import create_fastapi_app
+
+    _http_env(
+        monkeypatch, tmp_path,
+        SLACK_BIND_ASSERTION_KEY="", FAULTMAVEN_REQUIRE_WORKSPACE_BINDING=required,
+    )
+    try:
+        with TestClient(create_fastapi_app()) as client:
+            resp = client.get("/faultmaven/callback", params={"code": "c", "state": "s"})
+    finally:
+        config.get_settings.cache_clear()
+
+    assert resp.status_code == 404
+    assert said in resp.text
+    assert "ready" not in resp.text
+
+
+@pytest.mark.parametrize("key,warned", [("", True), (BIND_KEY.get_secret_value(), False)])
+def test_two_urls_without_a_key_are_named_at_startup(monkeypatch, tmp_path, caplog, key, warned):
+    """Binding the operator asked for, turned off by a missing key, says so."""
+    import config
+    from web import create_fastapi_app
+
+    _http_env(monkeypatch, tmp_path, SLACK_BIND_ASSERTION_KEY=key)
     caplog.set_level(logging.WARNING)
     try:
         create_fastapi_app()

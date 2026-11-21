@@ -103,7 +103,8 @@ def authorize_url(
     return f"{dashboard_url.rstrip('/')}/auth/authorize?{query}"
 
 
-#: How long a bind assertion is valid: it is sent the moment it is signed.
+#: How long a bind assertion is signed for (the API accepts it with 30 seconds'
+#: clock leeway either side): it is sent the moment it is signed.
 BIND_ASSERTION_LIFETIME_SECONDS = 60
 
 

@@ -2118,8 +2118,8 @@ class FaultMavenClient:
     def _error_detail(resp: httpx.Response, *, withhold: str = "") -> str:
         """The backend's error explanation, truncated — for logs and messages.
         Each of ``withhold``'s payload and signature segments (the bind's
-        assertion) is cut from it before truncation, so an echo of either, or of
-        a tail of the assertion, is withheld too.
+        assertion) is cut from it before truncation: an echo containing a whole
+        payload or signature segment is withheld.
 
         A JSON object is never quoted whole: at any status, it may be a token
         response or a gateway echoing the request, and its values, even its keys,
