@@ -389,6 +389,22 @@ def _make_button(action: dict[str, Any]) -> dict[str, Any] | None:
     return button
 
 
+# Engine-owned decision chips (#2468): the intent types core's own rule
+# (``_typed_text_may_answer``) sets aside as a chip that answers or re-opens an
+# offer. On Slack they are the only path to their action, so they are never the
+# ones left without a button.
+_DECISION_INTENT_TYPES = frozenset({"status_transition", "confirmation"})
+
+
+def _button_priority(action: dict[str, Any]) -> int:
+    """Rank an action for the button cap: decision chips, other intents, rest."""
+
+    intent = action.get("intent")
+    if not isinstance(intent, dict) or not intent:
+        return 2
+    return 0 if intent.get("type") in _DECISION_INTENT_TYPES else 1
+
+
 def build_turn_blocks(
     result: TurnResult, *, case_id: str | None = None
 ) -> list[dict[str, Any]]:
@@ -403,7 +419,9 @@ def build_turn_blocks(
     DECIDE actions become interactive buttons (handled by
     listeners/actions.py); so do data-box choices (``prefill``, #100), whose
     click opens a modal. RUN renders as a copyable code block; other EVIDENCE
-    asks render as the prominent text section above.
+    asks render as the prominent text section above. Within the 10-button cap,
+    engine decision chips get buttons first (``_button_priority``); what is left
+    over is listed under "Suggested next steps" in core's order.
 
     ``case_id`` is passed **only on the case-opening reply** (thread = case, so
     once is enough). It renders as a quiet, selectable line in the context row
@@ -422,16 +440,27 @@ def build_turn_blocks(
         blocks.append(_section(part))
 
     evidence: list[dict[str, Any]] = []
-    buttons: list[dict[str, Any]] = []
-    text_actions: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
     for action in result.suggested_actions:
         a_type = (action.get("type") or action.get("action_type") or "").upper()
         if a_type == "EVIDENCE" and not is_data_box(action):
             evidence.append(action)
-            continue
-        button = _make_button(action) if len(buttons) < _MAX_BUTTONS else None
+        else:
+            eligible.append(action)
+
+    # The cap is spent by priority, each pass in core's order (#2468): a
+    # decision chip core appends after ten follow-ups still gets its button.
+    buttons: list[dict[str, Any]] = []
+    buttoned: set[int] = set()
+    for i in sorted(range(len(eligible)), key=lambda i: _button_priority(eligible[i])):
+        button = _make_button(eligible[i]) if len(buttons) < _MAX_BUTTONS else None
         if button is not None:
             buttons.append(button)
+            buttoned.add(i)
+
+    text_actions: list[dict[str, Any]] = []
+    for i, action in enumerate(eligible):
+        if i in buttoned:
             # A button face shows only the terse label ("Something else"); when
             # the action carries a fuller ``body``, also describe it in the step
             # list so the choice reads with its meaning, not as a bare chip. A
