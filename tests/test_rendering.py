@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from rendering import build_turn_blocks, clean_mention
+from rendering import _button_priority, build_turn_blocks, clean_mention
 
 
 def _sections(blocks) -> list[str]:
@@ -406,8 +406,9 @@ def test_decision_chips_after_twelve_choices_and_follow_ups_keep_their_buttons()
                *(_follow_up(n) for n in range(3)), resolve, close]
     blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
 
+    # Priority picks which actions get a button; the row keeps core's order.
     assert _labels(blocks) == [
-        "Mark it resolved", "Close without resolving", *(f"Type {n}" for n in range(8))]
+        *(f"Type {n}" for n in range(8)), "Mark it resolved", "Close without resolving"]
     # The overflow is listed in core's order; the decision chips are not listed.
     steps = _steps(blocks)
     overflow = [f"*Type {n}*" for n in range(8, 12)] + [
@@ -423,13 +424,13 @@ def test_declined_close_card_after_ten_follow_ups_is_a_button():
     actions = [*(_follow_up(n) for n in range(10)), card]
     blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
 
-    assert _labels(blocks) == ["Close the case", *(f"Follow-up {n}" for n in range(9))]
+    assert _labels(blocks) == [*(f"Follow-up {n}" for n in range(9)), "Close the case"]
     # Body lines stay in core's order, the overflowed follow-up among them.
     steps = _steps(blocks)
     assert steps.index("Follow-up 9") < steps.index("Close it as a false alarm.")
 
 
-def test_under_the_cap_every_action_is_a_button_in_priority_order():
+def test_under_the_cap_buttons_keep_core_order():
     actions = [
         {"type": "EVIDENCE", "label": "paste the DB logs"},
         _follow_up(0),
@@ -441,17 +442,48 @@ def test_under_the_cap_every_action_is_a_button_in_priority_order():
     blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
 
     assert _labels(blocks) == [
-        "Yes, close it", "Type 0", "Follow-up 0", "Submit the output", "Follow-up 1"]
-    assert _buttons(blocks)[3]["action_id"] == "fm_data_box:3"
+        "Follow-up 0", "Type 0", "Submit the output", "Yes, close it", "Follow-up 1"]
+    assert _buttons(blocks)[2]["action_id"] == "fm_data_box:2"
     # The EVIDENCE ask keeps its own section, never a button.
     assert any("paste the DB logs" in s and "FaultMaven needs" in s
                for s in _sections(blocks))
 
 
-def test_without_decision_chips_buttons_keep_core_order():
-    # Core puts clarification choices ahead of the follow-ups
-    # (turn_response.py), so with no decision chip nothing moves.
-    actions = [*(_reclassify(n) for n in range(8)), *(_follow_up(n) for n in range(4))]
+def test_over_the_cap_a_data_box_and_decision_chips_keep_buttons_gate1_ranks_as_engine():
+    data_box = {"type": "EVIDENCE", "label": "Submit the output", "prefill": ""}
+    gate1 = [_chip(label, type="confirmation", confirmation_value=value,
+                   proposal_id="gate1:0123456789abcdef")
+             for label, value in (("Yes, that's it", True), ("Not quite", False))]
+    resolve = _chip("Mark it resolved", type="status_transition", to_state="resolved")
+    close = _chip("Close without resolving", type="status_transition", to_state="closed")
+    actions = [data_box, *(_reclassify(n) for n in range(12)), *gate1, resolve, close]
     blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    # The decision chips take 2 buttons; the other 8 go to the engine choices in
+    # core's order, so Gate 1's pair, ranked among them after 12 choices, has none.
     assert _labels(blocks) == [
-        *(f"Type {n}" for n in range(8)), "Follow-up 0", "Follow-up 1"]
+        "Submit the output", *(f"Type {n}" for n in range(7)),
+        "Mark it resolved", "Close without resolving"]
+    assert _buttons(blocks)[0]["action_id"] == "fm_data_box:0"
+    assert {_button_priority(a) for a in (data_box, *gate1, _reclassify(0))} == {1}
+    assert _button_priority(resolve) == _button_priority(close) == 0
+    assert _button_priority(_follow_up(0)) == 2
+
+
+def test_without_decision_chips_buttons_keep_core_order():
+    # Core's order (turn_response.py): save-chat-data choices, the data box,
+    # clarification choices, then the follow-ups. This is what main renders.
+    save = {"type": "DECIDE", "label": "Yes, save it as data",
+            "payload": "Save that output as data.",
+            "intent": {"type": "save_chat_data", "offer_id": "offer_1"}}
+    resubmit = {"type": "EVIDENCE", "label": "Not exactly, let me re-submit",
+                "prefill": "ERROR 42"}
+    actions = [save, resubmit, *(_reclassify(n) for n in range(12)),
+               *(_follow_up(n) for n in range(3))]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    assert [(b["text"]["text"], b["action_id"]) for b in _buttons(blocks)] == [
+        ("Yes, save it as data", "fm_suggested_action:0"),
+        ("Not exactly, let me re-submit", "fm_data_box:1"),
+        *((f"Type {n}", f"fm_suggested_action:{n + 2}") for n in range(8)),
+    ]

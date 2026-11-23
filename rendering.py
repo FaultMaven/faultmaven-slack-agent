@@ -389,20 +389,28 @@ def _make_button(action: dict[str, Any]) -> dict[str, Any] | None:
     return button
 
 
-# Engine-owned decision chips (#2468): the intent types core's own rule
+# Engine-owned decision chips (#2468), the set core's own rule
 # (``_typed_text_may_answer``) sets aside as a chip that answers or re-opens an
-# offer. On Slack they are the only path to their action, so they are never the
-# ones left without a button.
+# offer: any ``status_transition``, and any ``confirmation`` that does not name
+# Gate 1 (a ``proposal_id`` starting ``gate1:``, core's ``is_gate1_offer_key``).
+# Typed text may answer Gate 1's pair, so it ranks with the other engine
+# choices. A decision chip is the only path to its action on Slack.
 _DECISION_INTENT_TYPES = frozenset({"status_transition", "confirmation"})
+_GATE1_KEY_PREFIX = "gate1:"
 
 
 def _button_priority(action: dict[str, Any]) -> int:
-    """Rank an action for the button cap: decision chips, other intents, rest."""
+    """Rank an action for the button cap: 0 a decision chip, 1 another engine
+    choice (any other intent, Gate 1's pair, or a data box), 2 the rest."""
 
     intent = action.get("intent")
     if not isinstance(intent, dict) or not intent:
-        return 2
-    return 0 if intent.get("type") in _DECISION_INTENT_TYPES else 1
+        return 1 if is_data_box(action) else 2
+    kind = intent.get("type")
+    gate1 = kind == "confirmation" and str(intent.get("proposal_id") or "").startswith(
+        _GATE1_KEY_PREFIX
+    )
+    return 0 if kind in _DECISION_INTENT_TYPES and not gate1 else 1
 
 
 def build_turn_blocks(
@@ -419,9 +427,10 @@ def build_turn_blocks(
     DECIDE actions become interactive buttons (handled by
     listeners/actions.py); so do data-box choices (``prefill``, #100), whose
     click opens a modal. RUN renders as a copyable code block; other EVIDENCE
-    asks render as the prominent text section above. Within the 10-button cap,
-    engine decision chips get buttons first (``_button_priority``); what is left
-    over is listed under "Suggested next steps" in core's order.
+    asks render as the prominent text section above. Over the 10-button cap,
+    which actions get a button is decided by ``_button_priority``, engine
+    decision chips first; the buttons and the "Suggested next steps" list both
+    keep core's order.
 
     ``case_id`` is passed **only on the case-opening reply** (thread = case, so
     once is enough). It renders as a quiet, selectable line in the context row
@@ -448,19 +457,19 @@ def build_turn_blocks(
         else:
             eligible.append(action)
 
-    # The cap is spent by priority, each pass in core's order (#2468): a
-    # decision chip core appends after ten follow-ups still gets its button.
-    buttons: list[dict[str, Any]] = []
-    buttoned: set[int] = set()
+    # Priority decides only WHICH actions get the capped buttons (#2468), each
+    # tier in core's order: a decision chip core appends after ten follow-ups
+    # still gets its button. The chosen buttons are laid out in core's order.
+    chosen: dict[int, dict[str, Any]] = {}
     for i in sorted(range(len(eligible)), key=lambda i: _button_priority(eligible[i])):
-        button = _make_button(eligible[i]) if len(buttons) < _MAX_BUTTONS else None
+        button = _make_button(eligible[i]) if len(chosen) < _MAX_BUTTONS else None
         if button is not None:
-            buttons.append(button)
-            buttoned.add(i)
+            chosen[i] = button
+    buttons = [chosen[i] for i in sorted(chosen)]
 
     text_actions: list[dict[str, Any]] = []
     for i, action in enumerate(eligible):
-        if i in buttoned:
+        if i in chosen:
             # A button face shows only the terse label ("Something else"); when
             # the action carries a fuller ``body``, also describe it in the step
             # list so the choice reads with its meaning, not as a bare chip. A
