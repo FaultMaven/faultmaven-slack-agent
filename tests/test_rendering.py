@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from faultmaven.client import TurnResult
-from rendering import build_turn_blocks, clean_mention
+from rendering import _button_priority, build_turn_blocks, clean_mention
 
 
 def _sections(blocks) -> list[str]:
@@ -368,3 +368,122 @@ def test_overclaim_adds_caution_marker():
     )
     ctx = _context_texts(build_turn_blocks(result))
     assert any("mechanistic" in t and "⚠" in t for t in ctx)
+
+
+# --- The button cap spends on decision chips first (#2468) -------------------
+# Core appends its engine-owned decision chips after the model's follow-ups and
+# any clarification choices; on Slack they are the only path to their action.
+
+
+def _follow_up(n: int) -> dict:
+    return {"type": "DECIDE", "label": f"Follow-up {n}",
+            "payload": f"Do follow-up {n}.", "body": f"Follow-up {n} body."}
+
+
+def _reclassify(n: int) -> dict:
+    return {"type": "DECIDE", "label": f"Type {n}", "payload": f"Treat as {n}.",
+            "intent": {"type": "file_reclassification",
+                       "file_id": f"file_{n // 4}", "data_type": f"type_{n}"}}
+
+
+def _chip(label: str, **intent) -> dict:
+    return {"action_type": "DECIDE", "label": label, "payload": f"{label}.",
+            "intent": intent}
+
+
+def _labels(blocks) -> list[str]:
+    return [b["text"]["text"] for b in _buttons(blocks)]
+
+
+def _steps(blocks) -> str:
+    return next(s for s in _sections(blocks) if "Suggested next steps" in s)
+
+
+def test_decision_chips_after_twelve_choices_and_follow_ups_keep_their_buttons():
+    resolve = _chip("Mark it resolved", type="status_transition", to_state="resolved")
+    close = _chip("Close without resolving", type="status_transition", to_state="closed")
+    actions = [*(_reclassify(n) for n in range(12)),
+               *(_follow_up(n) for n in range(3)), resolve, close]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    # Priority picks which actions get a button; the row keeps core's order.
+    assert _labels(blocks) == [
+        *(f"Type {n}" for n in range(8)), "Mark it resolved", "Close without resolving"]
+    # The overflow is listed in core's order; the decision chips are not listed.
+    steps = _steps(blocks)
+    overflow = [f"*Type {n}*" for n in range(8, 12)] + [
+        f"*Follow-up {n}*" for n in range(3)]
+    positions = [steps.index(label) for label in overflow]
+    assert positions == sorted(positions)
+    assert "Mark it resolved" not in steps and "Close without resolving" not in steps
+
+
+def test_declined_close_card_after_ten_follow_ups_is_a_button():
+    card = {**_chip("Close the case", type="status_transition", to_state="closed"),
+            "body": "Close it as a false alarm."}
+    actions = [*(_follow_up(n) for n in range(10)), card]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    assert _labels(blocks) == [*(f"Follow-up {n}" for n in range(9)), "Close the case"]
+    # Body lines stay in core's order, the overflowed follow-up among them.
+    steps = _steps(blocks)
+    assert steps.index("Follow-up 9") < steps.index("Close it as a false alarm.")
+
+
+def test_under_the_cap_buttons_keep_core_order():
+    actions = [
+        {"type": "EVIDENCE", "label": "paste the DB logs"},
+        _follow_up(0),
+        _reclassify(0),
+        {"type": "EVIDENCE", "label": "Submit the output", "prefill": ""},
+        _chip("Yes, close it", type="confirmation", confirmation_value=True),
+        _follow_up(1),
+    ]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    assert _labels(blocks) == [
+        "Follow-up 0", "Type 0", "Submit the output", "Yes, close it", "Follow-up 1"]
+    assert _buttons(blocks)[2]["action_id"] == "fm_data_box:2"
+    # The EVIDENCE ask keeps its own section, never a button.
+    assert any("paste the DB logs" in s and "FaultMaven needs" in s
+               for s in _sections(blocks))
+
+
+def test_over_the_cap_a_data_box_and_decision_chips_keep_buttons_gate1_ranks_as_engine():
+    data_box = {"type": "EVIDENCE", "label": "Submit the output", "prefill": ""}
+    gate1 = [_chip(label, type="confirmation", confirmation_value=value,
+                   proposal_id="gate1:0123456789abcdef")
+             for label, value in (("Yes, that's it", True), ("Not quite", False))]
+    resolve = _chip("Mark it resolved", type="status_transition", to_state="resolved")
+    close = _chip("Close without resolving", type="status_transition", to_state="closed")
+    actions = [data_box, *(_reclassify(n) for n in range(12)), *gate1, resolve, close]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    # The decision chips take 2 buttons; the other 8 go to the engine choices in
+    # core's order, so Gate 1's pair, ranked among them after 12 choices, has none.
+    assert _labels(blocks) == [
+        "Submit the output", *(f"Type {n}" for n in range(7)),
+        "Mark it resolved", "Close without resolving"]
+    assert _buttons(blocks)[0]["action_id"] == "fm_data_box:0"
+    assert {_button_priority(a) for a in (data_box, *gate1, _reclassify(0))} == {1}
+    assert _button_priority(resolve) == _button_priority(close) == 0
+    assert _button_priority(_follow_up(0)) == 2
+
+
+def test_without_decision_chips_buttons_keep_core_order():
+    # Core's order (turn_response.py): save-chat-data choices, the data box,
+    # clarification choices, then the follow-ups. This is what main renders.
+    save = {"type": "DECIDE", "label": "Yes, save it as data",
+            "payload": "Save that output as data.",
+            "intent": {"type": "save_chat_data", "offer_id": "offer_1"}}
+    resubmit = {"type": "EVIDENCE", "label": "Not exactly, let me re-submit",
+                "prefill": "ERROR 42"}
+    actions = [save, resubmit, *(_reclassify(n) for n in range(12)),
+               *(_follow_up(n) for n in range(3))]
+    blocks = build_turn_blocks(TurnResult(agent_response="?", suggested_actions=actions))
+
+    assert [(b["text"]["text"], b["action_id"]) for b in _buttons(blocks)] == [
+        ("Yes, save it as data", "fm_suggested_action:0"),
+        ("Not exactly, let me re-submit", "fm_data_box:1"),
+        *((f"Type {n}", f"fm_suggested_action:{n + 2}") for n in range(8)),
+    ]
