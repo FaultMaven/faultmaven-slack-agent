@@ -991,8 +991,9 @@ def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     key reuse (:data:`KEY_REUSE_TEXT`) rather than replayed, and so is a
     mention or thread reply whose first delivery seeded the thread: its
     redelivery reads the thread as seeded, so its summons and catch-up differ
-    (pre-existing; tracked separately). An action_ts names one click. The namespace keeps them apart: a click's action_ts
-    and a message's ts are both Slack timestamps and could coincide.
+    (pre-existing; FaultMaven/faultmaven#3072). An action_ts names one click.
+    The namespace keeps them apart: a click's action_ts and a message's ts are
+    both Slack timestamps and could coincide.
 
     sha256 hex: deterministic, 64 characters, and inside the header's published
     grammar (8–255 of ``[A-Za-z0-9_-]``) whatever the identity contains — a

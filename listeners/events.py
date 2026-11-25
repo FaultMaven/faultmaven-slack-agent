@@ -363,7 +363,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 text=query,
                 query_source=query_source,
                 # The mention itself is the turn: the identity its redelivery
-                # is deduped on above, so a redelivery is the same turn.
+                # is deduped on above, so a redelivery is the same turn, and
+                # is replayed when it sends the same bytes. A redelivery of
+                # the mention that seeded the thread does not (it reads the
+                # thread as seeded): FaultMaven/faultmaven#3072.
                 idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 prior_context=prior_context,
