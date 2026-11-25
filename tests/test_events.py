@@ -10,8 +10,8 @@ from __future__ import annotations
 import httpx
 from slack_sdk.errors import SlackApiError
 
+from listeners._turn import SUMMONS_TEXT
 from listeners.events import (
-    SUMMONS_TEXT,
     _fetch_thread_context,
     is_dm_summons,
     is_thread_followup_candidate,

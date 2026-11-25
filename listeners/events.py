@@ -39,7 +39,7 @@ from ._turn import (
     run_gated,
     run_turn_and_post,
     skipped_files_note,
-    SUMMONS_TEXT,
+    SUMMONS_QUERY,
     UNREADABLE_FILES_TEXT,
 )
 
@@ -270,7 +270,7 @@ def mention_text(cleaned: str, *, seeded: bool) -> tuple[str, str | None]:
     """The turn's ``(query, query_source)`` for an ``app_mention``.
 
     Real text passes through. A bare mention on a thread that is not yet a
-    SEEDED investigation is a summons (:data:`SUMMONS_TEXT`) — "seeded", not
+    SEEDED investigation is a summons (:data:`~listeners._turn.SUMMONS_QUERY`) — "seeded", not
     merely mapped: a mapping whose opening turn failed still needs the summons
     and the catch-up read on the retry. A bare mention on a seeded thread is the
     user poking the assistant, not new data, and sends an EMPTY turn, which the
@@ -282,7 +282,7 @@ def mention_text(cleaned: str, *, seeded: bool) -> tuple[str, str | None]:
     """
     if cleaned:
         return cleaned, None
-    return ("", None) if seeded else (SUMMONS_TEXT, "generated")
+    return ("", None) if seeded else SUMMONS_QUERY
 
 
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
@@ -372,7 +372,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 requester=requester_for(context),
                 mention_user=event.get("user"),
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
-                empty_turn_fallback=SUMMONS_TEXT,
+                empty_turn_fallback=SUMMONS_QUERY,
             )
 
         run_gated(

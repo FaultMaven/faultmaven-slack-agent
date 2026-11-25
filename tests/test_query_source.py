@@ -27,6 +27,7 @@ import listeners._turn as turn_mod
 import listeners.assistant as assistant_mod
 import listeners.events as events_mod
 from faultmaven.client import FaultMavenAPIError, FaultMavenError
+from listeners.actions import register_data_box
 from listeners.assistant import build_assistant
 from listeners.events import register_events
 from listeners.shortcuts import register_shortcuts
@@ -41,7 +42,8 @@ from tests.test_requester import (
     _ctx,
     _live_thread,
 )
-from tests.test_turn_recovery import _Backend, _client, _ok, _read_timeout
+from rendering import DATA_BOX_BLOCK_ID, DATA_BOX_CALLBACK_ID, DATA_BOX_INPUT_ID
+from tests.test_turn_recovery import _Backend, _client, _conflict, _ok, _read_timeout
 
 _KEY = "query-source-test-key"
 
@@ -106,12 +108,28 @@ def test_an_unknown_source_is_refused_before_anything_is_sent():
     backend = _Backend(_ok())
     client, _ = _client(backend)
 
-    with pytest.raises(ValueError, match="query_source"):
+    # A FaultMavenError, which every caller already handles (preflight's
+    # smoke turn catches only that), not a bare ValueError.
+    with pytest.raises(FaultMavenError, match="query_source"):
         client.submit_turn(
             "c1", idempotency_key=_KEY, requester=None, query="x", query_source="pasted"
         )
 
     assert _turn_posts(backend) == []
+
+
+def test_an_empty_source_is_typed_and_sends_no_field():
+    """Core reads an empty field as typed, so it is not refused here."""
+
+    backend = _Backend(_ok())
+    client, _ = _client(backend)
+
+    client.submit_turn(
+        "c1", idempotency_key=_KEY, requester=None, query="x", query_source=""
+    )
+
+    (post,) = _turn_posts(backend)
+    assert "query_source" not in _form(post)
 
 
 def test_a_source_alone_is_not_a_turn():
@@ -371,18 +389,130 @@ def test_a_files_only_thread_reply_sends_generated(store, monkeypatch):
     assert _sent(fm) == [(events_mod.FILES_ONLY_REPLY_QUERY, "generated")]
 
 
-@pytest.mark.parametrize("surface", [_mention, _dm, _panel, _reply])
+#: Each surface's typed message beside the agent-written query it can send.
+_PAIRS = [
+    (_mention, "<@UBOT> ", {"text": "<@UBOT>"}, turn_mod.SUMMONS_TEXT),
+    (_dm, "", {"text": "", "files": True}, turn_mod.FILES_ONLY_QUERY),
+    (_panel, "", {"text": "", "files": True}, turn_mod.FILES_ONLY_QUERY),
+    (_reply, "", {"text": "", "files": True}, events_mod.FILES_ONLY_REPLY_QUERY),
+]
+
+
+@pytest.mark.parametrize(
+    "surface, prefix, written, written_query", _PAIRS, ids=lambda v: getattr(v, "__name__", None)
+)
 @pytest.mark.parametrize("files", [False, True])
-def test_a_typed_message_sends_no_source(store, monkeypatch, surface, files):
-    """With or without a file, the user's own words go as typed (no field)."""
+def test_a_typed_message_sends_no_source_beside_the_agent_s_generated(
+    tmp_path, monkeypatch, surface, prefix, written, written_query, files
+):
+    """With or without a file, the user's own words go as typed (no field);
+    the same surface's agent-written query goes as generated, so a surface
+    that sent no field at all would fail here."""
 
     _files_only(monkeypatch)
-    fm = _FM()
-    prefix = "<@UBOT> " if surface is _mention else ""
+    typed_fm, written_fm = _FM(), _FM()
+    typed_store = CaseStore(str(tmp_path / "typed.db"))
+    written_store = CaseStore(str(tmp_path / "written.db"))
+    try:
+        surface(typed_store, typed_fm, text=f"{prefix}the pods are crashlooping", files=files)
+        surface(written_store, written_fm, **written)
+    finally:
+        typed_store.close()
+        written_store.close()
 
-    surface(store, fm, text=f"{prefix}the pods are crashlooping", files=files)
+    assert _sent(typed_fm) == [("the pods are crashlooping", None)]
+    assert _sent(written_fm) == [(written_query, "generated")]
 
-    assert _sent(fm) == [("the pods are crashlooping", None)]
+
+def test_a_data_box_submission_puts_no_source_on_the_wire(store):
+    """Its turn has no query (core composes one), so there is nothing to describe."""
+
+    backend = _Backend(_ok())
+    client, _ = _client(backend)
+    _live_thread(store)
+    app = _App()
+    register_data_box(app, client, store)
+
+    app.views[DATA_BOX_CALLBACK_ID](
+        ack=lambda **kw: None,
+        body={"user": {"id": "U1"}},
+        view={
+            "id": "V1",
+            "private_metadata": '{"c": "C1", "t": "TS1"}',
+            "state": {"values": {DATA_BOX_BLOCK_ID: {DATA_BOX_INPUT_ID: {"value": "df -h"}}}},
+        },
+        context=_ctx(),
+        client=_Slack(),
+        logger=_LOG,
+    )
+    turn_mod.drain_turns(5.0)
+
+    (post,) = _turn_posts(backend)
+    form = _form(post)
+    assert form["pasted_content"] == ["df -h"]
+    assert "query" not in form and "query_source" not in form
+
+
+def test_the_empty_turn_fallback_carries_its_own_source():
+    """The fallback's source travels with it, not hardcoded at the re-send."""
+
+    fm = _Pre28FM()
+
+    class _Store:
+        def get(self, *key):
+            return "case_1"
+
+        def mark_seeded(self, *key):
+            pass
+
+    turn_mod.run_turn_and_post(
+        _Slack(), fm, _Store(), channel="C1", thread_ts="TS1", team_id="T1",
+        text="", empty_turn_fallback=("Re-asked.", "chosen"), requester=None,
+        idempotency_key=_KEY,
+    )
+
+    assert _sent(fm) == [("", None), ("Re-asked.", "chosen")]
+
+
+class _RecordingSlack(_Slack):
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def chat_postMessage(self, **kw):
+        self.texts.append(kw.get("text", ""))
+        return super().chat_postMessage(**kw)
+
+    def chat_update(self, **kw):
+        self.texts.append(kw.get("text", ""))
+        return super().chat_update(**kw)
+
+
+def test_a_redelivery_refused_as_a_key_reuse_says_to_check_the_case(store):
+    """The deploy window: a turn the previous release committed with no field,
+    redelivered here with ``generated`` under the same key, is refused as a key
+    reuse. The thread is told the key was used and to check the case before
+    re-sending, not that the turn failed or to try again."""
+
+    backend = _Backend(
+        httpx.Response(201, json={"case_id": "c1"}), _conflict("IDEMPOTENCY_KEY_REUSE")
+    )
+    client, _ = _client(backend)
+    slack = _RecordingSlack()
+    app = _App()
+    register_events(app, client, store)
+
+    app.events["app_mention"](
+        event={"channel": "C1", "ts": "5.0", "thread_ts": "TS1", "user": "U1",
+               "text": "<@UBOT>"},
+        context=_ctx(),
+        client=slack,
+        logger=_LOG,
+    )
+    turn_mod.drain_turns(5.0)
+
+    (post,) = _turn_posts(backend)
+    assert _form(post)["query_source"] == ["generated"]
+    assert slack.texts[-1] == turn_mod.KEY_REUSE_TEXT
 
 
 def test_the_doctor_s_smoke_turn_sends_generated():

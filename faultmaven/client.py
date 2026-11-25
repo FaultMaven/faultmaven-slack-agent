@@ -2576,9 +2576,10 @@ class FaultMavenClient:
         defaults to submission time when it is absent, which reads a
         two-hour-old alert as current.
 
-        ``query_source`` says who wrote ``query`` (:data:`QUERY_SOURCES`); None
-        sends no field, which core reads as typed. Any other value raises
-        ``ValueError`` before anything is sent.
+        ``query_source`` says who wrote ``query`` (:data:`QUERY_SOURCES`). None
+        or ``""`` sends no field, which core reads as typed (core reads an
+        empty field as typed too). Any other value raises
+        :class:`FaultMavenError` before anything is sent.
 
         ``requester`` is the turn's opaque ordering key
         (``listeners._turn.requester_for``), sent as :data:`REQUESTER_HEADER`
@@ -2709,9 +2710,9 @@ class FaultMavenClient:
                 "a turn needs at least one of query / pasted_content / files"
             )
         # Added after the guard: it describes the query, it is not content.
-        if query_source is not None:
+        if query_source:
             if query_source not in QUERY_SOURCES:
-                raise ValueError(f"unknown query_source {query_source!r}")
+                raise FaultMavenError(f"unknown query_source {query_source!r}")
             form["query_source"] = query_source
 
         cred = self._credential_for(team_id)

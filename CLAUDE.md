@@ -138,10 +138,16 @@ done when its check conclusions are green, not when local tests pass.
   `resolve_query` or a thread reply, preflight's smoke turn). The user's own
   text, the empty turn and the data box's paste-only turn send none: core
   reads absent as `typed`, the only query it searches for system output to
-  offer back as data.
+  offer back as data. Deploy window: a turn the previous release committed
+  with no field, redelivered by Slack to this one with `chosen` or
+  `generated` under the same key, is refused as a key reuse (409
+  `IDEMPOTENCY_KEY_REUSE`, shown as `KEY_REUSE_TEXT`) instead of replayed:
+  a one-time cost of the deploy.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
-  regenerated `faultmaven/api_generated.py` in the same PR.
+  regenerated `faultmaven/api_generated.py` in the same PR. The one exception
+  (owner ruling, faultmaven#2717): an additive optional field an older core
+  ignores may be sent ahead of the pin, as `query_source` is.
 
 ## Hard rules
 

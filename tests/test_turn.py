@@ -22,6 +22,7 @@ from listeners._turn import (
     retry_may_help,
     run_turn,
     run_turn_and_post,
+    SUMMONS_QUERY,
     SUMMONS_TEXT,
     turn_error_text,
     TURN_ERROR_TEXT,
@@ -451,7 +452,7 @@ def test_empty_turn_falls_back_to_the_summons_on_a_pre_2_8_backend():
     client.chat_postMessage.return_value = {"ts": "p1"}
     run_turn_and_post(
         client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
-        text="", empty_turn_fallback=SUMMONS_TEXT, requester=None, idempotency_key="test-turn-key",
+        text="", empty_turn_fallback=SUMMONS_QUERY, requester=None, idempotency_key="test-turn-key",
     )
     assert calls == ["", SUMMONS_TEXT]
     posted = client.chat_update.call_args.kwargs.get("text", "")
@@ -472,6 +473,6 @@ def test_a_non_400_error_on_an_empty_turn_is_not_retried():
     client.chat_postMessage.return_value = {"ts": "p1"}
     run_turn_and_post(
         client, FakeFM(), _FakeStore(), channel="C", thread_ts="th", team_id="T",
-        text="", empty_turn_fallback=SUMMONS_TEXT, requester=None, idempotency_key="test-turn-key",
+        text="", empty_turn_fallback=SUMMONS_QUERY, requester=None, idempotency_key="test-turn-key",
     )
     assert calls == [""]

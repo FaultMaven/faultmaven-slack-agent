@@ -236,6 +236,8 @@ RESTARTING_TEXT = (
 #: discussion. Also the fallback when a backend older than contract 2.8.0
 #: refuses the EMPTY turn a seeded thread sends (see ``run_turn_and_post``).
 SUMMONS_TEXT = "Please investigate this thread."
+#: The summons as a turn's ``(query, query_source)``: this agent's text.
+SUMMONS_QUERY = (SUMMONS_TEXT, "generated")
 #: The query of a message that carries only files (:func:`resolve_query`).
 FILES_ONLY_QUERY = "Please investigate the attached file(s)."
 
@@ -983,8 +985,13 @@ def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     ``view:team:view_id`` for a data-box submission (one modal, one paste). The
     message ts and the trigger_id are what this agent already dedupes Slack's
     redeliveries on, so a redelivered event (even to a restarted process, whose
-    in-memory dedup is empty) is the same turn to the backend too; an action_ts
-    names one click. The namespace keeps them apart: a click's action_ts
+    in-memory dedup is empty) is the same turn to the backend too, as long as
+    it sends the same bytes: one redelivered across a release that changed
+    what the turn sends (``query_source``, faultmaven#2717) is refused as a
+    key reuse (:data:`KEY_REUSE_TEXT`) rather than replayed, and so is a
+    mention or thread reply whose first delivery seeded the thread: its
+    redelivery reads the thread as seeded, so its summons and catch-up differ
+    (pre-existing; tracked separately). An action_ts names one click. The namespace keeps them apart: a click's action_ts
     and a message's ts are both Slack timestamps and could coincide.
 
     sha256 hex: deterministic, 64 characters, and inside the header's published
@@ -1295,7 +1302,7 @@ def run_turn_and_post(
     placeholder_ts: str | None = None,
     mention_user: str | None = None,
     intro_note: str | None = None,
-    empty_turn_fallback: str | None = None,
+    empty_turn_fallback: tuple[str, str | None] | None = None,
     query_source: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place.
@@ -1303,9 +1310,9 @@ def run_turn_and_post(
     ``empty_turn_fallback``: when ``text`` is ``""`` (an EMPTY turn, which the
     backend answers with an orientation from contract 2.8.0) and the backend
     refuses it with HTTP 400 — a deployment older than that contract — the turn
-    is re-sent once with this text instead, so a mixed-version deployment gets
-    the pre-2.8.0 behaviour rather than an error. The fallback is this agent's
-    text, so the re-send goes as ``query_source="generated"``.
+    is re-sent once as this ``(query, query_source)`` instead (the caller's
+    :data:`SUMMONS_QUERY`), so a mixed-version deployment gets the pre-2.8.0
+    behaviour rather than an error.
 
     The caller holds the per-thread gate (:func:`try_begin_turn`), so no two turns
     overlap here. ``mention_user`` addresses the reply to the person whose message
@@ -1386,7 +1393,7 @@ def run_turn_and_post(
                     "re-sending the summons",
                     channel,
                 )
-                result = _run(empty_turn_fallback, "generated")
+                result = _run(*empty_turn_fallback)
             else:
                 raise
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
