@@ -407,10 +407,16 @@ def test_uvicorn_log_level_maps_extra_names():
     assert _uvicorn_log_level("NOTSET") == "trace"
 
 
-def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
-    # Socket mode passes a static bot token; Bolt eagerly verifies it via
-    # auth.test at construction (real, desirable prod behavior). Stub that one
-    # network call so the test exercises transport WIRING with a fake token.
+def _socket_app_settings(monkeypatch, tmp_path) -> None:
+    """Point ``app.get_settings`` at hermetic Socket Mode settings.
+
+    No ``.env``, every store under ``tmp_path``, and no refresh credential from
+    the shell, so a build never writes into the checkout. Bolt verifies the
+    static bot token via auth.test at construction (real, desirable prod
+    behavior); that one network call is stubbed.
+    """
+
+    import app
     from slack_sdk.web.client import WebClient
 
     monkeypatch.setattr(
@@ -418,24 +424,30 @@ def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
         "auth_test",
         lambda self, **kw: {"ok": True, "team_id": "T1", "user_id": "U1"},
     )
-    monkeypatch.setenv("SLACK_TRANSPORT", "socket")
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-static")
-    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-static")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "c.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
-    config.get_settings.cache_clear()
-    try:
-        from app import build_app
+    monkeypatch.delenv("FAULTMAVEN_REFRESH_TOKEN", raising=False)
+    settings = _settings(
+        monkeypatch,
+        SLACK_TRANSPORT="socket",
+        SLACK_BOT_TOKEN="xoxb-static",
+        SLACK_APP_TOKEN="xapp-static",
+        CASE_STORE_PATH=str(tmp_path / "c.db"),
+        CREDENTIAL_STORE_PATH=str(tmp_path / "credentials.db"),
+        FAULTMAVEN_API_TOKEN="preset-token",
+    )
+    monkeypatch.setattr(app, "get_settings", lambda: settings)
 
-        bolt_app, store, fm, settings, _stores = build_app()
-        try:
-            assert settings.slack_transport == "socket"
-            assert bolt_app.oauth_flow is None
-        finally:
-            store.close()
-            fm.close()
+
+def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
+    _socket_app_settings(monkeypatch, tmp_path)
+    from app import build_app
+
+    bolt_app, store, fm, settings, _stores = build_app()
+    try:
+        assert settings.slack_transport == "socket"
+        assert bolt_app.oauth_flow is None
     finally:
-        config.get_settings.cache_clear()
+        store.close()
+        fm.close()
 
 
 def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
@@ -449,7 +461,7 @@ def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
     import logging
     import signal
 
-    from slack_sdk.web.client import WebClient
+    from slack_bolt import App
 
     import app
     from faultmaven.client import FaultMavenClient
@@ -458,9 +470,11 @@ def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
         pass
 
     calls: list[str] = []
+    handed: list[object] = []
 
     class FakeHandler:
         def __init__(self, bolt_app, app_token):
+            handed.append(bolt_app)
             assert app_token == "xapp-static"
             self.client = None
 
@@ -471,26 +485,17 @@ def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
         def close(self):
             calls.append("close")
 
+    _socket_app_settings(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "SocketModeHandler", FakeHandler)
     monkeypatch.setattr(app, "apply_root_set", lambda extra: None)
     monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
     monkeypatch.setattr(FaultMavenClient, "startup", lambda self: calls.append("startup"))
-    monkeypatch.setattr(
-        WebClient,
-        "auth_test",
-        lambda self, **kw: {"ok": True, "team_id": "T1", "user_id": "U1"},
-    )
-    monkeypatch.setenv("SLACK_TRANSPORT", "socket")
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-static")
-    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-static")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "c.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
     sigterm = signal.getsignal(signal.SIGTERM)
-    config.get_settings.cache_clear()
     try:
         with pytest.raises(Connected):
             app.main()
     finally:
         signal.signal(signal.SIGTERM, sigterm)
-        config.get_settings.cache_clear()
     assert calls == ["startup", "connect", "close"]
+    (bolt_app,) = handed
+    assert isinstance(bolt_app, App)
