@@ -436,3 +436,61 @@ def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
             fm.close()
     finally:
         config.get_settings.cache_clear()
+
+
+def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
+    """``main()`` builds the app and connects the Socket Mode handler (#2781).
+
+    It once unpacked four of ``build_app()``'s five values and raised before
+    connecting. The handler's ``connect()`` records the call, then ends the
+    loop with a sentinel, so ``main()``'s shutdown path runs and returns here.
+    """
+
+    import logging
+    import signal
+
+    from slack_sdk.web.client import WebClient
+
+    import app
+    from faultmaven.client import FaultMavenClient
+
+    class Connected(Exception):
+        pass
+
+    calls: list[str] = []
+
+    class FakeHandler:
+        def __init__(self, bolt_app, app_token):
+            assert app_token == "xapp-static"
+            self.client = None
+
+        def connect(self):
+            calls.append("connect")
+            raise Connected
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(app, "SocketModeHandler", FakeHandler)
+    monkeypatch.setattr(app, "apply_root_set", lambda extra: None)
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
+    monkeypatch.setattr(FaultMavenClient, "startup", lambda self: calls.append("startup"))
+    monkeypatch.setattr(
+        WebClient,
+        "auth_test",
+        lambda self, **kw: {"ok": True, "team_id": "T1", "user_id": "U1"},
+    )
+    monkeypatch.setenv("SLACK_TRANSPORT", "socket")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-static")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-static")
+    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
+    sigterm = signal.getsignal(signal.SIGTERM)
+    config.get_settings.cache_clear()
+    try:
+        with pytest.raises(Connected):
+            app.main()
+    finally:
+        signal.signal(signal.SIGTERM, sigterm)
+        config.get_settings.cache_clear()
+    assert calls == ["startup", "connect", "close"]

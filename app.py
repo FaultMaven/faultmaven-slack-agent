@@ -461,7 +461,7 @@ def main() -> None:
         run_http()
         return
 
-    app, store, fm, settings = build_app()
+    app, store, fm, settings, _stores = build_app()
     # SLACK_APP_TOKEN presence is already enforced for socket mode by
     # Settings._validate_transport_requirements, so no re-check here.
 
