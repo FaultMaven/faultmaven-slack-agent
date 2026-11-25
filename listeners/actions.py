@@ -85,6 +85,9 @@ def apply_action(
     :meth:`FaultMavenClient.submit_turn`): the click's
     :func:`~listeners._turn.click_turn_key`. ``requester`` is the click's
     opaque ordering key (:func:`~listeners._turn.requester_for`).
+
+    The query is the button's words, which the user chose rather than typed,
+    so it travels as ``query_source="chosen"``.
     """
 
     value = json.loads(value_json)
@@ -92,6 +95,7 @@ def apply_action(
         case_id,
         idempotency_key=idempotency_key,
         query=value.get("q"),
+        query_source="chosen",
         intent_type=value.get("it"),
         intent_data=value.get("id"),
         team_id=team_id,
@@ -539,6 +543,8 @@ def register_data_box(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
+                # No query, so no query_source: core composes the query of a
+                # paste-only turn itself and never searches it for output.
                 text="",
                 pasted_content=pasted,
                 idempotency_key=view_turn_key(team_id, view.get("id")),

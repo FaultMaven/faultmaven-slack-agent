@@ -236,6 +236,10 @@ RESTARTING_TEXT = (
 #: discussion. Also the fallback when a backend older than contract 2.8.0
 #: refuses the EMPTY turn a seeded thread sends (see ``run_turn_and_post``).
 SUMMONS_TEXT = "Please investigate this thread."
+#: The summons as a turn's ``(query, query_source)``: this agent's text.
+SUMMONS_QUERY = (SUMMONS_TEXT, "generated")
+#: The query of a message that carries only files (:func:`resolve_query`).
+FILES_ONLY_QUERY = "Please investigate the attached file(s)."
 
 UNREADABLE_FILES_TEXT = (
     ":information_source: I couldn't read the attached file(s) (too large, or "
@@ -927,20 +931,25 @@ def run_gated(
     return True
 
 
-def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
-    """The query for a turn, or ``None`` if there's nothing to investigate.
+def resolve_query(
+    raw_text: str | None, *, downloaded_files: bool
+) -> tuple[str, str | None] | None:
+    """The turn's ``(query, query_source)``, or ``None`` if there's nothing to
+    investigate.
 
     ``raw_text`` may be missing/``None`` (Slack sends ``text: null`` on some
     file-share messages) or whitespace. Returns ``None`` only when there is no
     text *and* no ingestible file, so a caller can decline (tell the user)
     instead of opening a blank case with an empty query the backend rejects.
+    The user's own text has no source (core reads it as typed); the query this
+    agent writes for a files-only message is ``generated``.
     """
 
     text = (raw_text or "").strip()
     if text:
-        return text
+        return text, None
     if downloaded_files:
-        return "Please investigate the attached file(s)."
+        return FILES_ONLY_QUERY, "generated"
     return None
 
 
@@ -976,9 +985,15 @@ def _turn_key(namespace: str, distinguishing: str | None, *scope: str) -> str:
     ``view:team:view_id`` for a data-box submission (one modal, one paste). The
     message ts and the trigger_id are what this agent already dedupes Slack's
     redeliveries on, so a redelivered event (even to a restarted process, whose
-    in-memory dedup is empty) is the same turn to the backend too; an action_ts
-    names one click. The namespace keeps them apart: a click's action_ts
-    and a message's ts are both Slack timestamps and could coincide.
+    in-memory dedup is empty) is the same turn to the backend too, as long as
+    it sends the same bytes: one redelivered across a release that changed
+    what the turn sends (``query_source``, faultmaven#2717) is refused as a
+    key reuse (:data:`KEY_REUSE_TEXT`) rather than replayed, and so is a
+    mention or thread reply whose first delivery seeded the thread: its
+    redelivery reads the thread as seeded, so its summons and catch-up differ
+    (pre-existing; FaultMaven/faultmaven#3072). An action_ts names one click.
+    The namespace keeps them apart: a click's action_ts and a message's ts are
+    both Slack timestamps and could coincide.
 
     sha256 hex: deterministic, 64 characters, and inside the header's published
     grammar (8–255 of ``[A-Za-z0-9_-]``) whatever the identity contains — a
@@ -1085,6 +1100,7 @@ def run_turn(
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
+    query_source: str | None = None,
     on_waiting=None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
@@ -1118,6 +1134,11 @@ def run_turn(
     - ``requester`` is the turn's opaque ordering key (:func:`requester_for`),
       for :meth:`FaultMavenClient.submit_turn`; None sends none. Required, as
       the key is, so a new surface cannot forget it silently.
+    - ``query_source`` says who wrote ``text``
+      (:data:`~faultmaven.client.QUERY_SOURCES`): ``generated`` for text this
+      agent wrote (the shortcut's seed, the summons, a files-only message's
+      query). None, a message the user typed, sends no field, which core
+      reads as typed.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -1158,6 +1179,7 @@ def run_turn(
                 observed_at=observed_at,
                 files=files or None,
                 input_type="paste" if pasted_content else None,
+                query_source=query_source,
                 team_id=team_id,
                 requester=requester,
                 on_waiting=on_waiting,
@@ -1167,6 +1189,7 @@ def run_turn(
                 case_id,
                 idempotency_key=idempotency_key,
                 query=text,
+                query_source=query_source,
                 team_id=team_id,
                 requester=requester,
                 on_waiting=on_waiting,
@@ -1280,15 +1303,17 @@ def run_turn_and_post(
     placeholder_ts: str | None = None,
     mention_user: str | None = None,
     intro_note: str | None = None,
-    empty_turn_fallback: str | None = None,
+    empty_turn_fallback: tuple[str, str | None] | None = None,
+    query_source: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place.
 
     ``empty_turn_fallback``: when ``text`` is ``""`` (an EMPTY turn, which the
     backend answers with an orientation from contract 2.8.0) and the backend
     refuses it with HTTP 400 — a deployment older than that contract — the turn
-    is re-sent once with this text instead, so a mixed-version deployment gets
-    the pre-2.8.0 behaviour rather than an error.
+    is re-sent once as this ``(query, query_source)`` instead (the caller's
+    :data:`SUMMONS_QUERY`), so a mixed-version deployment gets the pre-2.8.0
+    behaviour rather than an error.
 
     The caller holds the per-thread gate (:func:`try_begin_turn`), so no two turns
     overlap here. ``mention_user`` addresses the reply to the person whose message
@@ -1305,7 +1330,8 @@ def run_turn_and_post(
     (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
     waits on a slow turn under it, the placeholder is updated once to
     :data:`STILL_WORKING_TEXT`. ``requester`` is the turn's opaque ordering
-    key (:func:`requester_for`), passed to :func:`run_turn`.
+    key (:func:`requester_for`), passed to :func:`run_turn`, as is
+    ``query_source`` (who wrote ``text``; None for a typed message).
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise
@@ -1338,7 +1364,7 @@ def run_turn_and_post(
     try:
         first_turn = store.get(team_id, channel, thread_ts) is None
 
-        def _run(text_: str):
+        def _run(text_: str, query_source_: str | None):
             return run_turn(
                 fm,
                 store,
@@ -1355,11 +1381,12 @@ def run_turn_and_post(
                 # the first with a 400, so nothing committed under it.
                 idempotency_key=idempotency_key,
                 requester=requester,
+                query_source=query_source_,
                 on_waiting=lambda: update(STILL_WORKING_TEXT),
             )
 
         try:
-            result = _run(text)
+            result = _run(text, query_source)
         except FaultMavenAPIError as exc:
             if text == "" and exc.status_code == 400 and empty_turn_fallback:
                 logger.info(
@@ -1367,7 +1394,7 @@ def run_turn_and_post(
                     "re-sending the summons",
                     channel,
                 )
-                result = _run(empty_turn_fallback)
+                result = _run(*empty_turn_fallback)
             else:
                 raise
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn

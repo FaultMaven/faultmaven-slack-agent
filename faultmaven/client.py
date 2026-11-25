@@ -945,6 +945,14 @@ class _Credential:
 #: Slack service account and orders that account's own worker jobs by it.
 REQUESTER_HEADER = "X-FaultMaven-Requester"
 
+#: Who wrote a turn's ``query`` (contract 15.18.0, FaultMaven/faultmaven#2717),
+#: sent as the ``query_source`` form field: ``typed`` by the user, ``chosen``
+#: from a button the engine offered, or ``generated`` by this agent. Core
+#: searches only a typed query for system output to offer back as data; absent
+#: means typed. Sent without moving the contract pin: a core older than 15.18.0
+#: ignores the unknown form field.
+QUERY_SOURCES = frozenset({"typed", "chosen", "generated"})
+
 
 class FaultMavenClient:
     """Sync facade over the FaultMaven core API."""
@@ -2555,6 +2563,7 @@ class FaultMavenClient:
         input_type: str | None = None,
         source_url: str | None = None,
         observed_at: str | None = None,
+        query_source: str | None = None,
         team_id: str | None = None,
         on_waiting: Callable[[], None] | None = None,
     ) -> TurnResult:
@@ -2566,6 +2575,11 @@ class FaultMavenClient:
         was observed — distinct from when it was submitted. The backend
         defaults to submission time when it is absent, which reads a
         two-hour-old alert as current.
+
+        ``query_source`` says who wrote ``query`` (:data:`QUERY_SOURCES`). None
+        or ``""`` sends no field, which core reads as typed (core reads an
+        empty field as typed too). Any other value raises
+        :class:`FaultMavenError` before anything is sent.
 
         ``requester`` is the turn's opaque ordering key
         (``listeners._turn.requester_for``), sent as :data:`REQUESTER_HEADER`
@@ -2695,6 +2709,11 @@ class FaultMavenClient:
             raise FaultMavenError(
                 "a turn needs at least one of query / pasted_content / files"
             )
+        # Added after the guard: it describes the query, it is not content.
+        if query_source:
+            if query_source not in QUERY_SOURCES:
+                raise FaultMavenError(f"unknown query_source {query_source!r}")
+            form["query_source"] = query_source
 
         cred = self._credential_for(team_id)
         # The one headers dict every attempt and ``_post``'s re-auth re-POST

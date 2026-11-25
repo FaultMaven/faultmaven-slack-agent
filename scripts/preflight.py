@@ -320,6 +320,8 @@ def check_turn_contract(fm: FaultMavenClient) -> bool:
             # The doctor's smoke turn is nobody's: it names no requester.
             requester=None,
             query="Preflight ping — please ack.",
+            # The doctor wrote it, not a user.
+            query_source="generated",
         )
     except FaultMavenError as exc:
         return _fail(

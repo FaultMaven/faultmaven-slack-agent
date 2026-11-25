@@ -39,13 +39,16 @@ from ._turn import (
     run_gated,
     run_turn_and_post,
     skipped_files_note,
-    SUMMONS_TEXT,
+    SUMMONS_QUERY,
     UNREADABLE_FILES_TEXT,
 )
 
 
 #: For the module-level helpers; Bolt injects its own logger into handlers.
 logger = logging.getLogger(__name__)
+
+#: The query of a thread reply that carries only files.
+FILES_ONLY_REPLY_QUERY = "Please continue the investigation with this data."
 
 
 def _post_note(
@@ -263,20 +266,23 @@ def is_dm_summons(event: dict) -> bool:
     )
 
 
-def mention_text(cleaned: str, *, seeded: bool) -> str:
-    """The turn's ``query`` for an ``app_mention``.
+def mention_text(cleaned: str, *, seeded: bool) -> tuple[str, str | None]:
+    """The turn's ``(query, query_source)`` for an ``app_mention``.
 
     Real text passes through. A bare mention on a thread that is not yet a
-    SEEDED investigation is a summons (:data:`SUMMONS_TEXT`) — "seeded", not
+    SEEDED investigation is a summons (:data:`~listeners._turn.SUMMONS_QUERY`) — "seeded", not
     merely mapped: a mapping whose opening turn failed still needs the summons
     and the catch-up read on the retry. A bare mention on a seeded thread is the
     user poking the assistant, not new data, and sends an EMPTY turn, which the
     backend answers with a state-aware orientation (``run_turn_and_post`` falls
     back to the summons on a backend that predates that).
+
+    The user's text, and the empty turn, carry no source (core reads it as
+    typed); the summons is this agent's text, so it is ``generated``.
     """
     if cleaned:
-        return cleaned
-    return "" if seeded else SUMMONS_TEXT
+        return cleaned, None
+    return ("", None) if seeded else SUMMONS_QUERY
 
 
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
@@ -346,6 +352,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
                     logger.warning("decline update failed in %s: %s", channel, exc)
                 return
+            query, query_source = mention_text(cleaned, seeded=seeded)
             run_turn_and_post(
                 client,
                 fm,
@@ -353,9 +360,13 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=mention_text(cleaned, seeded=seeded),
+                text=query,
+                query_source=query_source,
                 # The mention itself is the turn: the identity its redelivery
-                # is deduped on above, so a redelivery is the same turn.
+                # is deduped on above, so a redelivery is the same turn, and
+                # is replayed when it sends the same bytes. A redelivery of
+                # the mention that seeded the thread does not (it reads the
+                # thread as seeded): FaultMaven/faultmaven#3072.
                 idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 prior_context=prior_context,
@@ -364,7 +375,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 requester=requester_for(context),
                 mention_user=event.get("user"),
                 intro_note=RESTARTED_AFTER_MISSING_CASE if restarted else None,
-                empty_turn_fallback=SUMMONS_TEXT,
+                empty_turn_fallback=SUMMONS_QUERY,
             )
 
         run_gated(
@@ -412,10 +423,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         )
                 # File(s) present but unreadable and no text → decline instead of
                 # opening a blank case (mirrors the Assistant surface).
-                query = resolve_query(
+                resolved = resolve_query(
                     text or None, downloaded_files=bool(files or snippet_text)
                 )
-                if query is None:
+                if resolved is None:
                     try:
                         client.chat_update(
                             channel=channel,
@@ -425,6 +436,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
                         logger.warning("decline update failed in %s: %s", channel, exc)
                     return
+                query, query_source = resolved
                 run_turn_and_post(
                     client,
                     fm,
@@ -433,6 +445,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     thread_ts=thread_ts,
                     team_id=team_id,
                     text=query,
+                    query_source=query_source,
                     idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                     pasted_content=snippet_text,
                     files=files or None,
@@ -502,7 +515,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=text or "Please continue the investigation with this data.",
+                # A files-only reply's query is this agent's text, not the
+                # user's: it goes as generated; the user's own text as typed.
+                text=text or FILES_ONLY_REPLY_QUERY,
+                query_source=None if text else "generated",
                 idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 files=files or None,

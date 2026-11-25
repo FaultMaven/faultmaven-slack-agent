@@ -669,6 +669,9 @@ all — while `is_unlinked` preserves the memory:
      source_url=<url>                           # optional (shortcut/page capture)
      intent_type=conversation|status_transition|hypothesis_action|evidence_need|confirmation|greeting
      intent_data=<json>                         # for DECIDE/confirmation/hypothesis buttons
+     query_source=chosen|generated              # who wrote query (15.18.0): a click / any query the agent
+                                                #   writes (shortcut seed, summons, files-only text);
+                                                #   absent = typed, the only query core searches for output
    → 200 TurnResponse   (or 202 + Location header → poll until ready)
    ```
    > Large `query` / `pasted_content` are size-guarded server-side against
@@ -690,7 +693,8 @@ all — while `is_unlinked` preserves the memory:
    header: the sha256 hex of the Slack identity of the thing that asked for it
    (`msg:team:channel:ts`, `click:team:channel:action_ts`,
    `shortcut:team:trigger_id`), so a redelivered event is the same turn and two
-   messages or clicks never are. When an attempt's outcome is unknown (the client
+   messages or clicks never are. The backend replays it only when it sends the
+   same bytes; `listeners._turn._turn_key` names the cases that do not. When an attempt's outcome is unknown (the client
    timed out after the attempt timeout, a gateway 502/504, a 500
    `TURN_OUTCOME_UNKNOWN` or uncoded, a connection dropped after sending), `FaultMavenClient.submit_turn` re-sends the same
    request under the same key: `200` (with `X-Idempotency-Replayed: true` when an
