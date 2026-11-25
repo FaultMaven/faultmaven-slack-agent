@@ -18,7 +18,6 @@ import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.oauth.installation_store.models.installation import Installation
 
-import config
 from config import Settings
 
 
@@ -277,31 +276,57 @@ def test_a_database_url_with_sslmode_disable_goes_on_to_connect():
         build_oauth_stores(database_url=url, client_id="1")
 
 
+def _app_settings(monkeypatch, tmp_path, transport: str) -> None:
+    """Point ``app.get_settings`` at hermetic settings for ``transport``.
+
+    No ``.env``, every store under ``tmp_path``, and no refresh credential from
+    the shell, so a build never writes into the checkout. FAULTMAVEN_API_TOKEN
+    is preset so the FM client's startup short-circuits (no network). Bolt
+    verifies a static bot token via auth.test at construction (real, desirable
+    prod behavior); that one network call is stubbed.
+    """
+
+    import app
+    from slack_sdk.web.client import WebClient
+
+    monkeypatch.setattr(
+        WebClient,
+        "auth_test",
+        lambda self, **kw: {"ok": True, "team_id": "T1", "user_id": "U1"},
+    )
+    monkeypatch.delenv("FAULTMAVEN_REFRESH_TOKEN", raising=False)
+    if transport == "http":
+        env = {
+            "SLACK_CLIENT_ID": "123.456",
+            "SLACK_CLIENT_SECRET": "secret",
+            "SLACK_SIGNING_SECRET": "signsign",
+            "SLACK_DATABASE_URL": f"sqlite:///{tmp_path / 'oauth.db'}",
+        }
+    else:
+        env = {"SLACK_BOT_TOKEN": "xoxb-static", "SLACK_APP_TOKEN": "xapp-static"}
+    settings = _settings(
+        monkeypatch,
+        SLACK_TRANSPORT=transport,
+        CASE_STORE_PATH=str(tmp_path / "cases.db"),
+        CREDENTIAL_STORE_PATH=str(tmp_path / "credentials.db"),
+        FAULTMAVEN_API_TOKEN="preset-token",
+        **env,
+    )
+    monkeypatch.setattr(app, "get_settings", lambda: settings)
+
+
 # --- FastAPI app -------------------------------------------------------------
 
 
 @pytest.fixture
 def http_client(monkeypatch, tmp_path):
-    """A TestClient over the HTTP transport app, fully hermetic.
+    """A TestClient over the HTTP transport app, fully hermetic."""
 
-    FAULTMAVEN_API_TOKEN is preset so the FM client's startup short-circuits
-    (no network), keeping the app build offline and fast.
-    """
-
-    monkeypatch.setenv("SLACK_TRANSPORT", "http")
-    monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
-    monkeypatch.setenv("SLACK_CLIENT_SECRET", "secret")
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "signsign")
-    monkeypatch.setenv("SLACK_DATABASE_URL", f"sqlite:///{tmp_path / 'oauth.db'}")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "cases.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
-    config.get_settings.cache_clear()
-
+    _app_settings(monkeypatch, tmp_path, "http")
     from web import create_fastapi_app
 
     with TestClient(create_fastapi_app()) as client:
         yield client
-    config.get_settings.cache_clear()
 
 
 def test_health_is_ok_and_dependency_free(http_client):
@@ -332,14 +357,7 @@ def test_fm_startup_runs_off_the_lifespan_thread(monkeypatch, tmp_path):
     lifespan: uvicorn does not serve /health until lifespan startup returns, so a
     slow backend here would block the liveness probe and trip a CrashLoop."""
 
-    monkeypatch.setenv("SLACK_TRANSPORT", "http")
-    monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
-    monkeypatch.setenv("SLACK_CLIENT_SECRET", "secret")
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "signsign")
-    monkeypatch.setenv("SLACK_DATABASE_URL", f"sqlite:///{tmp_path / 'oauth.db'}")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "cases.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
-    config.get_settings.cache_clear()
+    _app_settings(monkeypatch, tmp_path, "http")
 
     recorded: dict[str, str] = {}
     started = threading.Event()
@@ -359,7 +377,6 @@ def test_fm_startup_runs_off_the_lifespan_thread(monkeypatch, tmp_path):
         # Ran on the named daemon, not the lifespan/event-loop thread.
         assert recorded["thread"] == "fm-token-bootstrap"
         assert client.get("/health").status_code == 200
-    config.get_settings.cache_clear()
 
 
 # --- transport selection in build_app ---------------------------------------
@@ -368,32 +385,22 @@ def test_fm_startup_runs_off_the_lifespan_thread(monkeypatch, tmp_path):
 def test_build_app_http_wires_oauth_flow_and_rate_limit_retry(monkeypatch, tmp_path):
     from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
-    monkeypatch.setenv("SLACK_TRANSPORT", "http")
-    monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
-    monkeypatch.setenv("SLACK_CLIENT_SECRET", "secret")
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "signsign")
-    monkeypatch.setenv("SLACK_DATABASE_URL", f"sqlite:///{tmp_path / 'o.db'}")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "c.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
-    config.get_settings.cache_clear()
-    try:
-        from app import build_app
+    _app_settings(monkeypatch, tmp_path, "http")
+    from app import build_app
 
-        bolt_app, store, fm, settings, _stores = build_app()
-        try:
-            assert settings.slack_transport == "http"
-            assert bolt_app.oauth_flow is not None
-            # The base client must carry the rate-limit retry handler, or the
-            # per-team clients Bolt derives from it drop replies on a 429.
-            assert any(
-                isinstance(h, RateLimitErrorRetryHandler)
-                for h in bolt_app.client.retry_handlers
-            )
-        finally:
-            store.close()
-            fm.close()
+    bolt_app, store, fm, settings, _stores = build_app()
+    try:
+        assert settings.slack_transport == "http"
+        assert bolt_app.oauth_flow is not None
+        # The base client must carry the rate-limit retry handler, or the
+        # per-team clients Bolt derives from it drop replies on a 429.
+        assert any(
+            isinstance(h, RateLimitErrorRetryHandler)
+            for h in bolt_app.client.retry_handlers
+        )
     finally:
-        config.get_settings.cache_clear()
+        store.close()
+        fm.close()
 
 
 def test_uvicorn_log_level_maps_extra_names():
@@ -408,31 +415,64 @@ def test_uvicorn_log_level_maps_extra_names():
 
 
 def test_build_app_socket_uses_static_token(monkeypatch, tmp_path):
-    # Socket mode passes a static bot token; Bolt eagerly verifies it via
-    # auth.test at construction (real, desirable prod behavior). Stub that one
-    # network call so the test exercises transport WIRING with a fake token.
-    from slack_sdk.web.client import WebClient
+    _app_settings(monkeypatch, tmp_path, "socket")
+    from app import build_app
 
-    monkeypatch.setattr(
-        WebClient,
-        "auth_test",
-        lambda self, **kw: {"ok": True, "team_id": "T1", "user_id": "U1"},
-    )
-    monkeypatch.setenv("SLACK_TRANSPORT", "socket")
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-static")
-    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-static")
-    monkeypatch.setenv("CASE_STORE_PATH", str(tmp_path / "c.db"))
-    monkeypatch.setenv("FAULTMAVEN_API_TOKEN", "preset-token")
-    config.get_settings.cache_clear()
+    bolt_app, store, fm, settings, _stores = build_app()
     try:
-        from app import build_app
-
-        bolt_app, store, fm, settings, _stores = build_app()
-        try:
-            assert settings.slack_transport == "socket"
-            assert bolt_app.oauth_flow is None
-        finally:
-            store.close()
-            fm.close()
+        assert settings.slack_transport == "socket"
+        assert bolt_app.oauth_flow is None
     finally:
-        config.get_settings.cache_clear()
+        store.close()
+        fm.close()
+
+
+def test_main_under_socket_transport_reaches_connect(monkeypatch, tmp_path):
+    """``main()`` builds the app and connects the Socket Mode handler (#2781).
+
+    It once unpacked four of ``build_app()``'s five values and raised before
+    connecting. The handler's ``connect()`` records the call, then ends the
+    loop with a sentinel, so ``main()``'s shutdown path runs and returns here.
+    """
+
+    import logging
+    import signal
+
+    from slack_bolt import App
+
+    import app
+    from faultmaven.client import FaultMavenClient
+
+    class Connected(Exception):
+        pass
+
+    calls: list[str] = []
+    handed: list[object] = []
+
+    class FakeHandler:
+        def __init__(self, bolt_app, app_token):
+            handed.append(bolt_app)
+            assert app_token == "xapp-static"
+            self.client = None
+
+        def connect(self):
+            calls.append("connect")
+            raise Connected
+
+        def close(self):
+            calls.append("close")
+
+    _app_settings(monkeypatch, tmp_path, "socket")
+    monkeypatch.setattr(app, "SocketModeHandler", FakeHandler)
+    monkeypatch.setattr(app, "apply_root_set", lambda extra: None)
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
+    monkeypatch.setattr(FaultMavenClient, "startup", lambda self: calls.append("startup"))
+    sigterm = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(Connected):
+            app.main()
+    finally:
+        signal.signal(signal.SIGTERM, sigterm)
+    assert calls == ["startup", "connect", "close"]
+    (bolt_app,) = handed
+    assert isinstance(bolt_app, App)
