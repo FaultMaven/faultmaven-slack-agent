@@ -669,6 +669,8 @@ all — while `is_unlinked` preserves the memory:
      source_url=<url>                           # optional (shortcut/page capture)
      intent_type=conversation|status_transition|hypothesis_action|evidence_need|confirmation|greeting
      intent_data=<json>                         # for DECIDE/confirmation/hypothesis buttons
+     query_source=chosen|generated              # who wrote query (15.18.0): a click / the shortcut seed;
+                                                #   absent = typed, the only query core searches for output
    → 200 TurnResponse   (or 202 + Location header → poll until ready)
    ```
    > Large `query` / `pasted_content` are size-guarded server-side against

@@ -34,7 +34,8 @@ from ._turn import (
 
 logger = logging.getLogger(__name__)
 
-# The shortcut seeds the message as evidence (pasted_content); this is the query.
+# The shortcut seeds the message as evidence (pasted_content); this is the
+# query. The agent wrote it, not the user, so it travels as ``generated``.
 _SEED_QUERY = "Please investigate this."
 # Cap the seed size (the backend size-guards too); matches events.py.
 _SEED_LIMIT = 8000
@@ -192,6 +193,7 @@ def register_shortcuts(app: App, fm: FaultMavenClient, store: CaseStore) -> None
                 thread_ts=thread_ts,
                 team_id=team_id,
                 text=_SEED_QUERY,
+                query_source="generated",
                 # One invocation, one turn: the trigger_id the redelivery is
                 # deduped on above. A deliberate second invocation gets a fresh
                 # trigger_id, so it is a new turn, as it should be.

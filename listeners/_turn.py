@@ -1085,6 +1085,7 @@ def run_turn(
     observed_at: str | None = None,
     prior_context: str | None = None,
     files: list[tuple[str, bytes, str]] | None = None,
+    query_source: str | None = None,
     on_waiting=None,
 ) -> TurnResult:
     """Find-or-create the case for this thread and advance it by one turn.
@@ -1118,6 +1119,10 @@ def run_turn(
     - ``requester`` is the turn's opaque ordering key (:func:`requester_for`),
       for :meth:`FaultMavenClient.submit_turn`; None sends none. Required, as
       the key is, so a new surface cannot forget it silently.
+    - ``query_source`` says who wrote ``text``
+      (:data:`~faultmaven.client.QUERY_SOURCES`): ``generated`` for the
+      shortcut's seed. None, a message the user typed, sends no field, which
+      core reads as typed.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -1158,6 +1163,7 @@ def run_turn(
                 observed_at=observed_at,
                 files=files or None,
                 input_type="paste" if pasted_content else None,
+                query_source=query_source,
                 team_id=team_id,
                 requester=requester,
                 on_waiting=on_waiting,
@@ -1167,6 +1173,7 @@ def run_turn(
                 case_id,
                 idempotency_key=idempotency_key,
                 query=text,
+                query_source=query_source,
                 team_id=team_id,
                 requester=requester,
                 on_waiting=on_waiting,
@@ -1281,6 +1288,7 @@ def run_turn_and_post(
     mention_user: str | None = None,
     intro_note: str | None = None,
     empty_turn_fallback: str | None = None,
+    query_source: str | None = None,
 ) -> None:
     """Post a placeholder, run one turn, and update it in place.
 
@@ -1305,7 +1313,8 @@ def run_turn_and_post(
     (:func:`message_turn_key` or :func:`shortcut_turn_key`); while the client
     waits on a slow turn under it, the placeholder is updated once to
     :data:`STILL_WORKING_TEXT`. ``requester`` is the turn's opaque ordering
-    key (:func:`requester_for`), passed to :func:`run_turn`.
+    key (:func:`requester_for`), passed to :func:`run_turn`, as is
+    ``query_source`` (who wrote ``text``; None for a typed message).
 
     Failure discipline: "the turn failed" and "the turn succeeded but Slack
     wouldn't take the reply" are different failures. Only the former may advise
@@ -1355,6 +1364,7 @@ def run_turn_and_post(
                 # the first with a 400, so nothing committed under it.
                 idempotency_key=idempotency_key,
                 requester=requester,
+                query_source=query_source,
                 on_waiting=lambda: update(STILL_WORKING_TEXT),
             )
 
