@@ -158,11 +158,11 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                 # saves as data from the offer (#100) is not stored as
                 # ``&gt;`` and ``<@U…>``. No mention strip: the panel has no
                 # @mention to remove, and a user's own mention is content.
-                query = resolve_query(
+                resolved = resolve_query(
                     render_slack_text(payload.get("text") or ""),
                     downloaded_files=bool(files or pasted_text),
                 )
-                if query is None:
+                if resolved is None:
                     # No text and nothing ingestible — don't open a blank case;
                     # say why (mirrors the shortcut's decline instead of a
                     # generic error).
@@ -174,6 +174,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     )
                     return
 
+                query, query_source = resolved
                 first_turn = store.get(team_id, channel, thread_ts) is None
                 result = run_turn(
                     fm,
@@ -182,6 +183,7 @@ def build_assistant(fm: FaultMavenClient, store: CaseStore) -> Assistant:
                     channel_id=channel,
                     thread_ts=thread_ts,
                     text=query,
+                    query_source=query_source,
                     # The message is the turn: the identity its redelivery is
                     # deduped on above.
                     idempotency_key=message_turn_key(

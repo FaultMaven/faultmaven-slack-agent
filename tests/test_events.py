@@ -139,14 +139,14 @@ def test_returns_prior_human_messages_joined():
 def test_bare_mention_on_an_unseeded_thread_is_a_summons():
     """Unseeded, not unmapped: a mapping whose opening turn failed still needs
     the summons (and the catch-up read) on the retry."""
-    assert mention_text("", seeded=False) == SUMMONS_TEXT
+    assert mention_text("", seeded=False) == (SUMMONS_TEXT, "generated")
 
 
 def test_bare_mention_on_a_seeded_thread_sends_an_empty_turn():
-    assert mention_text("", seeded=True) == ""
+    assert mention_text("", seeded=True) == ("", None)
 
 
 def test_real_text_passes_through_unchanged():
     for text in ("the pod is crashlooping again", "help", "hi"):
-        assert mention_text(text, seeded=True) == text
-        assert mention_text(text, seeded=False) == text
+        assert mention_text(text, seeded=True) == (text, None)
+        assert mention_text(text, seeded=False) == (text, None)

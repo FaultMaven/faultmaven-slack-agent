@@ -132,10 +132,13 @@ done when its check conclusions are green, not when local tests pass.
   admission by it: workspaces sharing the default credential rotate together.
   Core keeps a per-requester stamp in memory while busy; nothing persists it.
 - A turn says who wrote its `query` (`query_source`, contract 15.18.0, sent
-  without moving the pin): a button click `chosen` (`actions.apply_action`), the
-  message shortcut's seed `generated`; a typed message and the data box's
-  paste-only turn send none (core reads absent as `typed`, the only query it
-  searches for system output to offer back as data).
+  without moving the pin): a button click `chosen` (`actions.apply_action`);
+  every query this agent writes `generated` (the shortcut's seed, the summons
+  and its empty-turn fallback re-send, a files-only message's query from
+  `resolve_query` or a thread reply, preflight's smoke turn). The user's own
+  text, the empty turn and the data box's paste-only turn send none: core
+  reads absent as `typed`, the only query it searches for system output to
+  offer back as data.
 - The contract is pinned in `api-contract.pin.json` (`ref` + `contractVersion`,
   which must agree). Adopting a new contract = move the pin and commit the
   regenerated `faultmaven/api_generated.py` in the same PR.

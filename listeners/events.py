@@ -47,6 +47,9 @@ from ._turn import (
 #: For the module-level helpers; Bolt injects its own logger into handlers.
 logger = logging.getLogger(__name__)
 
+#: The query of a thread reply that carries only files.
+FILES_ONLY_REPLY_QUERY = "Please continue the investigation with this data."
+
 
 def _post_note(
     client: WebClient, channel: str, thread_ts: str, text: str
@@ -263,8 +266,8 @@ def is_dm_summons(event: dict) -> bool:
     )
 
 
-def mention_text(cleaned: str, *, seeded: bool) -> str:
-    """The turn's ``query`` for an ``app_mention``.
+def mention_text(cleaned: str, *, seeded: bool) -> tuple[str, str | None]:
+    """The turn's ``(query, query_source)`` for an ``app_mention``.
 
     Real text passes through. A bare mention on a thread that is not yet a
     SEEDED investigation is a summons (:data:`SUMMONS_TEXT`) — "seeded", not
@@ -273,10 +276,13 @@ def mention_text(cleaned: str, *, seeded: bool) -> str:
     user poking the assistant, not new data, and sends an EMPTY turn, which the
     backend answers with a state-aware orientation (``run_turn_and_post`` falls
     back to the summons on a backend that predates that).
+
+    The user's text, and the empty turn, carry no source (core reads it as
+    typed); the summons is this agent's text, so it is ``generated``.
     """
     if cleaned:
-        return cleaned
-    return "" if seeded else SUMMONS_TEXT
+        return cleaned, None
+    return ("", None) if seeded else (SUMMONS_TEXT, "generated")
 
 
 def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
@@ -346,6 +352,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
                     logger.warning("decline update failed in %s: %s", channel, exc)
                 return
+            query, query_source = mention_text(cleaned, seeded=seeded)
             run_turn_and_post(
                 client,
                 fm,
@@ -353,7 +360,8 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=mention_text(cleaned, seeded=seeded),
+                text=query,
+                query_source=query_source,
                 # The mention itself is the turn: the identity its redelivery
                 # is deduped on above, so a redelivery is the same turn.
                 idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
@@ -412,10 +420,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                         )
                 # File(s) present but unreadable and no text → decline instead of
                 # opening a blank case (mirrors the Assistant surface).
-                query = resolve_query(
+                resolved = resolve_query(
                     text or None, downloaded_files=bool(files or snippet_text)
                 )
-                if query is None:
+                if resolved is None:
                     try:
                         client.chat_update(
                             channel=channel,
@@ -425,6 +433,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     except Exception as exc:  # noqa: BLE001 — decline must never strand the placeholder
                         logger.warning("decline update failed in %s: %s", channel, exc)
                     return
+                query, query_source = resolved
                 run_turn_and_post(
                     client,
                     fm,
@@ -433,6 +442,7 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                     thread_ts=thread_ts,
                     team_id=team_id,
                     text=query,
+                    query_source=query_source,
                     idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                     pasted_content=snippet_text,
                     files=files or None,
@@ -502,7 +512,10 @@ def register_events(app: App, fm: FaultMavenClient, store: CaseStore) -> None:
                 channel=channel,
                 thread_ts=thread_ts,
                 team_id=team_id,
-                text=text or "Please continue the investigation with this data.",
+                # A files-only reply's query is this agent's text, not the
+                # user's: it goes as generated; the user's own text as typed.
+                text=text or FILES_ONLY_REPLY_QUERY,
+                query_source=None if text else "generated",
                 idempotency_key=message_turn_key(team_id, channel, event.get("ts")),
                 pasted_content=snippet_text,
                 files=files or None,

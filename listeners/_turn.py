@@ -236,6 +236,8 @@ RESTARTING_TEXT = (
 #: discussion. Also the fallback when a backend older than contract 2.8.0
 #: refuses the EMPTY turn a seeded thread sends (see ``run_turn_and_post``).
 SUMMONS_TEXT = "Please investigate this thread."
+#: The query of a message that carries only files (:func:`resolve_query`).
+FILES_ONLY_QUERY = "Please investigate the attached file(s)."
 
 UNREADABLE_FILES_TEXT = (
     ":information_source: I couldn't read the attached file(s) (too large, or "
@@ -927,20 +929,25 @@ def run_gated(
     return True
 
 
-def resolve_query(raw_text: str | None, *, downloaded_files: bool) -> str | None:
-    """The query for a turn, or ``None`` if there's nothing to investigate.
+def resolve_query(
+    raw_text: str | None, *, downloaded_files: bool
+) -> tuple[str, str | None] | None:
+    """The turn's ``(query, query_source)``, or ``None`` if there's nothing to
+    investigate.
 
     ``raw_text`` may be missing/``None`` (Slack sends ``text: null`` on some
     file-share messages) or whitespace. Returns ``None`` only when there is no
     text *and* no ingestible file, so a caller can decline (tell the user)
     instead of opening a blank case with an empty query the backend rejects.
+    The user's own text has no source (core reads it as typed); the query this
+    agent writes for a files-only message is ``generated``.
     """
 
     text = (raw_text or "").strip()
     if text:
-        return text
+        return text, None
     if downloaded_files:
-        return "Please investigate the attached file(s)."
+        return FILES_ONLY_QUERY, "generated"
     return None
 
 
@@ -1120,9 +1127,10 @@ def run_turn(
       for :meth:`FaultMavenClient.submit_turn`; None sends none. Required, as
       the key is, so a new surface cannot forget it silently.
     - ``query_source`` says who wrote ``text``
-      (:data:`~faultmaven.client.QUERY_SOURCES`): ``generated`` for the
-      shortcut's seed. None, a message the user typed, sends no field, which
-      core reads as typed.
+      (:data:`~faultmaven.client.QUERY_SOURCES`): ``generated`` for text this
+      agent wrote (the shortcut's seed, the summons, a files-only message's
+      query). None, a message the user typed, sends no field, which core
+      reads as typed.
     """
 
     # ``team_id`` selects which FaultMaven service account owns this case and,
@@ -1296,7 +1304,8 @@ def run_turn_and_post(
     backend answers with an orientation from contract 2.8.0) and the backend
     refuses it with HTTP 400 — a deployment older than that contract — the turn
     is re-sent once with this text instead, so a mixed-version deployment gets
-    the pre-2.8.0 behaviour rather than an error.
+    the pre-2.8.0 behaviour rather than an error. The fallback is this agent's
+    text, so the re-send goes as ``query_source="generated"``.
 
     The caller holds the per-thread gate (:func:`try_begin_turn`), so no two turns
     overlap here. ``mention_user`` addresses the reply to the person whose message
@@ -1347,7 +1356,7 @@ def run_turn_and_post(
     try:
         first_turn = store.get(team_id, channel, thread_ts) is None
 
-        def _run(text_: str):
+        def _run(text_: str, query_source_: str | None):
             return run_turn(
                 fm,
                 store,
@@ -1364,12 +1373,12 @@ def run_turn_and_post(
                 # the first with a 400, so nothing committed under it.
                 idempotency_key=idempotency_key,
                 requester=requester,
-                query_source=query_source,
+                query_source=query_source_,
                 on_waiting=lambda: update(STILL_WORKING_TEXT),
             )
 
         try:
-            result = _run(text)
+            result = _run(text, query_source)
         except FaultMavenAPIError as exc:
             if text == "" and exc.status_code == 400 and empty_turn_fallback:
                 logger.info(
@@ -1377,7 +1386,7 @@ def run_turn_and_post(
                     "re-sending the summons",
                     channel,
                 )
-                result = _run(empty_turn_fallback)
+                result = _run(empty_turn_fallback, "generated")
             else:
                 raise
     except Exception as exc:  # noqa: BLE001 — last line of defense for a bg turn
